@@ -1,0 +1,36 @@
+<!--
+  Headway's Windows installer (WiX 5). Built by the release workflow:
+    wix build assets/windows/headway.wxs -arch x64 -d Version=<x.y.z> -d ExePath=<headway.exe> -o <out.msi>
+  Installs to Program Files\Headway, adds a Start menu shortcut, and puts headway on the PATH.
+  Keep UpgradeCode fixed forever: it is how new versions replace old ones.
+-->
+<Wix xmlns="http://wixtoolset.org/schemas/v4/wxs">
+  <Package Name="Headway" Manufacturer="Srinivasan Rangarajan" Version="$(var.Version)"
+           UpgradeCode="FC95592F-E540-4366-8F05-9FB6C3527036" Scope="perMachine">
+    <MajorUpgrade DowngradeErrorMessage="A newer version of Headway is already installed." />
+    <MediaTemplate EmbedCab="yes" />
+
+    <Icon Id="headway.ico" SourceFile="assets\icon\headway.ico" />
+    <Property Id="ARPPRODUCTICON" Value="headway.ico" />
+    <Property Id="ARPURLINFOABOUT" Value="https://github.com/cnu/headway" />
+
+    <StandardDirectory Id="ProgramFiles64Folder">
+      <Directory Id="INSTALLFOLDER" Name="Headway">
+        <Component Id="MainExecutable">
+          <File Id="HeadwayExe" Name="headway.exe" Source="$(var.ExePath)" KeyPath="yes">
+            <Shortcut Id="StartMenuShortcut" Directory="ProgramMenuFolder" Name="Headway"
+                      Description="A fast, friendly native Git client with workspaces"
+                      WorkingDirectory="INSTALLFOLDER" Icon="headway.ico" Advertise="yes" />
+          </File>
+          <Environment Id="PathEntry" Name="PATH" Value="[INSTALLFOLDER]" Part="last"
+                       Action="set" System="yes" Permanent="no" />
+        </Component>
+      </Directory>
+    </StandardDirectory>
+    <StandardDirectory Id="ProgramMenuFolder" />
+
+    <Feature Id="Main">
+      <ComponentRef Id="MainExecutable" />
+    </Feature>
+  </Package>
+</Wix>

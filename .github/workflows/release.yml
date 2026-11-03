@@ -1,0 +1,212 @@
+# Build Headway for Linux, Windows and macOS when a version tag (v1.2.3) is pushed, package it
+# (.tar.gz, .deb, .rpm, AppImage, .zip, .msi, .dmg), publish a GitHub release, then update the
+# Homebrew cask in cnu/homebrew-tap and the headway-bin package on the AUR.
+name: Release
+
+on:
+  push:
+    tags: ["v*"]
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    name: Build ${{ matrix.name }}
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { name: linux_amd64,   os: ubuntu-22.04,     target: x86_64-unknown-linux-gnu }
+          - { name: linux_arm64,   os: ubuntu-22.04-arm, target: aarch64-unknown-linux-gnu }
+          - { name: darwin_arm64,  os: macos-14,         target: aarch64-apple-darwin }
+          - { name: darwin_amd64,  os: macos-14,         target: x86_64-apple-darwin }
+          - { name: windows_amd64, os: windows-latest,   target: x86_64-pc-windows-msvc }
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - uses: actions/checkout@v5
+
+      - name: Check the tag matches Cargo.toml
+        run: |
+          crate=$(sed -n 's/^version = "\(.*\)"/\1/p' Cargo.toml | head -1)
+          if [ "v$crate" != "$GITHUB_REF_NAME" ]; then
+            echo "::error::Tag $GITHUB_REF_NAME does not match Cargo.toml version $crate"
+            exit 1
+          fi
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: ${{ matrix.target }}
+
+      # Older Ubuntu keeps the glibc requirement low; these headers are what winit/eframe link against.
+      - name: Install Linux build dependencies
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libxkbcommon-dev libxcb-render0-dev libxcb-shape0-dev libxcb-xfixes0-dev
+
+      - name: Build
+        run: cargo build --release --locked --target ${{ matrix.target }}
+
+      - name: Install Linux packaging tools
+        if: runner.os == 'Linux'
+        uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-deb@3.8.0,cargo-generate-rpm@0.21.1
+
+      - name: Install WiX
+        if: runner.os == 'Windows'
+        run: |
+          dotnet tool install --global wix --version 5.0.2
+          echo "$USERPROFILE/.dotnet/tools" >> "$GITHUB_PATH"
+
+      - name: Package
+        run: |
+          version="${GITHUB_REF_NAME#v}"
+          out="target/${{ matrix.target }}/release"
+          mkdir dist
+          case "$RUNNER_OS" in
+            Linux)
+              .github/scripts/package-linux.sh "$version" "${{ matrix.target }}" "${{ matrix.name }}" dist ;;
+            Windows)
+              7z a "dist/headway_${version}_${{ matrix.name }}.zip" "./$out/headway.exe"
+              wix build assets/windows/headway.wxs -arch x64 -d Version="$version" -d ExePath="$out/headway.exe" \
+                -o "dist/headway_${version}_${{ matrix.name }}.msi" ;;
+            macOS)
+              tar -czf "dist/headway_${version}_${{ matrix.name }}.tar.gz" -C "$out" headway ;;
+          esac
+
+      - uses: actions/upload-artifact@v5
+        with:
+          name: ${{ matrix.name }}
+          path: dist/*
+          if-no-files-found: error
+
+  dmg:
+    name: Build macOS app and .dmg
+    needs: build
+    runs-on: macos-14
+    steps:
+      - uses: actions/checkout@v5
+
+      - uses: actions/download-artifact@v5
+        with:
+          pattern: darwin_*
+          path: dist
+          merge-multiple: true
+
+      - name: Package
+        run: |
+          version="${GITHUB_REF_NAME#v}"
+          for arch in arm64 amd64; do
+            mkdir -p "bin/$arch"
+            tar -xzf "dist/headway_${version}_darwin_$arch.tar.gz" -C "bin/$arch"
+          done
+          .github/scripts/package-macos.sh "$version" bin/arm64/headway bin/amd64/headway out
+
+      - uses: actions/upload-artifact@v5
+        with:
+          name: macos_dmg
+          path: out/*
+          if-no-files-found: error
+
+  release:
+    name: Publish GitHub release
+    needs: [build, dmg]
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+
+      - uses: actions/download-artifact@v5
+        with:
+          path: dist
+          merge-multiple: true
+
+      - name: Write checksums
+        working-directory: dist
+        run: find . -type f ! -name checksums.txt -printf '%P\n' | sort | xargs sha256sum > checksums.txt
+
+      - name: Create release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          # Release notes: this version's section of CHANGELOG.md, or GitHub's own if there isn't one.
+          .github/scripts/changelog-notes.sh "${GITHUB_REF_NAME#v}" > notes.md
+          if [ -s notes.md ]; then notes=(--notes-file notes.md); else notes=(--generate-notes); fi
+          gh release create "$GITHUB_REF_NAME" dist/* \
+            --repo "$GITHUB_REPOSITORY" \
+            --title "Headway $GITHUB_REF_NAME" \
+            "${notes[@]}"
+
+  homebrew:
+    name: Update Homebrew cask
+    needs: release
+    runs-on: ubuntu-latest
+    env:
+      TAP_TOKEN: ${{ secrets.HOMEBREW_TAP_GITHUB_TOKEN }}
+    steps:
+      - uses: actions/checkout@v5
+
+      - uses: actions/download-artifact@v5
+        with:
+          path: dist
+          merge-multiple: true
+
+      - name: Push cask to cnu/homebrew-tap
+        run: |
+          if [ -z "$TAP_TOKEN" ]; then
+            echo "::warning::HOMEBREW_TAP_GITHUB_TOKEN is not set; skipping the Homebrew update."
+            exit 0
+          fi
+          version="${GITHUB_REF_NAME#v}"
+          git clone "https://x-access-token:${TAP_TOKEN}@github.com/cnu/homebrew-tap.git" tap
+          .github/scripts/homebrew-cask.sh "$version" dist > tap/Casks/headway.rb
+          cd tap
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add Casks/headway.rb
+          git commit -m "Headway $version"
+          git push
+
+  aur:
+    name: Update AUR package
+    needs: release
+    runs-on: ubuntu-latest
+    env:
+      AUR_KEY: ${{ secrets.AUR_SSH_PRIVATE_KEY }}
+    steps:
+      - uses: actions/checkout@v5
+
+      - uses: actions/download-artifact@v5
+        with:
+          pattern: linux_*
+          path: dist
+          merge-multiple: true
+
+      - name: Push headway-bin to the AUR
+        run: |
+          if [ -z "$AUR_KEY" ]; then
+            echo "::warning::AUR_SSH_PRIVATE_KEY is not set; skipping the AUR update."
+            exit 0
+          fi
+          version="${GITHUB_REF_NAME#v}"
+          mkdir -p ~/.ssh
+          printf '%s\n' "$AUR_KEY" > ~/.ssh/aur
+          chmod 600 ~/.ssh/aur
+          ssh-keyscan -t ed25519 aur.archlinux.org >> ~/.ssh/known_hosts
+          export GIT_SSH_COMMAND="ssh -i ~/.ssh/aur -o IdentitiesOnly=yes"
+          git clone ssh://aur@aur.archlinux.org/headway-bin.git aur
+          .github/scripts/aur-package.sh "$version" dist aur
+          cd aur
+          git config user.name "Srinivasan Rangarajan"
+          git config user.email "srinivasanr@gmail.com"
+          git add PKGBUILD .SRCINFO
+          git commit -m "Update to $version"
+          git push origin HEAD:master

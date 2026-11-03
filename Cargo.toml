@@ -1,0 +1,84 @@
+[package]
+name = "headway"
+version = "0.1.0"
+edition = "2024"
+description = "A fast, friendly native Git client with workspaces"
+license = "MIT OR Apache-2.0"
+authors = ["Srinivasan Rangarajan <srinivasanr@gmail.com>"]
+repository = "https://github.com/cnu/headway"
+homepage = "https://github.com/cnu/headway"
+readme = "README.md"
+keywords = ["git", "gui", "egui", "workspaces"]
+categories = ["development-tools", "gui"]
+
+[dependencies]
+dirs = "7.0.0"
+eframe = "0.37.0"
+egui = "0.37.0"
+image = { version = "0.25.10", default-features = false, features = ["png"] }
+pollster = "1.0.1"
+rfd = "0.17.2"
+serde = { version = "1.0.229", features = ["derive"] }
+serde_json = "1.0.154"
+
+# Keep the default (debug) build snappy: optimise our code a little and libraries fully.
+[profile.dev]
+opt-level = 1
+
+[profile.dev.package."*"]
+opt-level = 3
+
+# The version to ship: fast and as small as reasonable.
+[profile.release]
+opt-level = 3
+lto = "fat"          # optimise across all libraries together
+codegen-units = 1    # slower to build, smaller and faster to run
+strip = true         # leave out debugging symbols
+
+# Embeds the app icon into headway.exe (see build.rs).
+[target.'cfg(windows)'.build-dependencies]
+winresource = "0.1.34"
+
+[dev-dependencies]
+egui_kittest = { version = "0.37.0", features = ["eframe"] }
+egui_system_font_provider = "0.37.0"
+
+# ---- Linux packages (built by the release workflow) ------------------------
+# .deb: cargo deb --no-build --target <triple>
+[package.metadata.deb]
+section = "vcs"
+depends = "git, $auto"
+extended-description = """\
+Headway groups the repositories you work on into workspaces, so you can see \
+all of them at once and jump between them in tabs. It runs the git already on \
+your computer, so it uses your existing settings, keys and logins."""
+assets = [
+    ["target/release/headway", "usr/bin/", "755"],
+    ["assets/linux/headway.desktop", "usr/share/applications/", "644"],
+    ["assets/icon/headway.svg", "usr/share/icons/hicolor/scalable/apps/", "644"],
+    ["assets/icon/headway-16.png", "usr/share/icons/hicolor/16x16/apps/headway.png", "644"],
+    ["assets/icon/headway-32.png", "usr/share/icons/hicolor/32x32/apps/headway.png", "644"],
+    ["assets/icon/headway-48.png", "usr/share/icons/hicolor/48x48/apps/headway.png", "644"],
+    ["assets/icon/headway-64.png", "usr/share/icons/hicolor/64x64/apps/headway.png", "644"],
+    ["assets/icon/headway-128.png", "usr/share/icons/hicolor/128x128/apps/headway.png", "644"],
+    ["assets/icon/headway-256.png", "usr/share/icons/hicolor/256x256/apps/headway.png", "644"],
+    ["assets/icon/headway-512.png", "usr/share/icons/hicolor/512x512/apps/headway.png", "644"],
+]
+
+# .rpm: cargo generate-rpm --target <triple>
+[package.metadata.generate-rpm]
+assets = [
+    { source = "target/release/headway", dest = "/usr/bin/headway", mode = "755" },
+    { source = "assets/linux/headway.desktop", dest = "/usr/share/applications/headway.desktop", mode = "644" },
+    { source = "assets/icon/headway.svg", dest = "/usr/share/icons/hicolor/scalable/apps/headway.svg", mode = "644" },
+    { source = "assets/icon/headway-16.png", dest = "/usr/share/icons/hicolor/16x16/apps/headway.png", mode = "644" },
+    { source = "assets/icon/headway-32.png", dest = "/usr/share/icons/hicolor/32x32/apps/headway.png", mode = "644" },
+    { source = "assets/icon/headway-48.png", dest = "/usr/share/icons/hicolor/48x48/apps/headway.png", mode = "644" },
+    { source = "assets/icon/headway-64.png", dest = "/usr/share/icons/hicolor/64x64/apps/headway.png", mode = "644" },
+    { source = "assets/icon/headway-128.png", dest = "/usr/share/icons/hicolor/128x128/apps/headway.png", mode = "644" },
+    { source = "assets/icon/headway-256.png", dest = "/usr/share/icons/hicolor/256x256/apps/headway.png", mode = "644" },
+    { source = "assets/icon/headway-512.png", dest = "/usr/share/icons/hicolor/512x512/apps/headway.png", mode = "644" },
+]
+
+[package.metadata.generate-rpm.requires]
+git = "*"

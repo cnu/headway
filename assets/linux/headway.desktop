@@ -1,0 +1,10 @@
+[Desktop Entry]
+Type=Application
+Name=Headway
+GenericName=Git Client
+Comment=A fast, friendly git client with workspaces
+Exec=headway
+Icon=headway
+Terminal=false
+Categories=Development;RevisionControl;
+StartupWMClass=headway

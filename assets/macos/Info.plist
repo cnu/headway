@@ -1,0 +1,33 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<!-- Headway.app's Info.plist; @VERSION@ is filled in by .github/scripts/package-macos.sh. -->
+<plist version="1.0">
+<dict>
+    <key>CFBundleName</key>
+    <string>Headway</string>
+    <key>CFBundleDisplayName</key>
+    <string>Headway</string>
+    <key>CFBundleIdentifier</key>
+    <string>io.github.cnu.headway</string>
+    <key>CFBundleExecutable</key>
+    <string>headway</string>
+    <key>CFBundleIconFile</key>
+    <string>headway</string>
+    <key>CFBundlePackageType</key>
+    <string>APPL</string>
+    <key>CFBundleShortVersionString</key>
+    <string>@VERSION@</string>
+    <key>CFBundleVersion</key>
+    <string>@VERSION@</string>
+    <key>CFBundleInfoDictionaryVersion</key>
+    <string>6.0</string>
+    <key>LSMinimumSystemVersion</key>
+    <string>11.0</string>
+    <key>LSApplicationCategoryType</key>
+    <string>public.app-category.developer-tools</string>
+    <key>NSHighResolutionCapable</key>
+    <true/>
+    <key>NSHumanReadableCopyright</key>
+    <string>Copyright © 2026 Srinivasan Rangarajan</string>
+</dict>
+</plist>
