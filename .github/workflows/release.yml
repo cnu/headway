@@ -77,8 +77,10 @@ jobs:
               .github/scripts/package-linux.sh "$version" "${{ matrix.target }}" "${{ matrix.name }}" dist ;;
             Windows)
               7z a "dist/headway_${version}_${{ matrix.name }}.zip" "./$out/headway.exe"
+              # WiX also writes a .wixpdb (debug data) next to the .msi; keep it out of the release.
               wix build assets/windows/headway.wxs -arch x64 -d Version="$version" -d ExePath="$out/headway.exe" \
-                -o "dist/headway_${version}_${{ matrix.name }}.msi" ;;
+                -o "msi/headway_${version}_${{ matrix.name }}.msi"
+              mv msi/*.msi dist/ ;;
             macOS)
               tar -czf "dist/headway_${version}_${{ matrix.name }}.tar.gz" -C "$out" headway ;;
           esac
