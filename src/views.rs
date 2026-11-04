@@ -3110,6 +3110,64 @@ mod tests {
         assert_eq!(picked(&sel), [2]);
     }
 
+    /// Each run of a laid-out line: (text, colour, background).
+    fn runs(job: &LayoutJob) -> Vec<(String, Color32, Color32)> {
+        job.sections.iter().map(|s| (job.text[s.byte_range.start.0..s.byte_range.end.0].to_string(), s.format.color, s.format.background)).collect()
+    }
+
+    fn span(start: u32, end: u32, tok: highlight::Tok) -> highlight::Span {
+        highlight::Span { start, end, tok }
+    }
+
+    #[test]
+    fn code_lines_keep_colours_on_the_right_characters_past_tabs_and_accents() {
+        use highlight::Tok;
+        // Bytes: \t0 l1 e2 t3 _4 x5 _6 =7 _8 "9 é10-11 "12 ;13
+        let text = "\tlet x = \"é\";";
+        let job = code_job(text, &[span(1, 4, Tok::Keyword), span(9, 13, Tok::String)], CODE, true, Emphasis::NONE);
+        assert_eq!(job.text, "    let x = \"é\";", "a tab is four spaces");
+        let kw = theme::syntax(Tok::Keyword, true);
+        let st = theme::syntax(Tok::String, true);
+        let none = Color32::TRANSPARENT;
+        assert_eq!(
+            runs(&job),
+            [("    ".into(), CODE, none), ("let".into(), kw, none), (" x = ".into(), CODE, none), ("\"é\"".into(), st, none), (";".into(), CODE, none)]
+        );
+        // The light colours are used on a light background.
+        let light = code_job(text, &[span(1, 4, Tok::Keyword)], CODE_LIGHT, false, Emphasis::NONE);
+        assert_eq!(runs(&light)[1].1, theme::syntax(Tok::Keyword, false));
+    }
+
+    #[test]
+    fn changed_words_get_a_background_and_whitespace_changes_show() {
+        let bg = theme::emphasis(true, true);
+        let none = Color32::TRANSPARENT;
+        // An ordinary change: the word gets the background, nothing else changes.
+        let job = code_job("a = count;", &[], ADD_FG, true, Emphasis { ranges: std::slice::from_ref(&(4..9)), bg, show_whitespace: false });
+        assert_eq!(runs(&job), [("a = ".into(), ADD_FG, none), ("count".into(), ADD_FG, bg), (";".into(), ADD_FG, none)]);
+        // A whitespace-only change: marked spaces and tabs become · and →.
+        let job = code_job("\tif  x", &[], ADD_FG, true, Emphasis { ranges: &[0..1, 3..5], bg, show_whitespace: true });
+        assert_eq!(job.text, "→   if··x");
+        let r = runs(&job);
+        assert_eq!((r[0].0.as_str(), r[0].2), ("→   ", bg));
+        assert_eq!((r[1].0.as_str(), r[1].2), ("if", none));
+        assert_eq!((r[2].0.as_str(), r[2].2), ("··", bg));
+        assert_ne!(r[2].1, ADD_FG, "the dots are drawn faintly");
+        // Unmarked whitespace stays as it is, even in a whitespace-only change.
+        assert_eq!(code_job("a b", &[], ADD_FG, true, Emphasis { ranges: &[], bg, show_whitespace: true }).text, "a b");
+    }
+
+    #[test]
+    fn very_long_coloured_lines_are_cut_at_a_character_boundary() {
+        let text = "é".repeat(MAX_LINE_CHARS + 5);
+        let n = text.len() as u32;
+        let job = code_job(&text, &[span(0, n, highlight::Tok::String)], CODE, true, Emphasis { ranges: std::slice::from_ref(&(0..text.len())), bg: Color32::RED, show_whitespace: false });
+        let r = runs(&job);
+        assert_eq!(r[0].0.chars().count(), MAX_LINE_CHARS);
+        assert_eq!(r.last().unwrap(), &("  … (line shortened)".to_string(), CODE, Color32::TRANSPARENT), "the note isn't coloured or marked");
+        assert_eq!(job.text.chars().count(), display_line(&text).chars().count(), "same length as uncoloured lines");
+    }
+
     #[test]
     fn binary_files_say_how_big_they_are() {
         assert_eq!(binary_note(Some(2_200_000), Some(2_400_000)), "Binary file, 2.1 MB → 2.3 MB");

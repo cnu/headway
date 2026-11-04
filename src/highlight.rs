@@ -187,14 +187,33 @@ pub fn highlight(path: &str, text: &str) -> Option<Highlighted> {
     Some(out)
 }
 
+/// Highlighted files by key, forgetting the oldest beyond `cap`.
 struct Cache {
     map: HashMap<String, Option<Arc<Highlighted>>>,
     order: VecDeque<String>,
+    cap: usize,
+}
+
+impl Cache {
+    fn new(cap: usize) -> Self {
+        Self { map: HashMap::new(), order: VecDeque::new(), cap }
+    }
+
+    fn insert(&mut self, key: String, value: Option<Arc<Highlighted>>) {
+        if self.map.insert(key.clone(), value).is_none() {
+            self.order.push_back(key);
+        }
+        while self.order.len() > self.cap {
+            if let Some(old) = self.order.pop_front() {
+                self.map.remove(&old);
+            }
+        }
+    }
 }
 
 fn cache() -> &'static Mutex<Cache> {
     static CACHE: OnceLock<Mutex<Cache>> = OnceLock::new();
-    CACHE.get_or_init(|| Mutex::new(Cache { map: HashMap::new(), order: VecDeque::new() }))
+    CACHE.get_or_init(|| Mutex::new(Cache::new(CACHE_FILES)))
 }
 
 /// The colours of blob `id` (named `path`), highlighting it with the text from
@@ -208,14 +227,7 @@ pub fn cached(id: &str, path: &str, read: impl FnOnce() -> Option<String>) -> Op
     }
     let done = read().and_then(|text| highlight(path, &text)).map(Arc::new);
     if let Ok(mut c) = cache().lock() {
-        if c.map.insert(key.clone(), done.clone()).is_none() {
-            c.order.push_back(key);
-        }
-        while c.order.len() > CACHE_FILES {
-            if let Some(old) = c.order.pop_front() {
-                c.map.remove(&old);
-            }
-        }
+        c.insert(key, done.clone());
     }
     done
 }
@@ -338,6 +350,23 @@ mod tests {
     fn huge_or_minified_files_are_skipped() {
         assert!(highlight("a.js", &"x".repeat(MAX_BYTES + 1)).is_none());
         assert!(highlight("a.js", &format!("var a = '{}';\n", "x".repeat(MAX_LINE_BYTES))).is_none());
+    }
+
+    #[test]
+    fn the_cache_forgets_the_oldest_files_first() {
+        let mut c = Cache::new(2);
+        let h = || Some(Arc::new(Highlighted::default()));
+        c.insert("a".into(), h());
+        c.insert("b".into(), h());
+        c.insert("a".into(), None);
+        assert_eq!(c.order.len(), 2, "storing a key again doesn't count it twice");
+        c.insert("c".into(), h());
+        assert!(!c.map.contains_key("a") && c.map.contains_key("b") && c.map.contains_key("c"));
+        assert_eq!(c.order, ["b", "c"]);
+        // Files that can't be highlighted are remembered too, so they aren't tried again.
+        c.insert("d".into(), None);
+        assert!(matches!(c.map.get("d"), Some(None)));
+        assert_eq!(c.map.len(), 2);
     }
 
     #[test]

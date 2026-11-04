@@ -3079,6 +3079,119 @@ mod tests {
     }
 
     #[test]
+    fn highlighting_stops_when_nobody_wants_the_diff() {
+        use crate::highlight::{self, Job, JobFile};
+        let dir = temp_repo("hl-cancel");
+        // Contents no other test has, so its blob id is only ever seen here.
+        let text = format!("fn cancelled_{}() {{}}\n", std::process::id());
+        std::fs::write(dir.join("c.rs"), &text).unwrap();
+        stage(&dir, &["c.rs".into()]).unwrap();
+        let id = run(&dir, &["rev-parse", ":c.rs"]).unwrap().trim().to_string();
+        let file = || JobFile { path: "c.rs".into(), old_path: "c.rs".into(), old_id: Some(id.clone()), new_id: None, new_on_disk: false };
+
+        // The diff was closed: the job holds the only reference to its slots.
+        let slots = std::sync::Arc::new(vec![std::sync::OnceLock::new()]);
+        let weak = std::sync::Arc::downgrade(&slots);
+        Job { repo: dir.clone(), slots, files: vec![(0, file())] }.run(&|| {});
+        assert!(weak.upgrade().is_none());
+        assert!(!highlight::is_cached(&id, "c.rs"), "nothing was highlighted for a closed diff");
+
+        // Still open: the same job does the work.
+        let slots = std::sync::Arc::new(vec![std::sync::OnceLock::new()]);
+        Job { repo: dir.clone(), slots: slots.clone(), files: vec![(0, file())] }.run(&|| {});
+        assert!(slots[0].get().unwrap().old.is_some());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn linked_worktrees_read_their_own_files_for_colours_and_sizes() {
+        use crate::app::DiffDoc;
+        use crate::highlight::Tok;
+        use crate::views::DiffMode;
+        let dir = temp_repo("hl-worktree");
+        std::fs::write(dir.join("lib.rs"), "fn a() {}\nconst S: &str = \"x\";\n").unwrap();
+        std::fs::write(dir.join("data.bin"), vec![0u8; 1000]).unwrap();
+        stage(&dir, &["lib.rs".into(), "data.bin".into()]).unwrap();
+        commit(&dir, "first", false).unwrap();
+        let wt = dir.with_file_name(format!("{}-wt", dir.file_name().unwrap().to_string_lossy()));
+        let _ = std::fs::remove_dir_all(&wt);
+        run(&dir, &["worktree", "add", "-q", "-b", "side", wt.to_str().unwrap()]).unwrap();
+        assert!(wt.join(".git").is_file(), "a linked worktree's .git is a file, not a folder");
+
+        // Changed only in the worktree; the main checkout keeps the old files.
+        std::fs::write(wt.join("lib.rs"), "fn a() {}\nconst S: &str = \"changed in the worktree\";\n").unwrap();
+        std::fs::write(wt.join("data.bin"), vec![1u8; 4000]).unwrap();
+        let st = status(&wt).unwrap();
+        let (unstaged, _) = worktree_diffs(&wt, &st, false).unwrap();
+        let mut doc = DiffDoc::working(vec![("UNSTAGED".into(), DiffMode::Unstaged, unstaged.into_iter().map(|f| (f, false)).collect())]);
+        doc.load_binaries(&wt, None);
+        let bin = doc.files.iter().position(|f| f.path == "data.bin").unwrap();
+        assert_eq!(doc.binary_sizes.get(&bin), Some(&(Some(1000), Some(4000))), "the new size is the worktree's file");
+
+        doc.highlighter(&wt).run(&|| {});
+        let rs = doc.files.iter().position(|f| f.path == "lib.rs").unwrap();
+        let added = doc.files[rs].hunks[0].lines.iter().find(|l| l.kind == LineKind::Add).unwrap();
+        assert_eq!(added.text, "const S: &str = \"changed in the worktree\";");
+        let toks: Vec<Tok> = doc.spans(rs, added).expect("coloured from the worktree's copy").iter().map(|s| s.tok).collect();
+        assert!(toks.contains(&Tok::String));
+        assert!(doc.spans(rs, doc.files[rs].hunks[0].lines.iter().find(|l| l.kind == LineKind::Del).unwrap()).is_some(), "and the old side from git");
+        let _ = run(&dir, &["worktree", "remove", "--force", wt.to_str().unwrap()]);
+        let _ = std::fs::remove_dir_all(&wt);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn renamed_files_use_their_old_name_for_the_old_side() {
+        use crate::app::DiffDoc;
+        use crate::highlight::Tok;
+        use crate::views::DiffMode;
+        let dir = temp_repo("hl-rename");
+        // Python, renamed to a name Headway doesn't know: "# ..." is a comment only in the old one.
+        let body: String = (1..=12).map(|i| format!("value_{i} = {i}\n")).collect();
+        std::fs::write(dir.join("tool.py"), format!("# settings\n{body}")).unwrap();
+        std::fs::write(dir.join("blob.bin"), [vec![0u8; 3000], vec![7u8; 100]].concat()).unwrap();
+        std::fs::write(dir.join("tidy.rs"), "fn a() {\n    b();\n    c();\n    d();\n}\n").unwrap();
+        stage(&dir, &["tool.py".into(), "blob.bin".into(), "tidy.rs".into()]).unwrap();
+        commit(&dir, "first", false).unwrap();
+        run(&dir, &["mv", "tool.py", "tool"]).unwrap();
+        std::fs::write(dir.join("tool"), format!("# settings\n{body}value_13 = 13\n")).unwrap();
+        run(&dir, &["mv", "blob.bin", "blob2.bin"]).unwrap();
+        std::fs::write(dir.join("blob2.bin"), [vec![0u8; 3000], vec![7u8; 120]].concat()).unwrap();
+        stage(&dir, &["tool".into(), "blob2.bin".into()]).unwrap();
+
+        let st = status(&dir).unwrap();
+        let (_, staged) = worktree_diffs(&dir, &st, false).unwrap();
+        let mut doc = DiffDoc::working(vec![("STAGED".into(), DiffMode::Staged, staged.into_iter().map(|f| (f, false)).collect())]);
+        let tool = doc.files.iter().position(|f| f.path == "tool").unwrap();
+        assert_eq!(doc.files[tool].old_path.as_deref(), Some("tool.py"));
+        doc.highlighter(&dir).run(&|| {});
+        let sides = doc.syntax[tool].get().expect("still coloured: the old name is Python");
+        let first_old = sides.old.as_ref().unwrap().line(1, "# settings").unwrap();
+        assert_eq!(first_old.iter().map(|s| s.tok).collect::<Vec<_>>(), [Tok::Comment]);
+        assert!(sides.new.is_none(), "the new name isn't a known language");
+
+        // A renamed binary file gets both sizes.
+        doc.load_binaries(&dir, None);
+        let bin = doc.files.iter().position(|f| f.path == "blob2.bin").unwrap();
+        assert_eq!(doc.files[bin].old_path.as_deref(), Some("blob.bin"));
+        assert_eq!(doc.binary_sizes.get(&bin), Some(&(Some(3100), Some(3120))));
+
+        // Renamed and only re-indented: with whitespace ignored it's still listed, under both names.
+        commit(&dir, "rename", false).unwrap();
+        run(&dir, &["mv", "tidy.rs", "neat.rs"]).unwrap();
+        std::fs::write(dir.join("neat.rs"), "fn a() {\n\tb();\n    c();\n    d();\n}\n").unwrap();
+        stage(&dir, &["neat.rs".into()]).unwrap();
+        commit(&dir, "move and re-indent", false).unwrap();
+        let head = run(&dir, &["rev-parse", "HEAD"]).unwrap().trim().to_string();
+        let d = commit_detail(&dir, &head, true).unwrap();
+        assert_eq!(d.files.len(), 1, "{:?}", d.files.iter().map(|f| &f.path).collect::<Vec<_>>());
+        let f = &d.files[0];
+        assert_eq!((f.path.as_str(), f.old_path.as_deref(), f.change.clone()), ("neat.rs", Some("tidy.rs"), Change::Renamed));
+        assert_eq!(f.note.as_deref(), Some(WHITESPACE_ONLY));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
     fn ignoring_whitespace_hides_whitespace_only_changes() {
         let dir = temp_repo("ignore-ws");
         std::fs::write(dir.join("a.rs"), "fn a() {\n    x();\n}\n").unwrap();

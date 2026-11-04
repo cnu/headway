@@ -2131,3 +2131,75 @@ fn large_changes_wait_for_show_anyway() {
     click(&mut h, "Show anyway");
     assert!(!shows(&h, note));
 }
+
+#[test]
+fn switching_layout_reaches_every_open_diff() {
+    use super::{Action, FileOpen};
+    let s = scratch("layout-everywhere");
+    let r1 = new_repo(&s.root, "one");
+    commit(&r1, "f.txt", "a\n", "Add f");
+    commit(&r1, "f.txt", "b\n", "Change f");
+    write(&r1, "f.txt", "c\n");
+    let r2 = new_repo(&s.root, "two");
+    commit(&r2, "g.txt", "x\n", "Add g");
+    write(&r2, "g.txt", "y\n");
+    let mut h = app(&s, &[&r1, &r2], true);
+
+    // In the first tab: the uncommitted changes, a commit's changes, and a file's history.
+    click(&mut h, "Change f");
+    h.state_mut().do_action(Action::File(FileOpen::History { path: "f.txt".into(), folder: false }));
+    settle(&mut h);
+    // Then move to a second tab, so the first one is out of sight.
+    h.state_mut().do_action(Action::OpenRepo(r2.clone()));
+    settle(&mut h);
+
+    let docs_split = |h: &Harness<'static, HeadwayApp>, r: &Path| -> Vec<bool> {
+        let rv = &h.state().tabs[r];
+        let history = rv.file_view.as_ref().and_then(|f| f.history.as_ref()).and_then(|h| h.diff.as_ref()).and_then(|d| d.as_ref().ok());
+        [rv.wd_doc.as_ref(), rv.detail.as_ref().map(|d| &d.doc), history].into_iter().map(|d| d.expect("every kind of diff is open").split).collect()
+    };
+    assert_eq!(docs_split(&h, &r1), [false, false, false]);
+
+    h.state_mut().cfg.view.diff.split = true;
+    h.state_mut().do_action(Action::DiffPrefsChanged { reload: false });
+    settle(&mut h);
+    assert_eq!(docs_split(&h, &r1), [true, true, true], "the tab in the background follows");
+    assert!(h.state().tabs[&r2].wd_doc.as_ref().unwrap().split);
+
+    // Diffs read afterwards come out side by side too.
+    write(&r2, "g.txt", "z\n");
+    ctrl(&mut h, egui::Key::R);
+    let wd = h.state().tabs[&r2].wd_doc.as_ref().unwrap();
+    assert!(wd.split && wd.files[0].hunks[0].lines.iter().any(|l| l.text == "z"), "a fresh reading, still split");
+    assert!(shows(&h, "Side by side"));
+}
+
+#[test]
+fn dragging_side_by_side_stays_in_its_column() {
+    let s = scratch("split-drag");
+    let r = new_repo(&s.root, "words");
+    commit(&r, "a.txt", "top\nold one\nold two\nold three\nbottom\n", "Start");
+    write(&r, "a.txt", "top\nnew one\nnew two\nnew three\nbottom\n");
+    let mut h = app(&s, &[&r], true);
+    click(&mut h, "Unified");
+    click(&mut h, "Side by side");
+
+    // Drag down the left column, over three removed lines that each face an added one.
+    let from = h.get_all_by_label("line old one").next().unwrap().rect().center();
+    let to = h.get_all_by_label("line old three").next().unwrap().rect().center();
+    let right = h.get_all_by_label("line new three").next().unwrap().rect();
+    assert!(right.y_range().contains(to.y) && !right.x_range().contains(to.x), "the pointer ends level with an added line, but left of it");
+    drag(&mut h, from, to);
+    assert!(shows(&h, "3 lines picked"), "only the left column's lines");
+    click(&mut h, "Stage lines");
+    let cached = git_ok(&r, &["diff", "--cached"]);
+    assert!(cached.contains("-old one\n-old two\n-old three\n") && !cached.contains("+new"), "{cached}");
+
+    // And down the right column: only added lines.
+    let from = h.get_all_by_label("line new one").next().unwrap().rect().center();
+    let to = h.get_all_by_label("line new three").next().unwrap().rect().center();
+    drag(&mut h, from, to);
+    assert!(shows(&h, "3 lines picked"));
+    click(&mut h, "Stage lines");
+    assert!(git_ok(&r, &["diff"]).is_empty(), "everything is staged now");
+}

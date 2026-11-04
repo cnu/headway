@@ -359,7 +359,11 @@ impl DiffDoc {
             .files
             .iter()
             .enumerate()
-            .filter(|(fi, f)| !f.binary && !f.hunks.is_empty() && self.preview(*fi).is_none() && highlight::knows(&f.path))
+            .filter(|(fi, f)| {
+                // A renamed file is worth colouring if either name is a language Headway knows.
+                let known = highlight::knows(&f.path) || f.old_path.as_deref().is_some_and(highlight::knows);
+                !f.binary && !f.hunks.is_empty() && self.preview(*fi).is_none() && known
+            })
             .map(|(fi, f)| {
                 let new_on_disk = matches!(self.modes.get(fi), Some(views::DiffMode::Unstaged | views::DiffMode::Untracked));
                 let old_path = f.old_path.clone().unwrap_or_else(|| f.path.clone());
