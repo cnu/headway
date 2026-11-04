@@ -3,7 +3,7 @@
 //! Everything here is blocking and is meant to be called from worker threads.
 
 use std::collections::HashMap;
-use std::io::Write;
+use std::io::{BufRead, BufReader, Read, Write};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 
@@ -2470,6 +2470,441 @@ fn parse_reflog_line(line: &str) -> Option<ReflogEntry> {
     Some(ReflogEntry { hash, action, message, time })
 }
 
+// ---------------------------------------------------------------------------
+// Blame and file history
+
+/// Run git and hand each line of its output to `on_line` as soon as it arrives
+/// (for slow commands worth showing early, like blame).
+pub fn stream(repo: &Path, args: &[&str], mut on_line: impl FnMut(&str)) -> GitResult<()> {
+    let mut child = base_cmd(repo).args(args).spawn().map_err(|e| format!("Could not start git: {e}"))?;
+    // stderr is read on its own thread, so a chatty git can't fill the pipe and stall.
+    let mut err_pipe = child.stderr.take();
+    let err_reader = std::thread::spawn(move || {
+        let mut s = String::new();
+        if let Some(e) = err_pipe.as_mut() {
+            let _ = e.read_to_string(&mut s);
+        }
+        s
+    });
+    if let Some(out) = child.stdout.take() {
+        let mut r = BufReader::new(out);
+        let mut buf = Vec::new();
+        loop {
+            buf.clear();
+            match r.read_until(b'\n', &mut buf) {
+                Ok(0) => break,
+                Ok(_) => on_line(String::from_utf8_lossy(&buf).trim_end_matches(['\n', '\r'])),
+                Err(e) => {
+                    let _ = child.kill();
+                    let _ = child.wait();
+                    return Err(e.to_string());
+                }
+            }
+        }
+    }
+    let status = child.wait().map_err(|e| e.to_string())?;
+    let err = err_reader.join().unwrap_or_default();
+    if status.success() {
+        Ok(())
+    } else {
+        let err = err.trim();
+        Err(if err.is_empty() { format!("git {} failed", args.join(" ")) } else { err.to_string() })
+    }
+}
+
+/// A commit that blame names as the last to change some lines.
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct BlameCommit {
+    pub hash: String,
+    pub author: String,
+    pub email: String,
+    /// Unix seconds (author date).
+    pub time: i64,
+    pub summary: String,
+    /// The commit before it and the file's name there ("Blame the parent").
+    pub previous: Option<(String, String)>,
+    /// The oldest commit blame looked at: its lines may be older still.
+    pub boundary: bool,
+}
+
+impl BlameCommit {
+    /// Lines changed in the working copy but not committed (git's all-zero id).
+    pub fn uncommitted(&self) -> bool {
+        !self.hash.is_empty() && self.hash.bytes().all(|b| b == b'0')
+    }
+
+    pub fn short(&self) -> &str {
+        &self.hash[..self.hash.len().min(8)]
+    }
+}
+
+/// Consecutive lines that one commit last changed.
+#[derive(Clone, Debug, PartialEq)]
+pub struct BlameRange {
+    /// Index into [`BlameParser::commits`].
+    pub commit: usize,
+    /// First line (from 1) in that commit's version of the file.
+    pub orig_line: u32,
+    /// First line (from 1) in the blamed version of the file.
+    pub line: u32,
+    pub count: u32,
+    /// The file's name in that commit (it may have been renamed since).
+    pub path: String,
+}
+
+/// Reads `git blame --incremental` output a line at a time, so results can be
+/// shown while git is still working.
+#[derive(Default)]
+pub struct BlameParser {
+    pub commits: Vec<BlameCommit>,
+    index: HashMap<String, usize>,
+    cur: Option<BlameRange>,
+}
+
+impl BlameParser {
+    /// Read one line. Returns a range once its entry is complete.
+    pub fn feed(&mut self, line: &str) -> Option<BlameRange> {
+        let Some(cur) = &mut self.cur else {
+            // "<sha> <orig line> <final line> <count>" starts an entry.
+            let mut it = line.split(' ');
+            let hash = it.next()?;
+            if hash.len() < 40 || !hash.bytes().all(|b| b.is_ascii_hexdigit()) {
+                return None;
+            }
+            let orig_line = it.next()?.parse().ok()?;
+            let line_no = it.next()?.parse().ok()?;
+            let count = it.next().and_then(|c| c.parse().ok()).unwrap_or(1);
+            let commit = match self.index.get(hash) {
+                Some(&i) => i,
+                None => {
+                    self.commits.push(BlameCommit { hash: hash.to_string(), ..Default::default() });
+                    self.index.insert(hash.to_string(), self.commits.len() - 1);
+                    self.commits.len() - 1
+                }
+            };
+            self.cur = Some(BlameRange { commit, orig_line, line: line_no, count, path: String::new() });
+            return None;
+        };
+        let c = &mut self.commits[cur.commit];
+        let (key, val) = line.split_once(' ').unwrap_or((line, ""));
+        match key {
+            "author" => c.author = val.to_string(),
+            "author-mail" => c.email = val.trim_start_matches('<').trim_end_matches('>').to_string(),
+            "author-time" => c.time = val.parse().unwrap_or(0),
+            "summary" => c.summary = val.to_string(),
+            "boundary" => c.boundary = true,
+            "previous" => {
+                if let Some((h, p)) = val.split_once(' ') {
+                    c.previous = Some((h.to_string(), unquote_path(p)));
+                }
+            }
+            // "filename" always ends an entry.
+            "filename" => {
+                cur.path = unquote_path(val);
+                return self.cur.take();
+            }
+            _ => {}
+        }
+        None
+    }
+}
+
+/// How far blame looks for lines that moved.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Serialize, Deserialize)]
+pub enum BlameMoves {
+    #[default]
+    Off,
+    /// Lines moved within the file (`-M`).
+    File,
+    /// Lines moved or copied from other files changed in the same commit (`-C`).
+    Files,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct BlameOptions {
+    /// `-w`: whitespace-only changes don't count.
+    pub ignore_whitespace: bool,
+    pub moves: BlameMoves,
+    /// Skip the commits listed in the repository's ignore-revs file.
+    pub ignore_revs: bool,
+}
+
+impl Default for BlameOptions {
+    fn default() -> Self {
+        Self { ignore_whitespace: false, moves: BlameMoves::Off, ignore_revs: true }
+    }
+}
+
+/// The list of commits blame should skip (formatting commits and the like).
+#[derive(Clone, Debug, PartialEq)]
+pub struct IgnoreRevs {
+    /// As written in the setting, or the conventional file name.
+    pub file: String,
+    /// Set with `blame.ignoreRevsFile` (git then applies it by itself).
+    pub configured: bool,
+    pub exists: bool,
+}
+
+/// The repository's ignore-revs file: `blame.ignoreRevsFile` when set, otherwise a
+/// `.git-blame-ignore-revs` in the top folder (the name GitHub and GitLab look for).
+pub fn ignore_revs(repo: &Path) -> Option<IgnoreRevs> {
+    let set = run(repo, &["config", "--get-all", "blame.ignoreRevsFile"]).unwrap_or_default();
+    // An empty value clears the earlier ones.
+    let configured = set.lines().rev().take_while(|l| !l.trim().is_empty()).last().map(|l| l.trim().to_string());
+    let top = run(repo, &["rev-parse", "--show-toplevel"]).map(|t| PathBuf::from(t.trim())).unwrap_or_else(|_| repo.to_path_buf());
+    if let Some(file) = configured {
+        let p = match file.strip_prefix("~/") {
+            Some(rest) => dirs::home_dir().unwrap_or_default().join(rest),
+            None => repo.join(&file),
+        };
+        return Some(IgnoreRevs { exists: p.is_file(), file, configured: true });
+    }
+    let conventional = ".git-blame-ignore-revs";
+    top.join(conventional).is_file().then(|| IgnoreRevs { file: conventional.into(), configured: false, exists: true })
+}
+
+/// Arguments for `git blame --incremental` of `path` at `rev` (the working copy when `None`).
+pub fn blame_args(rev: Option<&str>, path: &str, opts: &BlameOptions, ignore: Option<&IgnoreRevs>) -> Vec<String> {
+    let mut a: Vec<String> = vec!["blame".into(), "--incremental".into()];
+    if opts.ignore_whitespace {
+        a.push("-w".into());
+    }
+    match opts.moves {
+        BlameMoves::Off => {}
+        BlameMoves::File => a.push("-M".into()),
+        BlameMoves::Files => a.push("-C".into()),
+    }
+    match ignore {
+        // The setting applies by itself; an empty name clears it.
+        Some(i) if i.configured && !opts.ignore_revs => a.push("--ignore-revs-file=".into()),
+        Some(i) if !i.configured && opts.ignore_revs => a.push(format!("--ignore-revs-file={}", i.file)),
+        _ => {}
+    }
+    if let Some(r) = rev {
+        a.push(r.to_string());
+    }
+    a.push("--".into());
+    a.push(path.to_string());
+    a
+}
+
+/// The text blame numbers its lines against: the file at `rev`, or the working copy.
+/// `Err` for binary files.
+pub fn blame_text(repo: &Path, rev: Option<&str>, path: &str) -> GitResult<Vec<String>> {
+    let bytes = match rev {
+        Some(r) => {
+            let out = base_cmd(repo)
+                .args(["cat-file", "blob", &format!("{r}:{path}")])
+                .output()
+                .map_err(|e| format!("Could not start git: {e}"))?;
+            if !out.status.success() {
+                return Err(String::from_utf8_lossy(&out.stderr).trim().to_string());
+            }
+            out.stdout
+        }
+        None => std::fs::read(repo.join(path)).map_err(|e| format!("Couldn't read {path}: {e}"))?,
+    };
+    if looks_binary(&bytes) {
+        return Err("This is a binary file, so it has no lines to blame.".into());
+    }
+    Ok(String::from_utf8_lossy(&bytes).lines().map(String::from).collect())
+}
+
+/// Blame `path` at `rev`, calling `on_range` for each block of lines as git finds it
+/// (not in file order). Returns every commit seen.
+pub fn blame(
+    repo: &Path,
+    rev: Option<&str>,
+    path: &str,
+    opts: &BlameOptions,
+    ignore: Option<&IgnoreRevs>,
+    mut on_range: impl FnMut(&BlameParser, BlameRange),
+) -> GitResult<Vec<BlameCommit>> {
+    if let Some(i) = ignore.filter(|i| i.configured && !i.exists) {
+        return Err(format!(
+            "blame.ignoreRevsFile is set to {}, which doesn't exist, so git can't blame. Create the file or remove the setting.",
+            i.file
+        ));
+    }
+    let args = blame_args(rev, path, opts, ignore);
+    let args: Vec<&str> = args.iter().map(String::as_str).collect();
+    let mut parser = BlameParser::default();
+    stream(repo, &args, |line| {
+        if let Some(r) = parser.feed(line) {
+            on_range(&parser, r);
+        }
+    })?;
+    Ok(parser.commits)
+}
+
+/// A commit in a file's (or folder's, or lines') history.
+#[derive(Clone, Debug, PartialEq)]
+pub struct FileCommit {
+    pub hash: String,
+    pub author: String,
+    pub email: String,
+    pub time: i64,
+    pub summary: String,
+    /// The file's name in this commit.
+    pub path: String,
+    /// Its earlier name, when this commit renamed it.
+    pub old_path: Option<String>,
+    pub change: Change,
+}
+
+/// A commit in a history, with its change to the lines when it's line history.
+pub type HistoryEntry = (FileCommit, Option<DiffFile>);
+
+const FILE_LOG_FORMAT: &str = "--format=%x1e%H%x1f%an%x1f%ae%x1f%at%x1f%s";
+
+fn file_commit_header(head: &str, path: &str) -> Option<FileCommit> {
+    let f: Vec<&str> = head.splitn(5, '\x1f').collect();
+    if f.len() < 5 {
+        return None;
+    }
+    Some(FileCommit {
+        hash: f[0].to_string(),
+        author: f[1].to_string(),
+        email: f[2].to_string(),
+        time: f[3].parse().unwrap_or(0),
+        summary: f[4].trim_end().to_string(),
+        path: path.to_string(),
+        old_path: None,
+        change: Change::Modified,
+    })
+}
+
+/// Commits that changed `path`, newest first. A file is followed across renames
+/// (each commit knows the name it had then); a folder isn't.
+pub fn file_log(repo: &Path, path: &str, folder: bool, limit: usize) -> GitResult<Vec<FileCommit>> {
+    let n = format!("-n{limit}");
+    let mut args = vec!["log", FILE_LOG_FORMAT, "--name-status", "-M", &n];
+    if !folder {
+        args.push("--follow");
+    }
+    args.extend(["--", path]);
+    let out = run(repo, &args)?;
+    Ok(parse_file_log(&out, path, folder))
+}
+
+pub fn parse_file_log(out: &str, path: &str, folder: bool) -> Vec<FileCommit> {
+    // Newest first: once a commit renames the file, older ones use the old name.
+    let mut name = path.to_string();
+    let mut list = Vec::new();
+    for chunk in out.split('\x1e').filter(|c| !c.trim().is_empty()) {
+        let mut lines = chunk.lines();
+        let Some(mut c) = file_commit_header(lines.next().unwrap_or(""), &name) else { continue };
+        if !folder {
+            for l in lines.filter(|l| !l.is_empty()) {
+                let f: Vec<&str> = l.split('\t').collect();
+                let Some(change) = f.first().and_then(|s| s.chars().next()).and_then(Change::from_code) else { continue };
+                match (&change, f.as_slice()) {
+                    (Change::Renamed | Change::Copied, [_, old, new]) => {
+                        c.path = unquote_path(new);
+                        c.old_path = Some(unquote_path(old));
+                        name = unquote_path(old);
+                    }
+                    (_, [_, p]) => {
+                        c.path = unquote_path(p);
+                        name = c.path.clone();
+                    }
+                    _ => {}
+                }
+                c.change = change;
+            }
+        }
+        list.push(c);
+    }
+    list
+}
+
+/// What one commit changed in `paths` (a file under its old and new names, or a folder).
+pub fn commit_files(repo: &Path, hash: &str, paths: &[String]) -> GitResult<Vec<DiffFile>> {
+    let mut args = vec!["show", "--no-ext-diff", "--format=", "--patch", "-M", "--diff-merges=first-parent", hash, "--"];
+    args.extend(paths.iter().map(String::as_str));
+    Ok(parse_patch(&run(repo, &args)?))
+}
+
+/// Commits that changed lines `start..=end` of `path` as it is at `rev`, newest
+/// first, each with the change to just those lines (`git log -L`).
+pub fn line_log(repo: &Path, rev: &str, path: &str, start: u32, end: u32, limit: usize) -> GitResult<Vec<HistoryEntry>> {
+    let range = format!("-L{start},{end}:{path}");
+    let n = format!("-n{limit}");
+    let out = run(repo, &["log", FILE_LOG_FORMAT, &n, &range, rev])?;
+    Ok(parse_line_log(&out, path))
+}
+
+pub fn parse_line_log(out: &str, path: &str) -> Vec<HistoryEntry> {
+    let mut list = Vec::new();
+    for chunk in out.split('\x1e').filter(|c| !c.trim().is_empty()) {
+        let (head, patch) = chunk.split_once('\n').unwrap_or((chunk, ""));
+        let Some(mut c) = file_commit_header(head, path) else { continue };
+        let file = parse_patch(patch).into_iter().next();
+        if let Some(f) = &file {
+            c.path = f.path.clone();
+            c.change = f.change.clone();
+            // -L leaves out rename headers: the two names tell.
+            let old = f.header.lines().next().and_then(|l| l.strip_prefix("diff --git a/")).and_then(|r| r.rsplit_once(" b/")).map(|(a, _)| a.to_string());
+            if old.as_deref().is_some_and(|o| o != f.path) && f.change != Change::Added {
+                c.old_path = old;
+                c.change = Change::Renamed;
+            }
+        }
+        list.push((c, file));
+    }
+    list
+}
+
+/// Line history for lines of the working copy: git starts from the last commit,
+/// so the line numbers are first moved past your uncommitted changes.
+pub fn working_line_log(repo: &Path, path: &str, start: u32, end: u32, limit: usize) -> GitResult<Vec<HistoryEntry>> {
+    let diff = run(repo, &["diff", "--no-ext-diff", "HEAD", "--", path])?;
+    let (s, e) = match parse_patch(&diff).first() {
+        Some(f) => (line_before(f, start), line_before(f, end)),
+        None => (start, end),
+    };
+    line_log(repo, "HEAD", path, s, e.max(s), limit)
+}
+
+/// Where line `new` of a changed file was before the change (line history of the
+/// working copy has to start from a commit). Added lines map to the nearest line
+/// that existed before them.
+pub fn line_before(file: &DiffFile, new: u32) -> u32 {
+    // Lines after a hunk move by what it added or removed.
+    let mut shift: i64 = 0;
+    for h in &file.hunks {
+        let (old_start, new_start) = parse_hunk_starts(&h.header);
+        let old_count = h.lines.iter().filter(|l| l.old_no.is_some()).count() as u32;
+        let new_count = h.lines.iter().filter(|l| l.new_no.is_some()).count() as u32;
+        // A hunk that only removes lines sits just after `new_start`.
+        if new < if new_count == 0 { new_start + 1 } else { new_start } {
+            break;
+        }
+        if new < new_start + new_count {
+            let mut last_old = if old_count == 0 { old_start } else { old_start.saturating_sub(1) };
+            for l in &h.lines {
+                if let Some(o) = l.old_no {
+                    last_old = o;
+                }
+                if l.new_no == Some(new) {
+                    return l.old_no.unwrap_or(last_old).max(1);
+                }
+            }
+            return last_old.max(1);
+        }
+        let after = |start: u32, count: u32| if count == 0 { start + 1 } else { start + count } as i64;
+        shift = after(old_start, old_count) - after(new_start, new_count);
+    }
+    (new as i64 + shift).max(1) as u32
+}
+
+/// Every tracked file, for the "Find file" list.
+pub fn tracked_files(repo: &Path) -> GitResult<Vec<String>> {
+    let out = run(repo, &["ls-files", "-z"])?;
+    Ok(out.split('\0').filter(|s| !s.is_empty()).map(String::from).collect())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -4245,5 +4680,211 @@ index 4444444..0000000
         assert_eq!(reflog(&dir, "refs/heads/main", 1).unwrap().len(), 1);
         assert!(reflog(&dir, "refs/heads/nope", 5).is_err());
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    // -----------------------------------------------------------------------
+    // Blame and file history
+
+    /// Who last changed each line (1-based line → (summary, name in that commit, line there)).
+    fn blame_lines(dir: &Path, rev: Option<&str>, path: &str, opts: &BlameOptions) -> Vec<(String, String, u32)> {
+        let ignore = ignore_revs(dir);
+        let mut ranges = Vec::new();
+        let commits = blame(dir, rev, path, opts, ignore.as_ref(), |_, r| ranges.push(r)).unwrap();
+        ranges.sort_by_key(|r| r.line);
+        ranges
+            .iter()
+            .flat_map(|r| (0..r.count).map(move |k| (r, k)))
+            .map(|(r, k)| {
+                let c = &commits[r.commit];
+                let who = if c.uncommitted() { "(uncommitted)".to_string() } else { c.summary.clone() };
+                (who, r.path.clone(), r.orig_line + k)
+            })
+            .collect()
+    }
+
+    #[test]
+    fn blame_parser_reads_incremental_output() {
+        let a = "a".repeat(40);
+        let b = "b".repeat(40);
+        let zero = "0".repeat(40);
+        let out = format!(
+            "{b} 2 2 1\nauthor Bo\nauthor-mail <bo@example.com>\nauthor-time 1700000000\nauthor-tz +0000\nsummary Rename it\nprevious {a} old name.txt\nfilename new.txt\n\
+             {a} 1 1 1\nauthor Ana\nauthor-mail <ana@example.com>\nauthor-time 1600000000\nsummary First\nboundary\nfilename old name.txt\n\
+             {a} 3 3 2\nfilename old name.txt\n\
+             {zero} 5 5 1\nauthor Not Committed Yet\nsummary Version of new.txt from new.txt\nfilename new.txt\n"
+        );
+        let mut p = BlameParser::default();
+        let ranges: Vec<BlameRange> = out.lines().filter_map(|l| p.feed(l)).collect();
+        assert_eq!(ranges.len(), 4);
+        assert_eq!(p.commits.len(), 3);
+        let renamed = &p.commits[ranges[0].commit];
+        assert_eq!((renamed.author.as_str(), renamed.email.as_str(), renamed.time), ("Bo", "bo@example.com", 1_700_000_000));
+        assert_eq!(renamed.previous, Some((a.clone(), "old name.txt".to_string())));
+        assert!(!renamed.boundary);
+        // The boundary mark comes only with a commit's first entry, but holds for all of them.
+        assert_eq!(ranges[1].commit, ranges[2].commit);
+        assert!(p.commits[ranges[2].commit].boundary);
+        assert_eq!((ranges[2].line, ranges[2].count, ranges[2].path.as_str()), (3, 2, "old name.txt"));
+        assert!(p.commits[ranges[3].commit].uncommitted());
+        // Anything else is ignored.
+        assert_eq!(p.feed("not a header"), None);
+    }
+
+    #[test]
+    fn blame_follows_renames_and_marks_boundary_commits() {
+        let dir = temp_repo("blame-rename");
+        commit_file_with(&dir, "f.txt", "one\ntwo\nthree\n", "Add f");
+        run(&dir, &["mv", "f.txt", "g.txt"]).unwrap();
+        std::fs::write(dir.join("g.txt"), "one\nTWO\nthree\nfour\n").unwrap();
+        stage(&dir, &["g.txt".into()]).unwrap();
+        commit(&dir, "Rename to g", false).unwrap();
+        let opts = BlameOptions::default();
+        let lines = blame_lines(&dir, Some("HEAD"), "g.txt", &opts);
+        assert_eq!(
+            lines,
+            vec![
+                ("Add f".into(), "f.txt".into(), 1),
+                ("Rename to g".into(), "g.txt".into(), 2),
+                ("Add f".into(), "f.txt".into(), 3),
+                ("Rename to g".into(), "g.txt".into(), 4),
+            ]
+        );
+        // The rename knows where to look next; the root commit is the boundary.
+        let mut seen = Vec::new();
+        let commits = blame(&dir, Some("HEAD"), "g.txt", &opts, None, |_, r| seen.push(r)).unwrap();
+        let first = run(&dir, &["rev-parse", "HEAD~1"]).unwrap().trim().to_string();
+        let rename = commits.iter().find(|c| c.summary == "Rename to g").unwrap();
+        assert_eq!(rename.previous, Some((first.clone(), "f.txt".into())));
+        let root = commits.iter().find(|c| c.hash == first).unwrap();
+        assert!(root.boundary && root.previous.is_none());
+        // Blaming the parent: the old name at the old commit.
+        assert_eq!(blame_lines(&dir, Some(&first), "f.txt", &opts).len(), 3);
+        // A range stops at a boundary commit even when the lines are older.
+        let mut ranges = Vec::new();
+        let head = run(&dir, &["rev-parse", "HEAD"]).unwrap().trim().to_string();
+        let commits = blame(&dir, Some(&format!("{first}..{head}")), "g.txt", &opts, None, |_, r| ranges.push(r)).unwrap();
+        assert!(commits.iter().any(|c| c.hash == first && c.boundary));
+        // The text it numbers against, at a commit and in the working copy.
+        assert_eq!(blame_text(&dir, Some("HEAD"), "g.txt").unwrap(), vec!["one", "TWO", "three", "four"]);
+        std::fs::write(dir.join("g.txt"), "one\r\nTWO\r\nthree\r\nfour\r\nfive\r\n").unwrap();
+        assert_eq!(blame_text(&dir, None, "g.txt").unwrap().last().unwrap(), "five");
+        let wd = blame_lines(&dir, None, "g.txt", &opts);
+        assert_eq!(wd.len(), 5);
+        assert_eq!(wd[4].0, "(uncommitted)");
+        std::fs::write(dir.join("pic.bin"), [0u8, 1, 2, 0]).unwrap();
+        assert!(blame_text(&dir, None, "pic.bin").unwrap_err().contains("binary"));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn blame_options_skip_whitespace_and_listed_commits() {
+        let dir = temp_repo("blame-options");
+        commit_file_with(&dir, "a.rs", "fn a() {\nx();\n}\n", "Write a");
+        commit_file_with(&dir, "a.rs", "fn a() {\n    x();\n}\n", "Reformat");
+        let plain = BlameOptions { ignore_revs: false, ..Default::default() };
+        assert_eq!(blame_lines(&dir, Some("HEAD"), "a.rs", &plain)[1].0, "Reformat");
+        let ws = BlameOptions { ignore_whitespace: true, ..plain };
+        assert_eq!(blame_lines(&dir, Some("HEAD"), "a.rs", &ws)[1].0, "Write a");
+
+        // A .git-blame-ignore-revs file is honoured even without the setting.
+        assert_eq!(ignore_revs(&dir), None);
+        let fmt = run(&dir, &["rev-parse", "HEAD"]).unwrap();
+        std::fs::write(dir.join(".git-blame-ignore-revs"), format!("# formatting\n{fmt}")).unwrap();
+        let found = ignore_revs(&dir).unwrap();
+        assert_eq!((found.configured, found.exists), (false, true));
+        assert_eq!(blame_lines(&dir, Some("HEAD"), "a.rs", &BlameOptions::default())[1].0, "Write a");
+        assert_eq!(blame_lines(&dir, Some("HEAD"), "a.rs", &plain)[1].0, "Reformat");
+
+        // So is the setting; turning it off clears it.
+        std::fs::rename(dir.join(".git-blame-ignore-revs"), dir.join("revs.txt")).unwrap();
+        run(&dir, &["config", "blame.ignoreRevsFile", "revs.txt"]).unwrap();
+        assert!(ignore_revs(&dir).unwrap().configured);
+        assert_eq!(blame_lines(&dir, Some("HEAD"), "a.rs", &BlameOptions::default())[1].0, "Write a");
+        assert_eq!(blame_lines(&dir, Some("HEAD"), "a.rs", &plain)[1].0, "Reformat");
+
+        // A setting that names a missing file gets a plain explanation.
+        run(&dir, &["config", "blame.ignoreRevsFile", "gone.txt"]).unwrap();
+        let missing = ignore_revs(&dir).unwrap();
+        assert!(!missing.exists);
+        let err = blame(&dir, Some("HEAD"), "a.rs", &BlameOptions::default(), Some(&missing), |_, _| {}).unwrap_err();
+        assert!(err.contains("gone.txt"), "{err}");
+
+        // Moves: -M and -C reach git.
+        let args = blame_args(None, "a.rs", &BlameOptions { moves: BlameMoves::Files, ..plain }, None);
+        assert!(args.contains(&"-C".to_string()) && args.ends_with(&["--".to_string(), "a.rs".to_string()]));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn file_history_follows_a_rename_and_folders_do_not() {
+        let dir = temp_repo("file-log");
+        std::fs::create_dir_all(dir.join("src")).unwrap();
+        commit_file_with(&dir, "src/f.txt", "1\n2\n3\n", "Add f");
+        commit_file_with(&dir, "other.txt", "x\n", "Unrelated");
+        commit_file_with(&dir, "src/f.txt", "1\ntwo\n3\n", "Edit f");
+        run(&dir, &["mv", "src/f.txt", "g.txt"]).unwrap();
+        commit(&dir, "Move f to g", false).unwrap();
+        commit_file_with(&dir, "g.txt", "1\ntwo\n3\n4\n", "Edit g");
+
+        let log = file_log(&dir, "g.txt", false, 100).unwrap();
+        let seen: Vec<(&str, &str)> = log.iter().map(|c| (c.summary.as_str(), c.path.as_str())).collect();
+        assert_eq!(seen, vec![("Edit g", "g.txt"), ("Move f to g", "g.txt"), ("Edit f", "src/f.txt"), ("Add f", "src/f.txt")]);
+        assert_eq!(log[1].change, Change::Renamed);
+        assert_eq!(log[1].old_path.as_deref(), Some("src/f.txt"));
+        assert_eq!(log[3].change, Change::Added);
+        assert_eq!(log[0].author, "Test");
+
+        // The diff of just this file, under both names for the rename.
+        let files = commit_files(&dir, &log[1].hash, &["src/f.txt".into(), "g.txt".into()]).unwrap();
+        assert_eq!(files.len(), 1);
+        assert_eq!((files[0].change.clone(), files[0].old_path.as_deref()), (Change::Renamed, Some("src/f.txt")));
+        let files = commit_files(&dir, &log[2].hash, &["src/f.txt".into()]).unwrap();
+        assert_eq!((files[0].added, files[0].removed), (1, 1));
+
+        // A folder lists what happened inside it, without following anything out.
+        let folder = file_log(&dir, "src", true, 100).unwrap();
+        let seen: Vec<&str> = folder.iter().map(|c| c.summary.as_str()).collect();
+        assert_eq!(seen, vec!["Move f to g", "Edit f", "Add f"]);
+        assert_eq!(file_log(&dir, "g.txt", false, 2).unwrap().len(), 2);
+        assert_eq!(tracked_files(&dir).unwrap(), vec!["g.txt", "other.txt"]);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn line_history_shows_only_commits_that_touched_those_lines() {
+        let dir = temp_repo("line-log");
+        commit_file_with(&dir, "f.txt", "a\nb\nc\nd\n", "Add f");
+        commit_file_with(&dir, "f.txt", "a\nB\nc\nd\n", "Change b");
+        commit_file_with(&dir, "f.txt", "a\nB\nc\nD\n", "Change d");
+        run(&dir, &["mv", "f.txt", "g.txt"]).unwrap();
+        commit(&dir, "Rename", false).unwrap();
+        let log = line_log(&dir, "HEAD", "g.txt", 2, 2, 50).unwrap();
+        let seen: Vec<&str> = log.iter().map(|(c, _)| c.summary.as_str()).collect();
+        assert_eq!(seen, vec!["Change b", "Add f"]);
+        let (c, diff) = &log[0];
+        assert_eq!(c.path, "f.txt");
+        let diff = diff.as_ref().unwrap();
+        assert!(diff.hunks[0].lines.iter().any(|l| l.kind == LineKind::Add && l.text == "B"));
+        assert!(line_log(&dir, "HEAD", "g.txt", 9, 9, 50).is_err());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn working_copy_lines_map_back_to_the_commit() {
+        let patch = "diff --git a/f b/f\n--- a/f\n+++ b/f\n@@ -2,2 +2,4 @@\n a\n+new1\n+new2\n b\n@@ -10,2 +11,0 @@\n-x\n-y\n";
+        let f = &parse_patch(patch)[0];
+        // Before any change, unchanged.
+        assert_eq!(line_before(f, 1), 1);
+        // Inside the first hunk: context keeps its old number, added lines take the one above.
+        assert_eq!(line_before(f, 2), 2);
+        assert_eq!(line_before(f, 3), 2);
+        assert_eq!(line_before(f, 4), 2);
+        assert_eq!(line_before(f, 5), 3);
+        // Between the hunks: two lines further down than before.
+        assert_eq!(line_before(f, 8), 6);
+        assert_eq!(line_before(f, 11), 9);
+        // After the second hunk removed two lines.
+        assert_eq!(line_before(f, 12), 12);
+        assert_eq!(line_before(f, 13), 13);
     }
 }

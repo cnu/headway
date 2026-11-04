@@ -1804,3 +1804,174 @@ fn conflicted_pictures_show_every_side() {
     assert!(shows(&h, "Deleted here"));
     assert!(shows(&h, "Common ancestor  ·  16 × 16"));
 }
+
+// ---------------------------------------------------------------------------
+// Blame and file history
+
+/// A repository where f.txt was renamed to g.txt (and changed) along the way.
+fn renamed_file_repo(s: &Scratch) -> PathBuf {
+    let r = new_repo(&s.root, "notes");
+    commit(&r, "f.txt", "one\ntwo\nthree\n", "Add f");
+    git_ok(&r, &["mv", "f.txt", "g.txt"]);
+    commit(&r, "g.txt", "one\nTWO\nthree\nfour\n", "Rename f to g");
+    commit(&r, "src/other.txt", "x\n", "Unrelated change");
+    r
+}
+
+fn file_view<'a>(h: &'a Harness<'static, HeadwayApp>, r: &Path) -> Option<&'a crate::fileview::FileView> {
+    h.state().tabs.get(r).and_then(|rv| rv.file_view.as_ref())
+}
+
+fn rev_of(dir: &Path, rev: &str) -> String {
+    git_ok(dir, &["rev-parse", rev]).trim().to_string()
+}
+
+#[test]
+fn blame_from_commit_details_clicks_through_to_a_commit() {
+    use crate::fileview::{HistoryKind, Mode};
+    let s = scratch("blame");
+    let r = renamed_file_repo(&s);
+    let (add_f, rename) = (rev_of(&r, "HEAD~2"), rev_of(&r, "HEAD~1"));
+    let mut h = app(&s, &[&r], true);
+
+    // Right-click a file in a commit's details.
+    click(&mut h, "Rename f to g");
+    right_click_row(&mut h, "g.txt");
+    click(&mut h, "Blame");
+    let fv = file_view(&h, &r).expect("blame is open");
+    let b = fv.blame.as_ref().unwrap();
+    assert_eq!((fv.mode, b.rev.as_deref(), b.path.as_str()), (Mode::Blame, Some(rename.as_str()), "g.txt"));
+    assert!(b.done && b.error.is_none());
+    assert!(b.owners.iter().all(|o| o.is_some()), "every line is blamed");
+    assert_eq!(b.owner(0).unwrap().0.summary, "Add f");
+    assert_eq!(b.owner(1).unwrap().0.summary, "Rename f to g");
+    assert!(shows_containing(&h, "Newer"), "the age scale is shown");
+
+    // Clicking the gutter shows that commit in the history.
+    h.get_all_by_label_contains(&format!("{} Add f", &add_f[..8])).next().expect("a gutter entry for Add f").click();
+    settle(&mut h);
+    let rv = &h.state().tabs[&r];
+    assert!(rv.selection == Some(super::Selection::Commit(add_f.clone())), "the commit is selected");
+    assert!(!file_view(&h, &r).unwrap().shown);
+    assert!(shows(&h, "✎ Edit message"), "the commit's details are on screen");
+    click(&mut h, "Back to blame");
+    assert!(file_view(&h, &r).unwrap().shown);
+
+    // Blame the parent of a line: the old name, at the commit before.
+    right_click(&mut h, "line 2");
+    h.get_all_by_label_contains("Blame the parent").next().expect("Blame the parent in the menu").click();
+    settle(&mut h);
+    let fv = file_view(&h, &r).unwrap();
+    let b = fv.blame.as_ref().unwrap();
+    assert_eq!((b.rev.as_deref(), b.path.as_str()), (Some(add_f.as_str()), "f.txt"));
+    assert_eq!(b.picked(), Some((1, 1)), "the same line stays picked");
+    assert_eq!(fv.back.len(), 1);
+    click(&mut h, "← Back");
+    let b = file_view(&h, &r).unwrap().blame.as_ref().unwrap();
+    assert_eq!((b.rev.as_deref(), b.path.as_str()), (Some(rename.as_str()), "g.txt"));
+
+    // History of one line, from the keyboard.
+    click(&mut h, "line 2");
+    key(&mut h, egui::Key::L);
+    let fv = file_view(&h, &r).unwrap();
+    let hist = fv.history.as_ref().unwrap();
+    assert_eq!((fv.mode, &hist.kind), (Mode::History, &HistoryKind::Lines { rev: Some(rename.clone()), start: 2, end: 2 }));
+    let seen: Vec<&str> = hist.commits().iter().map(|(c, _)| c.summary.as_str()).collect();
+    assert_eq!(seen, ["Rename f to g", "Add f"]);
+    assert!(hist.diff.as_ref().is_some_and(|d| d.is_ok()), "the first commit's change is shown");
+
+    // B goes back to the blame, Esc closes.
+    key(&mut h, egui::Key::B);
+    assert_eq!(file_view(&h, &r).unwrap().mode, Mode::Blame);
+    key(&mut h, egui::Key::Escape);
+    key(&mut h, egui::Key::Escape);
+    assert!(file_view(&h, &r).is_none());
+    assert!(shows(&h, "Unrelated change"), "back to the history");
+
+    // Lines picked in a commit's diff have a history too.
+    click(&mut h, "Rename f to g");
+    click(&mut h, "line TWO");
+    click(&mut h, "History of this line");
+    let hist = file_view(&h, &r).unwrap().history.as_ref().unwrap();
+    assert_eq!((&hist.kind, hist.path.as_str()), (&HistoryKind::Lines { rev: Some(rename.clone()), start: 2, end: 2 }, "g.txt"));
+    assert_eq!(hist.commits().len(), 2);
+}
+
+#[test]
+fn file_history_follows_a_rename_and_blames_the_working_copy() {
+    use crate::fileview::{HistoryKind, Mode};
+    let s = scratch("file-history");
+    let r = renamed_file_repo(&s);
+    write(&r, "g.txt", "one\nTWO\nthree\nfour\nfive\n");
+    let mut h = app(&s, &[&r], true);
+
+    // Blame the working copy from the changes list: the new line isn't committed.
+    right_click_row(&mut h, "g.txt");
+    click(&mut h, "Blame");
+    let b = file_view(&h, &r).unwrap().blame.as_ref().unwrap();
+    assert_eq!(b.rev, None);
+    assert!(b.owner(4).unwrap().0.uncommitted());
+    assert!(shows(&h, "Not committed yet") || shows_containing(&h, "uncommitted"));
+
+    // Find a file with Ctrl/Cmd+P; Ctrl/Cmd+Enter opens its history.
+    ctrl(&mut h, egui::Key::P);
+    assert!(shows(&h, "Find file"));
+    type_text(&mut h, "g.txt");
+    h.key_press_modifiers(egui::Modifiers::COMMAND, egui::Key::Enter);
+    settle(&mut h);
+    let fv = file_view(&h, &r).unwrap();
+    let hist = fv.history.as_ref().unwrap();
+    assert_eq!((fv.mode, &hist.kind), (Mode::History, &HistoryKind::File));
+    let seen: Vec<(&str, &str)> = hist.commits().iter().map(|(c, _)| (c.summary.as_str(), c.path.as_str())).collect();
+    assert_eq!(seen, [("Rename f to g", "g.txt"), ("Add f", "f.txt")]);
+    assert_eq!(hist.commits()[0].0.old_path.as_deref(), Some("f.txt"));
+
+    // Picking the older commit shows its change to just this file.
+    click(&mut h, "Add f");
+    settle(&mut h);
+    let hist = file_view(&h, &r).unwrap().history.as_ref().unwrap();
+    assert_eq!(hist.selected, Some(1));
+    let doc = hist.diff.as_ref().unwrap().as_ref().unwrap();
+    assert_eq!(doc.files.iter().map(|f| f.path.as_str()).collect::<Vec<_>>(), ["f.txt"]);
+    // …and blaming it there opens the file under its old name.
+    click(&mut h, "Blame at this commit");
+    let b = file_view(&h, &r).unwrap().blame.as_ref().unwrap();
+    assert_eq!((b.path.as_str(), b.rev.clone()), ("f.txt", Some(rev_of(&r, "HEAD~2"))));
+
+    // A folder's history, from Find file.
+    ctrl(&mut h, egui::Key::P);
+    type_text(&mut h, "src");
+    key(&mut h, egui::Key::Enter);
+    let fv = file_view(&h, &r).unwrap();
+    let hist = fv.history.as_ref().unwrap();
+    assert_eq!((&hist.kind, hist.path.as_str()), (&HistoryKind::Folder, "src"));
+    assert_eq!(hist.commits().len(), 1);
+    assert!(fv.blame.is_none());
+}
+
+#[test]
+fn arrow_keys_in_find_file_leave_the_history_alone() {
+    let s = scratch("find-file-keys");
+    let r = renamed_file_repo(&s);
+    let mut h = app(&s, &[&r], true);
+    let selected = |h: &Harness<'static, HeadwayApp>| h.state().tabs[&r].selection.clone();
+    let before = selected(&h);
+    assert!(before == Some(super::Selection::Commit(rev_of(&r, "HEAD"))));
+
+    ctrl(&mut h, egui::Key::P);
+    key(&mut h, egui::Key::ArrowDown);
+    assert!(selected(&h) == before, "the history selection didn't move");
+    let Some(super::Dialog::FindFile { picked, hits, .. }) = &h.state().dialog else { panic!("Find file is still open") };
+    assert_eq!((*picked, hits.len()), (1, 2), "the dialog's list moved instead");
+    // Even in a frame where the text box has lost the keyboard (egui moves focus on
+    // arrow keys in the real window), the history stays put while the dialog is open.
+    h.ctx.memory_mut(|m| m.stop_text_input());
+    key(&mut h, egui::Key::ArrowDown);
+    assert!(selected(&h) == before);
+    key(&mut h, egui::Key::ArrowUp);
+    assert!(selected(&h) == before);
+    // The text box keeps the keyboard: typing still filters.
+    type_text(&mut h, "g.txt");
+    let Some(super::Dialog::FindFile { hits, .. }) = &h.state().dialog else { panic!() };
+    assert_eq!(hits[0].0, "g.txt");
+}

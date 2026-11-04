@@ -34,6 +34,17 @@ mod imp {
                 .output();
         }
 
+        /// The commit id `rev` names.
+        fn rev(&self, rev: &str) -> String {
+            Command::new("git")
+                .arg("-C")
+                .arg(self.dir)
+                .args(["rev-parse", rev])
+                .output()
+                .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string())
+                .unwrap_or_default()
+        }
+
         fn write(&self, file: &str, text: &str) {
             let p = self.dir.join(file);
             if let Some(parent) = p.parent() {
@@ -168,8 +179,30 @@ mod imp {
         b.git(&["add", "src/style.css"]);
     }
 
+    /// The API server, written by several people over time, with `indent` spaces per level.
+    fn api_server(indent: usize, orders: bool, host: &str) -> String {
+        let i = |n: usize| " ".repeat(indent * n);
+        let mut s = String::from("from http.server import HTTPServer, BaseHTTPRequestHandler\nimport json\n\nITEMS = [{\"id\": 1, \"name\": \"Mug\"}]\n");
+        if orders {
+            s += "ORDERS = []\n";
+        }
+        s += &format!("\n\nclass Handler(BaseHTTPRequestHandler):\n{}def do_GET(self):\n", i(1));
+        s += &format!("{}if self.path == \"/health\":\n{}self.reply(200, {{\"ok\": True}})\n", i(2), i(3));
+        s += &format!("{}elif self.path == \"/items\":\n{}self.reply(200, ITEMS)\n", i(2), i(3));
+        if orders {
+            s += &format!("{}elif self.path == \"/orders\":\n{}self.reply(200, ORDERS)\n", i(2), i(3));
+        }
+        s += &format!("{}else:\n{}self.reply(404, {{\"error\": \"not found\"}})\n\n", i(2), i(3));
+        s += &format!("{}def reply(self, code, body):\n{}data = json.dumps(body).encode()\n{}self.send_response(code)\n", i(1), i(2), i(2));
+        s += &format!("{}self.send_header(\"Content-Type\", \"application/json\")\n{}self.end_headers()\n{}self.wfile.write(data)\n\n\n", i(2), i(2), i(2));
+        s += &format!("app = HTTPServer((\"{host}\", 8000), Handler)\n");
+        s
+    }
+
+    /// Blame and file history: a server file several people changed, moved into a
+    /// package, then reformatted (a commit `.git-blame-ignore-revs` tells blame to skip).
     fn build_api(b: &mut Builder) {
-        b.write("main.py", "from server import app\n\nif __name__ == '__main__':\n    app.run()\n");
+        b.write("main.py", "from server import app\n\nif __name__ == '__main__':\n    app.serve_forever()\n");
         b.commit(SAM, "Create API entry point", 0);
         b.write("server.py", "app = None\n");
         b.commit(SAM, "Add server module", 50);
@@ -181,7 +214,23 @@ mod imp {
         b.git(&["checkout", "-q", "main"]);
         b.write("routes.py", "ROUTES = ['/health', '/items', '/orders']\n");
         b.commit(ALEX, "Add orders route", 60);
-        b.write("server.py", "app = None\nDEBUG = False\n");
+        b.write("server.py", &api_server(2, false, "127.0.0.1"));
+        b.commit(ALEX, "Serve items over HTTP", 30);
+        b.write("server.py", &api_server(2, true, "127.0.0.1"));
+        b.commit(JO, "Answer the orders route", 50);
+        b.write("api/__init__.py", "");
+        b.git(&["mv", "server.py", "api/server.py"]);
+        b.write("main.py", "from api.server import app\n\nif __name__ == '__main__':\n    app.serve_forever()\n");
+        b.commit(SAM, "Move the server into an api package", 40);
+        b.write("api/server.py", &api_server(4, true, "127.0.0.1"));
+        b.commit(ALEX, "Reformat with four-space indents", 20);
+        let reformat = b.rev("HEAD");
+        b.write(".git-blame-ignore-revs", &format!("# Formatting only: blame looks past these.\n{reformat}\n"));
+        b.commit(ALEX, "Hide the reformat from blame", 1);
+        b.write("api/server.py", &api_server(4, true, "0.0.0.0"));
+        b.commit(JO, "Listen on every interface", 30);
+        // Uncommitted work, so blame of the working copy has something new.
+        b.write("api/server.py", &(api_server(4, true, "0.0.0.0") + "DEBUG = False\n"));
     }
 
     fn build_tokens(b: &mut Builder) {
@@ -264,6 +313,36 @@ mod imp {
             assert_eq!((log[1].action.as_str(), log[1].message.as_str()), ("commit", "Try a free shipping banner"));
             let on_branches = git::run(&dir, &["branch", "--contains", &log[1].hash]).unwrap();
             assert!(on_branches.trim().is_empty(), "{on_branches}");
+            let _ = std::fs::remove_dir_all(&dir);
+        }
+
+        #[test]
+        fn api_server_has_a_moved_file_and_a_reformat_blame_skips() {
+            use crate::git::{self, BlameOptions};
+            let dir = std::env::temp_dir().join(format!("headway-sample-api-{}", std::process::id()));
+            let _ = std::fs::remove_dir_all(&dir);
+            build_one(&dir, build_api);
+            let log = git::file_log(&dir, "api/server.py", false, 100).unwrap();
+            let seen: Vec<&str> = log.iter().map(|c| c.summary.as_str()).collect();
+            assert_eq!(
+                seen,
+                [
+                    "Listen on every interface",
+                    "Reformat with four-space indents",
+                    "Move the server into an api package",
+                    "Answer the orders route",
+                    "Serve items over HTTP",
+                    "Add server module"
+                ]
+            );
+            let ignore = git::ignore_revs(&dir);
+            assert!(ignore.is_some());
+            let mut ranges = Vec::new();
+            let commits = git::blame(&dir, Some("HEAD"), "api/server.py", &BlameOptions::default(), ignore.as_ref(), |_, r| ranges.push(r)).unwrap();
+            assert!(!commits.iter().any(|c| c.summary.starts_with("Reformat")));
+            assert!(commits.iter().any(|c| c.summary == "Answer the orders route"));
+            assert!(ranges.iter().any(|r| r.path == "server.py"));
+            assert!(!git::status(&dir).unwrap().unstaged.is_empty());
             let _ = std::fs::remove_dir_all(&dir);
         }
 

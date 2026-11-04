@@ -40,6 +40,26 @@ pub fn lane(i: usize) -> Color32 {
     LANES[i % LANES.len()]
 }
 
+/// How recent a change is, from `t` = 0 (the oldest shown) to 1 (the newest):
+/// newer is a stronger, warmer colour.
+pub fn age(t: f32) -> Color32 {
+    let t = t.clamp(0.0, 1.0);
+    let old = Color32::from_rgb(58, 66, 80);
+    let new = Color32::from_rgb(240, 146, 64);
+    let mix = |a: u8, b: u8| (a as f32 + (b as f32 - a as f32) * t).round() as u8;
+    Color32::from_rgb(mix(old.r(), new.r()), mix(old.g(), new.g()), mix(old.b(), new.b()))
+}
+
+/// Where `time` sits between `oldest` and `newest` for [`age`]. Measured in days on a
+/// log scale, so last week's changes stand apart from last month's even in an old file.
+pub fn age_of(time: i64, oldest: i64, newest: i64) -> f32 {
+    if newest <= oldest {
+        return 1.0;
+    }
+    let days = |s: i64| (s.max(0) as f32 / 86_400.0 + 1.0).ln();
+    1.0 - days(newest - time) / days(newest - oldest)
+}
+
 pub fn mono(size: f32) -> FontId {
     FontId::new(size, FontFamily::Monospace)
 }

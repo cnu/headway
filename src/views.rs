@@ -1,6 +1,6 @@
 //! The repository screen: toolbar, sidebar, history, commit details, staging and diffs.
 
-use crate::app::{Action, DiffDoc, Dialog, FileSel, FlatRow, FollowUp, LineSel, OpKind, Record, RepoData, RepoView, Selection, Summary};
+use crate::app::{Action, DiffDoc, Dialog, FileOpen, FileSel, FlatRow, FollowUp, LineSel, OpKind, Record, RepoData, RepoView, Selection, Summary};
 use crate::git::{self, Change, FileChange, LineKind, RefKind};
 use crate::graph::Target;
 use crate::preview;
@@ -21,7 +21,7 @@ pub fn repo(
     view: &mut ViewPrefs,
     actions: &mut Vec<Action>,
 ) {
-    if ui.input(|i| i.modifiers.command && i.key_pressed(egui::Key::B)) {
+    if !rv.modal && ui.input(|i| i.modifiers.command && i.key_pressed(egui::Key::B)) {
         view.sidebar_open = !view.sidebar_open;
     }
     egui::Panel::top("repo_toolbar")
@@ -29,6 +29,7 @@ pub fn repo(
         .frame(egui::Frame::new().fill(PANEL).inner_margin(Margin::symmetric(14, 0)).stroke(Stroke::new(1.0, BORDER)))
         .show(ui, |ui| toolbar(ui, rv, busy, &mut view.sidebar_open, actions));
     crate::resolver::banner(ui, rv, actions);
+    crate::fileview::banner(ui, rv, actions);
 
     egui::Panel::left("sidebar")
         .default_size(210.0)
@@ -61,6 +62,12 @@ pub fn repo(
     // A conflicted file being resolved takes the whole width.
     if rv.resolver.as_ref().is_some_and(|r| r.shown) {
         egui::CentralPanel::default().frame(egui::Frame::new().fill(BG)).show(ui, |ui| crate::resolver::show(ui, rv, actions));
+        return;
+    }
+
+    // So do blame and file history.
+    if rv.file_view.as_ref().is_some_and(|f| f.shown) {
+        egui::CentralPanel::default().frame(egui::Frame::new().fill(BG)).show(ui, |ui| crate::fileview::show(ui, rv, view, actions));
         return;
     }
 
@@ -107,7 +114,7 @@ pub fn repo(
 fn toolbar(ui: &mut Ui, rv: &mut RepoView, busy: &[String], sidebar_open: &mut bool, actions: &mut Vec<Action>) {
     let path = rv.path.clone();
     let search_id = egui::Id::unique(("search", &path));
-    if ui.input(|i| i.modifiers.command && i.key_pressed(egui::Key::F)) {
+    if !rv.modal && ui.input(|i| i.modifiers.command && i.key_pressed(egui::Key::F)) {
         ui.memory_mut(|m| m.request_focus(search_id));
     }
     ui.horizontal_centered(|ui| {
@@ -226,6 +233,11 @@ fn repo_menu(ui: &mut Ui, path: &Path, data: &RepoData, actions: &mut Vec<Action
         actions.push(Action::ShowReflog(None));
         ui.close();
     }
+    let find_key = ui.ctx().format_shortcut(&egui::KeyboardShortcut::new(egui::Modifiers::COMMAND, egui::Key::P));
+    if ui.add(egui::Button::new("Find file…").shortcut_text(find_key)).on_hover_text("Blame a file, or see the history of a file or folder").clicked() {
+        actions.push(Action::FindFile);
+        ui.close();
+    }
     ui.separator();
     if ui.button("Copy folder path").clicked() {
         actions.push(Action::Copy(path.display().to_string()));
@@ -323,7 +335,7 @@ fn side_row(ui: &mut Ui, icon: &str, icon_color: Color32, text: &str, right: Opt
 }
 
 /// Give a hand-drawn control a name (for screen readers and tests).
-fn name_it(resp: &egui::Response, role: egui::Role, label: impl ToString) {
+pub(crate) fn name_it(resp: &egui::Response, role: egui::Role, label: impl ToString) {
     let label = label.to_string();
     resp.widget_info(|| egui::WidgetInfo::labeled(role, resp.enabled(), &label));
 }
@@ -970,7 +982,8 @@ fn commit_list(ui: &mut Ui, rv: &mut RepoView, actions: &mut Vec<Action>) {
         Some(Selection::Reflog) => None,
     };
     let mut scroll_offset = None;
-    if !ui.ctx().text_edit_focused() && !ui.ctx().any_popup_open() {
+    // Not while a dialog is open: its keys are its own.
+    if !rv.modal && !ui.ctx().text_edit_focused() && !ui.ctx().any_popup_open() {
         let (offset, view_h) = rv.list_view;
         let page = ((view_h / ROW_H).floor() as usize).saturating_sub(1).max(1);
         let key = ui.input(|i| {
@@ -1304,7 +1317,7 @@ fn reset_undo(mode: &str) -> git::Undoable {
     if mode == "--hard" { git::Undoable::Tree { save_work: true } } else { git::Undoable::Index }
 }
 
-fn paint_row_bg(p: &egui::Painter, rect: Rect, selected: bool, hovered: bool) {
+pub(crate) fn paint_row_bg(p: &egui::Painter, rect: Rect, selected: bool, hovered: bool) {
     if selected {
         p.rect_filled(rect, 0.0, SELECT);
         p.rect_filled(Rect::from_min_size(rect.min, vec2(3.0, rect.height())), 0.0, ACCENT);
@@ -1563,6 +1576,8 @@ fn commit_panel(ui: &mut Ui, rv: &mut RepoView, actions: &mut Vec<Action>) {
                     if resp.clicked() {
                         jump = Some(i);
                     }
+                    resp.on_hover_text("Click to go to its changes · right-click for blame and history")
+                        .context_menu(|ui| file_history_menu(ui, &f.path, Some(&info.hash), &f.change, actions));
                 }
             });
         });
@@ -1578,7 +1593,10 @@ fn commit_panel(ui: &mut Ui, rv: &mut RepoView, actions: &mut Vec<Action>) {
     let d = rv.detail.as_ref().unwrap();
     let toggled = egui::CentralPanel::default()
         .frame(egui::Frame::new().fill(BG))
-        .show(ui, |ui| diff_view(ui, &d.doc, DiffMode::Commit, &mut rv.diff_scroll_to, None, &rv.path, actions))
+        .show(ui, |ui| {
+            commit_line_bar(ui, &d.doc, &mut rv.detail_sel, &d.info.hash, actions);
+            diff_view(ui, &d.doc, DiffMode::Commit, &mut rv.diff_scroll_to, Some(&mut rv.detail_sel), &rv.path, actions)
+        })
         .inner;
     if let Some(fi) = toggled {
         if let Some(d) = rv.detail.as_mut() {
@@ -1597,7 +1615,7 @@ fn change_color(c: &Change) -> Color32 {
 }
 
 /// One file in a list. Returns the row response.
-fn file_line(ui: &mut Ui, path: &str, old: Option<&str>, change: &Change, selected: bool, stats: Option<(u32, u32)>) -> egui::Response {
+pub(crate) fn file_line(ui: &mut Ui, path: &str, old: Option<&str>, change: &Change, selected: bool, stats: Option<(u32, u32)>) -> egui::Response {
     file_line_tagged(ui, path, old, change, selected, stats, None)
 }
 
@@ -1727,6 +1745,7 @@ fn staging_panel(ui: &mut Ui, rv: &mut RepoView, actions: &mut Vec<Action>) {
                         match kind {
                             ListKind::Conflicts => {
                                 let (resp, b) = file_row_buttons(ui, f, false, &["Mark resolved"]);
+                                resp.context_menu(|ui| file_history_menu(ui, &f.path, None, &f.change, actions));
                                 if resp.clicked() {
                                     actions.push(Action::OpenConflict(f.path.clone()));
                                 }
@@ -1738,6 +1757,7 @@ fn staging_panel(ui: &mut Ui, rv: &mut RepoView, actions: &mut Vec<Action>) {
                                 let sel = FileSel { path: f.path.clone(), staged: false, untracked: f.change == Change::Untracked };
                                 let second = if f.change == Change::Untracked { "Delete" } else { "Discard" };
                                 let (resp, b) = file_row_buttons(ui, f, rv.file_sel.as_ref() == Some(&sel), &["Stage", second]);
+                                resp.context_menu(|ui| file_history_menu(ui, &f.path, None, &f.change, actions));
                                 if resp.clicked() {
                                     actions.push(Action::SelectFile(sel));
                                 }
@@ -1766,6 +1786,7 @@ fn staging_panel(ui: &mut Ui, rv: &mut RepoView, actions: &mut Vec<Action>) {
                             ListKind::Staged => {
                                 let sel = FileSel { path: f.path.clone(), staged: true, untracked: false };
                                 let (resp, b) = file_row_buttons(ui, f, rv.file_sel.as_ref() == Some(&sel), &["Unstage"]);
+                                resp.context_menu(|ui| file_history_menu(ui, &f.path, None, &f.change, actions));
                                 if resp.clicked() {
                                     actions.push(Action::SelectFile(sel));
                                 }
@@ -1953,6 +1974,78 @@ fn file_row_buttons(ui: &mut Ui, f: &FileChange, selected: bool, buttons: &[&str
         }
     }
     (resp, clicked)
+}
+
+/// Blame and history entries for a file's right-click menu. `at` is the commit the
+/// file is shown in (`None`: the working copy); `change` is what happened to it there.
+pub(crate) fn file_history_menu(ui: &mut Ui, path: &str, at: Option<&str>, change: &Change, actions: &mut Vec<Action>) {
+    let rev = match (at, change) {
+        // A deleted file is blamed as it was just before.
+        (Some(h), Change::Deleted) => Some(Some(format!("{h}^"))),
+        (Some(h), _) => Some(Some(h.to_string())),
+        (None, Change::Untracked | Change::Added) => None,
+        (None, Change::Deleted) => Some(Some("HEAD".to_string())),
+        (None, _) => Some(None),
+    };
+    let blame = ui.add_enabled(rev.is_some(), egui::Button::new("Blame")).on_hover_text("Who last changed each line").on_disabled_hover_text("A new file has no history to blame yet");
+    if blame.clicked() {
+        actions.push(Action::File(FileOpen::Blame { rev: rev.flatten(), path: path.to_string(), line: None, back: false }));
+    }
+    if ui.button("History of this file").on_hover_text("Every commit that changed it, following renames").clicked() {
+        actions.push(Action::File(FileOpen::History { path: path.to_string(), folder: false }));
+    }
+    if let Some((dir, _)) = path.rsplit_once('/')
+        && ui.button(format!("History of {dir}/")).on_hover_text("Every commit that changed something in this folder").clicked()
+    {
+        actions.push(Action::File(FileOpen::History { path: dir.to_string(), folder: true }));
+    }
+}
+
+/// Lines picked in a commit's diff: offer their history.
+fn commit_line_bar(ui: &mut Ui, doc: &DiffDoc, sel: &mut LineSel, hash: &str, actions: &mut Vec<Action>) {
+    if sel.rows.is_empty() {
+        return;
+    }
+    if !ui.ctx().text_edit_focused() && ui.input(|i| i.key_pressed(egui::Key::Escape)) {
+        sel.rows.clear();
+        return;
+    }
+    let mut fi = None;
+    let (mut new, mut old) = (Vec::new(), Vec::new());
+    for &r in &sel.rows {
+        if let Some(FlatRow::Line(f, hi, li)) = doc.rows.get(r) {
+            fi = Some(*f);
+            let l = &doc.files[*f].hunks[*hi].lines[*li];
+            new.extend(l.new_no);
+            old.extend(l.old_no.filter(|_| l.kind == LineKind::Del));
+        }
+    }
+    let Some(fi) = fi else { return };
+    let file = &doc.files[fi];
+    // Added lines are found in this commit; only removed ones, in the one before.
+    let (rev, path, nums) = if !new.is_empty() {
+        (hash.to_string(), file.path.clone(), new)
+    } else {
+        (format!("{hash}^"), file.old_path.clone().unwrap_or_else(|| file.path.clone()), old)
+    };
+    let (a, z) = (*nums.iter().min().unwrap_or(&1), *nums.iter().max().unwrap_or(&1));
+    let (rect, _) = ui.allocate_exact_size(vec2(ui.available_width(), 30.0), Sense::hover());
+    ui.painter().rect_filled(rect, 0.0, Color32::from_rgb(32, 48, 66));
+    ui.painter().line_segment([rect.left_bottom(), rect.right_bottom()], Stroke::new(1.0, BORDER));
+    let mut child = ui.new_child(egui::UiBuilder::new().max_rect(rect.shrink2(vec2(12.0, 3.0))).layout(Layout::left_to_right(Align::Center)));
+    let ui = &mut child;
+    let n = sel.rows.len();
+    ui.label(RichText::new(format!("{n} line{} picked", if n == 1 { "" } else { "s" })).strong().color(TEXT));
+    ui.label(RichText::new(format!("in {}", file.path)).color(DIM));
+    ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+        if ui.button("Clear").on_hover_text("Esc").clicked() {
+            sel.rows.clear();
+        }
+        let label = if a == z { "History of this line" } else { "History of these lines" };
+        if ui.button(label).on_hover_text(format!("Every commit that changed {path} lines {a}–{z}")).clicked() {
+            actions.push(Action::File(FileOpen::Lines { rev: Some(rev), path, start: a, end: z }));
+        }
+    });
 }
 
 // ---------------------------------------------------------------------------
@@ -2295,6 +2388,8 @@ pub fn diff_view(
     repo: &Path,
     actions: &mut Vec<Action>,
 ) -> Option<usize> {
+    // The commit shown (`None`: uncommitted changes), for blame and history.
+    let at = doc.commit.as_deref();
     let mut toggled = None;
     if let Some(sel) = line_sel.as_deref_mut() {
         if sel.dragging && !ui.input(|i| i.pointer.primary_down()) {
@@ -2360,9 +2455,11 @@ pub fn diff_view(
                             None => f.path.clone(),
                         };
                         let name_x = vis.left() + 42.0;
-                        if hdr.on_hover_text(if folded { "Click to show this file's changes" } else { "Click to fold this file's changes" }).clicked() {
+                        let hdr = hdr.on_hover_text(if folded { "Click to show this file's changes" } else { "Click to fold this file's changes" });
+                        if hdr.clicked() {
                             toggled = Some(fi);
                         }
+                        hdr.context_menu(|ui| file_history_menu(ui, &f.path, at, &f.change, actions));
                         // Buttons for uncommitted files (added after the bar, so they sit on top).
                         let sub = doc.submodule.get(fi).copied().unwrap_or(false);
                         let buttons: &[&str] = match (doc.modes[fi], sub) {

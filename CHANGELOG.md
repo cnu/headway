@@ -11,6 +11,19 @@ workflow uses that version's section as the GitHub release notes.
 
 ### Added
 
+- **Blame and file history**: right-click a file in a commit's details, the
+  changes list or a diff, or find any file or folder with Ctrl/Cmd+P. Blame
+  shows who last changed each line, grouped by commit, with an age colour
+  (newer is stronger); lines appear as git finds them, so big files show at
+  once. Hover for the commit's summary, click to jump to it in the history.
+  **Blame the parent** (P) steps back past a formatting or moving change, and
+  Back (Alt+←) returns. Ignore whitespace, look past moved or copied lines,
+  and skip the commits in `blame.ignoreRevsFile` or `.git-blame-ignore-revs`.
+  **History** lists the commits that changed a file (following renames) or a
+  folder, with just that file's or folder's changes. Pick lines in blame or a
+  commit's diff for **History of these lines** (L). B and H switch views, Esc
+  closes. Development builds' **api-server** sample has a moved file and a
+  reformat that blame skips.
 - **Image previews**: changed pictures (PNG, JPEG, GIF, WebP, BMP, ICO and
   SVG) show in the diff instead of "Binary file", before and after side by
   side, with a checkerboard behind transparent parts. SVGs also keep their

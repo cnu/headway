@@ -5,6 +5,7 @@ use crate::git::{self, Branch, Change, Commit, CommitDetail, DiffFile, GitResult
 use crate::graph::{self, Graph};
 use crate::theme::{self, *};
 use crate::workspace::{Config, Workspace};
+use crate::fileview::{self, FileView, Mode};
 use crate::resolver::Resolver;
 use crate::{overview, preview, views};
 use egui::{Align, Color32, CornerRadius, Id, Layout, Margin, RichText, Sense, Stroke, Ui};
@@ -224,6 +225,8 @@ pub struct DiffDoc {
     pub sections: Vec<(usize, String)>,
     /// Pictures shown for image files (one entry per file).
     pub previews: Vec<Option<preview::ImagePreview>>,
+    /// The commit these are the changes of (`None`: uncommitted changes).
+    pub commit: Option<String>,
 }
 
 /// Files with more changed lines than this start folded in the uncommitted view.
@@ -249,6 +252,7 @@ impl DiffDoc {
             submodule: vec![false; n],
             sections: Vec::new(),
             previews: Vec::new(),
+            commit: None,
         };
         doc.rebuild();
         doc
@@ -258,6 +262,7 @@ impl DiffDoc {
     /// `commit` is the commit shown, when this is a commit's changes.
     pub fn load_previews(&mut self, repo: &Path, commit: Option<&str>) {
         self.previews = preview::load_all(repo, &self.files, &self.modes, commit);
+        self.commit = commit.map(String::from);
         self.rebuild();
     }
 
@@ -424,6 +429,13 @@ pub struct RepoView {
     pub reflog_ref: String,
     pub reflog: Option<Result<Vec<git::ReflogEntry>, String>>,
     reflog_gen: u64,
+    /// Blame or history of one file, folder or set of lines, when open.
+    pub file_view: Option<FileView>,
+    file_gen: u64,
+    /// Lines picked in a commit's diff (for "History of these lines").
+    pub detail_sel: LineSel,
+    /// A dialog is open over the window (keys belong to it).
+    pub modal: bool,
 }
 
 impl RepoView {
@@ -456,6 +468,10 @@ impl RepoView {
             reflog_ref: "HEAD".into(),
             reflog: None,
             reflog_gen: 0,
+            file_view: None,
+            file_gen: 0,
+            detail_sel: LineSel::default(),
+            modal: false,
         }
     }
 
@@ -501,6 +517,16 @@ enum Msg {
     /// Conflicted files read for the resolver.
     Conflicts(PathBuf, u64, Vec<(String, Result<git::ConflictFile, String>, Option<preview::ConflictPictures>)>),
     Reflog(PathBuf, u64, Result<Vec<git::ReflogEntry>, String>),
+    /// The text of a file being blamed, and the repository's list of commits to skip.
+    BlameText(PathBuf, u64, Result<Vec<String>, String>, Option<git::IgnoreRevs>),
+    /// More blame results: commits seen for the first time, and the lines they changed.
+    BlameChunk(PathBuf, u64, Vec<git::BlameCommit>, Vec<git::BlameRange>),
+    BlameDone(PathBuf, u64, Result<(), String>),
+    FileLog(PathBuf, u64, Result<Vec<git::HistoryEntry>, String>),
+    /// What the commit picked in a file's history changed in that file.
+    FileDiff(PathBuf, u64, Result<DiffDoc, String>),
+    /// Every tracked file, for "Find file".
+    TrackedFiles(PathBuf, Result<Vec<(String, bool)>, String>),
     SamplesReady,
     /// A folder was chosen to add; carries the repositories found in it.
     Picked(PathBuf, Vec<PathBuf>),
@@ -548,6 +574,15 @@ pub enum Action {
     /// Show the reflog, of HEAD or a full branch name (None: the one shown last).
     ShowReflog(Option<String>),
     SelectFile(FileSel),
+    /// Blame or history of a file, folder or lines, and moving around in it.
+    File(FileOpen),
+    CloseFile,
+    /// Put the file view aside and show this commit in the history.
+    ShowCommit(String),
+    /// Put the file view aside and show the uncommitted changes.
+    ShowWorkingDir,
+    /// The "Find file" dialog (Ctrl/Cmd+P).
+    FindFile,
     /// Open a conflicted file (by path) in the resolver.
     OpenConflict(String),
     CloseResolver,
@@ -607,6 +642,28 @@ impl Action {
     }
 }
 
+/// What to show in the file view (blame and history).
+#[derive(Clone, Debug, PartialEq)]
+pub enum FileOpen {
+    /// Blame `path` at `rev` (the working copy when `None`), scrolled to `line`.
+    /// `back`: remember the blame shown now, for the Back button.
+    Blame { rev: Option<String>, path: String, line: Option<u32>, back: bool },
+    /// Commits that changed a file (following renames) or a folder.
+    History { path: String, folder: bool },
+    /// Commits that changed lines `start..=end` of `path` at `rev`.
+    Lines { rev: Option<String>, path: String, start: u32, end: u32 },
+    /// Switch between blame and history of what's shown.
+    Mode(Mode),
+    /// Blame again (the options changed).
+    Reload,
+    /// The previous blame.
+    Back,
+    /// Pick a commit in the history.
+    SelectCommit(usize),
+    /// Bring the view back after looking at a commit.
+    Show,
+}
+
 /// What to do after a git action succeeds.
 pub enum FollowUp {
     /// Add this folder to the workspace and open it.
@@ -639,6 +696,17 @@ pub enum Dialog {
         path_edited: bool,
     },
     Confirm { title: String, body: String, button: String, danger: bool, then: Option<Box<Action>> },
+    /// Find a file or folder by name, to blame it or see its history.
+    FindFile {
+        repo: PathBuf,
+        query: String,
+        /// Every tracked file and folder (true for folders), once read.
+        files: Option<Result<Vec<(String, bool)>, String>>,
+        /// What matches `hits_for`.
+        hits: Vec<(String, bool)>,
+        hits_for: Option<String>,
+        picked: usize,
+    },
 }
 
 struct Toast {
@@ -880,6 +948,215 @@ impl HeadwayApp {
         });
     }
 
+    /// Like [`Self::spawn`], for work that reports as it goes: `send` passes messages on
+    /// while it runs, and the value it returns is the last one.
+    fn spawn_stream(&self, f: impl FnOnce(&dyn Fn(Msg)) -> Msg + Send + 'static) {
+        let tx = self.tx.clone();
+        let ctx = self.ctx.clone();
+        let pending = self.pending.clone();
+        self.pending.fetch_add(1, Ordering::SeqCst);
+        std::thread::spawn(move || {
+            let send = |m: Msg| {
+                pending.fetch_add(1, Ordering::SeqCst);
+                let _ = tx.send(m);
+                ctx.request_repaint();
+            };
+            let last = f(&send);
+            let _ = tx.send(last);
+            ctx.request_repaint();
+        });
+    }
+
+    /// Blame the file the file view shows, streaming results in as git finds them.
+    fn load_blame(&mut self, path: &Path) {
+        let opts = self.cfg.view.blame;
+        let Some(rv) = self.tabs.get_mut(path) else { return };
+        rv.file_gen += 1;
+        let generation = rv.file_gen;
+        let Some(b) = rv.file_view.as_mut().and_then(|f| f.blame.as_mut()) else { return };
+        b.generation = generation;
+        let (p, rev, file) = (path.to_path_buf(), b.rev.clone(), b.path.clone());
+        self.spawn_stream(move |send| {
+            let ignore = git::ignore_revs(&p);
+            let text = git::blame_text(&p, rev.as_deref(), &file);
+            let ok = text.is_ok();
+            send(Msg::BlameText(p.clone(), generation, text, ignore.clone()));
+            if !ok {
+                return Msg::BlameDone(p, generation, Ok(()));
+            }
+            // Results go to the screen in batches, a few times a second.
+            let mut sent = 0;
+            let mut batch = Vec::new();
+            let mut last = std::time::Instant::now();
+            let res = git::blame(&p, rev.as_deref(), &file, &opts, ignore.as_ref(), |parser, r| {
+                batch.push(r);
+                if last.elapsed() >= std::time::Duration::from_millis(50) {
+                    send(Msg::BlameChunk(p.clone(), generation, parser.commits[sent..].to_vec(), std::mem::take(&mut batch)));
+                    sent = parser.commits.len();
+                    last = std::time::Instant::now();
+                }
+            });
+            match res {
+                Ok(commits) => {
+                    if !batch.is_empty() {
+                        send(Msg::BlameChunk(p.clone(), generation, commits[sent..].to_vec(), batch));
+                    }
+                    Msg::BlameDone(p, generation, Ok(()))
+                }
+                Err(e) => Msg::BlameDone(p, generation, Err(e)),
+            }
+        });
+    }
+
+    /// Read the commits for the file view's history.
+    fn load_history(&mut self, path: &Path) {
+        let Some(rv) = self.tabs.get_mut(path) else { return };
+        rv.file_gen += 1;
+        let generation = rv.file_gen;
+        let Some(h) = rv.file_view.as_mut().and_then(|f| f.history.as_mut()) else { return };
+        h.generation = generation;
+        let (p, kind, file) = (path.to_path_buf(), h.kind.clone(), h.path.clone());
+        self.spawn(move || {
+            let without_diffs = |l: Vec<git::FileCommit>| l.into_iter().map(|c| (c, None)).collect();
+            let res = match kind {
+                fileview::HistoryKind::File => git::file_log(&p, &file, false, fileview::HISTORY_LIMIT).map(without_diffs),
+                fileview::HistoryKind::Folder => git::file_log(&p, &file, true, fileview::HISTORY_LIMIT).map(without_diffs),
+                fileview::HistoryKind::Lines { rev: Some(rev), start, end } => git::line_log(&p, &rev, &file, start, end, fileview::LINE_HISTORY_LIMIT),
+                fileview::HistoryKind::Lines { rev: None, start, end } => git::working_line_log(&p, &file, start, end, fileview::LINE_HISTORY_LIMIT),
+            };
+            Msg::FileLog(p, generation, res)
+        });
+    }
+
+    /// Pick commit `i` in the file view's history and show what it changed there.
+    fn select_history(&mut self, path: &Path, i: usize) {
+        let Some(rv) = self.tabs.get_mut(path) else { return };
+        rv.file_gen += 1;
+        let generation = rv.file_gen;
+        let Some(h) = rv.file_view.as_mut().and_then(|f| f.history.as_mut()) else { return };
+        let Some((c, diff)) = h.commits().get(i).cloned() else { return };
+        h.selected = Some(i);
+        h.diff_generation = generation;
+        h.diff_scroll = Some(0);
+        if let fileview::HistoryKind::Lines { .. } = h.kind {
+            // Line history came with its changes.
+            let mut doc = DiffDoc::new(diff.into_iter().collect(), true);
+            doc.commit = Some(c.hash.clone());
+            h.diff = Some(Ok(doc));
+            return;
+        }
+        h.diff = None;
+        let paths = match h.kind {
+            fileview::HistoryKind::Folder => vec![h.path.clone()],
+            _ => std::iter::once(c.path.clone()).chain(c.old_path.clone()).collect(),
+        };
+        let p = path.to_path_buf();
+        self.spawn(move || {
+            let doc = git::commit_files(&p, &c.hash, &paths).map(|files| {
+                let mut doc = DiffDoc::new(files, true);
+                doc.load_previews(&p, Some(&c.hash));
+                doc
+            });
+            Msg::FileDiff(p, generation, doc)
+        });
+    }
+
+    /// Open, change or move around in the file view of the repository at `path`.
+    fn file_action(&mut self, path: &Path, op: FileOpen) {
+        let Some(rv) = self.tabs.get_mut(path) else { return };
+        match op {
+            FileOpen::Blame { rev, path: file, line, back } => {
+                let fv = rv.file_view.get_or_insert_with(|| FileView::new(Mode::Blame));
+                let top = fv.top_line();
+                if back {
+                    if let Some(b) = &fv.blame {
+                        fv.back.push((b.rev.clone(), b.path.clone(), top));
+                    }
+                } else {
+                    fv.back.clear();
+                }
+                if fv.history.as_ref().is_some_and(|h| h.path != file) {
+                    fv.history = None;
+                }
+                fv.mode = Mode::Blame;
+                fv.shown = true;
+                fv.blame = Some(fileview::Blame::new(rev, file, 0, line));
+                self.load_blame(path);
+            }
+            FileOpen::History { path: file, folder } => {
+                let kind = if folder { fileview::HistoryKind::Folder } else { fileview::HistoryKind::File };
+                self.open_history(path, kind, file);
+            }
+            FileOpen::Lines { rev, path: file, start, end } => self.open_history(path, fileview::HistoryKind::Lines { rev, start, end }, file),
+            FileOpen::Mode(m) => {
+                let Some(fv) = rv.file_view.as_mut() else { return };
+                fv.mode = m;
+                fv.shown = true;
+                match m {
+                    Mode::Blame if fv.blame.is_none() => {
+                        let Some(h) = &fv.history else { return };
+                        let (rev, line) = match &h.kind {
+                            fileview::HistoryKind::Folder => return,
+                            fileview::HistoryKind::Lines { rev, start, .. } => (rev.clone(), Some(*start)),
+                            fileview::HistoryKind::File => (None, None),
+                        };
+                        fv.blame = Some(fileview::Blame::new(rev, h.path.clone(), 0, line));
+                        self.load_blame(path);
+                    }
+                    Mode::History if fv.history.is_none() => {
+                        let Some(b) = &fv.blame else { return };
+                        fv.history = Some(fileview::History::new(fileview::HistoryKind::File, b.path.clone(), 0));
+                        self.load_history(path);
+                    }
+                    _ => {}
+                }
+            }
+            FileOpen::Reload => {
+                let Some(fv) = rv.file_view.as_mut() else { return };
+                let top = fv.top_line();
+                let Some(b) = &fv.blame else { return };
+                let mut fresh = fileview::Blame::new(b.rev.clone(), b.path.clone(), 0, None);
+                fresh.sel = b.sel;
+                fresh.scroll_to = Some(top);
+                fv.blame = Some(fresh);
+                self.load_blame(path);
+            }
+            FileOpen::Back => {
+                let Some(fv) = rv.file_view.as_mut() else { return };
+                let Some((rev, file, top)) = fv.back.pop() else { return };
+                if fv.history.as_ref().is_some_and(|h| h.path != file) {
+                    fv.history = None;
+                }
+                let mut b = fileview::Blame::new(rev, file, 0, None);
+                b.scroll_to = Some(top);
+                fv.blame = Some(b);
+                fv.mode = Mode::Blame;
+                self.load_blame(path);
+            }
+            FileOpen::SelectCommit(i) => self.select_history(path, i),
+            FileOpen::Show => {
+                if let Some(fv) = rv.file_view.as_mut() {
+                    fv.shown = true;
+                }
+            }
+        }
+    }
+
+    fn open_history(&mut self, path: &Path, kind: fileview::HistoryKind, file: String) {
+        let Some(rv) = self.tabs.get_mut(path) else { return };
+        let fv = rv.file_view.get_or_insert_with(|| FileView::new(Mode::History));
+        // Blame stays only for the same file (switching back to it keeps your place).
+        let same = fv.blame.as_ref().is_some_and(|b| b.path == file) && kind != fileview::HistoryKind::Folder;
+        if !same {
+            fv.blame = None;
+            fv.back.clear();
+        }
+        fv.mode = Mode::History;
+        fv.shown = true;
+        fv.history = Some(fileview::History::new(kind, file, 0));
+        self.load_history(path);
+    }
+
     fn toast(&mut self, text: impl Into<String>, error: bool) {
         let now = self.ctx.input(|i| i.time);
         self.toasts.push(Toast { text: text.into(), error, until: now + if error { 8.0 } else { 3.5 }, undo: None });
@@ -964,6 +1241,7 @@ impl HeadwayApp {
                                     rv.detail = Some(d);
                                     if other_commit {
                                         rv.reset_detail_scroll = true;
+                                        rv.detail_sel = LineSel::default();
                                     }
                                 }
                                 Err(e) => rv.error = Some(e),
@@ -1000,6 +1278,45 @@ impl HeadwayApp {
                 Msg::Reflog(path, generation, res) => {
                     if let Some(rv) = self.tabs.get_mut(&path).filter(|rv| rv.reflog_gen == generation) {
                         rv.reflog = Some(res);
+                    }
+                }
+                Msg::BlameText(path, generation, text, ignore) => {
+                    if let Some(b) = self.blame_mut(&path, generation) {
+                        b.text_loaded(text, ignore);
+                    }
+                }
+                Msg::BlameChunk(path, generation, commits, ranges) => {
+                    if let Some(b) = self.blame_mut(&path, generation) {
+                        b.add(commits, ranges);
+                    }
+                }
+                Msg::BlameDone(path, generation, res) => {
+                    if let Some(b) = self.blame_mut(&path, generation) {
+                        b.finished(res);
+                    }
+                }
+                Msg::FileLog(path, generation, res) => {
+                    let h = self.tabs.get_mut(&path).and_then(|rv| rv.file_view.as_mut()).and_then(|f| f.history.as_mut()).filter(|h| h.generation == generation);
+                    if let Some(h) = h {
+                        let any = matches!(&res, Ok(l) if !l.is_empty());
+                        h.list = Some(res);
+                        if any {
+                            self.select_history(&path, 0);
+                        }
+                    }
+                }
+                Msg::FileDiff(path, generation, res) => {
+                    let h = self.tabs.get_mut(&path).and_then(|rv| rv.file_view.as_mut()).and_then(|f| f.history.as_mut()).filter(|h| h.diff_generation == generation);
+                    if let Some(h) = h {
+                        h.diff = Some(res);
+                    }
+                }
+                Msg::TrackedFiles(repo, res) => {
+                    if let Some(Dialog::FindFile { repo: r, files, hits_for, .. }) = &mut self.dialog
+                        && *r == repo
+                    {
+                        *files = Some(res);
+                        *hits_for = None;
                     }
                 }
                 Msg::SamplesReady => {
@@ -1101,6 +1418,11 @@ impl HeadwayApp {
                 }
             }
         }
+    }
+
+    /// The blame the file view of `path` shows, if it's still the one asked for.
+    fn blame_mut(&mut self, path: &Path, generation: u64) -> Option<&mut fileview::Blame> {
+        self.tabs.get_mut(path)?.file_view.as_mut()?.blame.as_mut().filter(|b| b.generation == generation)
     }
 
     fn on_repo_loaded(&mut self, path: PathBuf, res: Result<RepoData, String>) {
@@ -1339,6 +1661,43 @@ impl HeadwayApp {
                     }
                 }
                 self.load_reflog(&p);
+            }
+            Action::File(op) => {
+                if let Some(p) = active {
+                    self.file_action(&p, op);
+                }
+            }
+            Action::CloseFile => {
+                if let Some(rv) = active.and_then(|p| self.tabs.get_mut(&p)) {
+                    rv.file_view = None;
+                }
+            }
+            Action::ShowCommit(hash) => {
+                let Some(p) = active else { return };
+                let Some(rv) = self.tabs.get_mut(&p) else { return };
+                if let Some(fv) = rv.file_view.as_mut() {
+                    fv.shown = false;
+                }
+                let found = rv.data.as_ref().and_then(|d| d.commits.iter().position(|c| c.hash == hash));
+                match found {
+                    Some(i) => {
+                        rv.search.clear();
+                        rv.list_scroll_to = Some(i);
+                    }
+                    None => self.toast("That commit isn't in the loaded history (its branch may be hidden). Showing its details.", false),
+                }
+                self.do_action(Action::SelectCommit(hash));
+            }
+            Action::ShowWorkingDir => {
+                if let Some(fv) = active.and_then(|p| self.tabs.get_mut(&p)).and_then(|rv| rv.file_view.as_mut()) {
+                    fv.shown = false;
+                }
+                self.do_action(Action::SelectWorkingDir);
+            }
+            Action::FindFile => {
+                let Some(p) = active else { return };
+                self.dialog = Some(Dialog::FindFile { repo: p.clone(), query: String::new(), files: None, hits: Vec::new(), hits_for: None, picked: 0 });
+                self.spawn(move || Msg::TrackedFiles(p.clone(), git::tracked_files(&p).map(|f| fileview::with_folders(&f))));
             }
             Action::SelectFile(sel) => {
                 // Highlight it in the list, unfold it and scroll the stacked view to it.
@@ -1972,6 +2331,91 @@ impl HeadwayApp {
                         keep = false;
                     }
                 }
+                Dialog::FindFile { query, files, hits, hits_for, picked, .. } => {
+                    ui.set_width(560.0);
+                    ui.heading("Find file");
+                    ui.label(RichText::new("Blame a file, or see the history of a file or folder.").color(DIM));
+                    ui.add_space(6.0);
+                    // ↑/↓ move through the list below, so the box keeps them (egui would otherwise move focus away).
+                    let keep_arrows = egui::EventFilter { horizontal_arrows: true, vertical_arrows: true, ..Default::default() };
+                    let edit = ui.add(egui::TextEdit::singleline(query).hint_text("Type part of a path").desired_width(f32::INFINITY).event_filter(keep_arrows));
+                    edit.request_focus();
+                    if edit.changed() {
+                        *picked = 0;
+                    }
+                    ui.add_space(6.0);
+                    let mut open = None;
+                    match files {
+                        None => {
+                            ui.add(egui::Spinner::new().color(ACCENT));
+                        }
+                        Some(Err(e)) => {
+                            ui.label(RichText::new(format!("Couldn't list the files\n{e}")).color(WARN));
+                        }
+                        Some(Ok(all)) => {
+                            if hits_for.as_deref() != Some(query.as_str()) {
+                                *hits = fileview::find_paths(all, query, 300);
+                                *hits_for = Some(query.clone());
+                            }
+                            let (up, down, history_key) = ctx.input(|i| (i.key_pressed(egui::Key::ArrowUp), i.key_pressed(egui::Key::ArrowDown), i.modifiers.command));
+                            if up {
+                                *picked = picked.saturating_sub(1);
+                            }
+                            if down && *picked + 1 < hits.len() {
+                                *picked += 1;
+                            }
+                            if hits.is_empty() {
+                                ui.label(RichText::new("Nothing matches").color(FAINT));
+                            }
+                            egui::ScrollArea::vertical().max_height(320.0).auto_shrink([false, true]).show(ui, |ui| {
+                                for (i, (path, folder)) in hits.iter().enumerate() {
+                                    let label = if *folder { format!("{path}/") } else { path.clone() };
+                                    let r = ui.add(egui::Button::selectable(*picked == i, RichText::new(label).monospace()));
+                                    if (up || down) && *picked == i {
+                                        r.scroll_to_me(None);
+                                    }
+                                    if r.clicked() {
+                                        *picked = i;
+                                    }
+                                    if r.double_clicked() {
+                                        open = Some((i, *folder));
+                                    }
+                                }
+                            });
+                            if enter && !hits.is_empty() {
+                                // Enter blames a file; Ctrl/Cmd+Enter (or a folder) shows history.
+                                open = Some((*picked, history_key || hits[*picked].1));
+                            }
+                        }
+                    }
+                    ui.add_space(8.0);
+                    let chosen = hits.get(*picked).cloned();
+                    ui.horizontal(|ui| {
+                        ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                            if ui.button("Cancel").clicked() {
+                                keep = false;
+                            }
+                            let has = chosen.is_some();
+                            if ui.add_enabled(has, egui::Button::new("History")).on_hover_text("Ctrl/Cmd+Enter").clicked() {
+                                open = Some((*picked, true));
+                            }
+                            let can_blame = chosen.as_ref().is_some_and(|c| !c.1);
+                            if ui.add_enabled(can_blame, egui::Button::new(RichText::new("Blame").strong()).fill(ACCENT_DIM)).on_hover_text("Enter").clicked() {
+                                open = Some((*picked, false));
+                            }
+                        });
+                    });
+                    if let Some((i, history)) = open
+                        && let Some((path, folder)) = hits.get(i).cloned()
+                    {
+                        actions.push(Action::File(if history || folder {
+                            FileOpen::History { path, folder }
+                        } else {
+                            FileOpen::Blame { rev: None, path, line: None, back: false }
+                        }));
+                        keep = false;
+                    }
+                }
                 Dialog::Confirm { title, body, button, danger, then } => {
                     ui.heading(title.as_str());
                     ui.add_space(4.0);
@@ -2088,6 +2532,11 @@ impl eframe::App for HeadwayApp {
             }
         }
 
+        // Ctrl/Cmd+P finds a file in the open repository, to blame it or see its history.
+        if self.dialog.is_none() && self.active_path().is_some() && ctx.input_mut(|i| i.consume_key(egui::Modifiers::COMMAND, egui::Key::P)) {
+            actions.push(Action::FindFile);
+        }
+
         egui::Panel::top("workspace_bar")
             .exact_size(40.0)
             .frame(egui::Frame::new().fill(BG).inner_margin(Margin::symmetric(10, 0)))
@@ -2108,6 +2557,7 @@ impl eframe::App for HeadwayApp {
                     let ws = self.cfg.ws().clone();
                     let busy: Vec<String> = self.busy.iter().filter(|b| b.1 == p).map(|b| b.2.clone()).collect();
                     if let Some(rv) = self.tabs.get_mut(&p) {
+                        rv.modal = self.dialog.is_some();
                         let before = self.cfg.view;
                         views::repo(ui, rv, &ws, &self.summaries, &busy, &mut self.cfg.view, &mut actions);
                         if self.cfg.view != before {

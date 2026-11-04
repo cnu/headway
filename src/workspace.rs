@@ -43,11 +43,14 @@ pub struct ViewPrefs {
     pub sidebar_open: bool,
     /// Share of the width (after the sidebar) given to the right-hand details pane.
     pub split: f32,
+    /// Blame settings (ignore whitespace, moved lines, listed commits).
+    #[serde(default)]
+    pub blame: crate::git::BlameOptions,
 }
 
 impl Default for ViewPrefs {
     fn default() -> Self {
-        Self { sidebar_open: true, split: 0.5 }
+        Self { sidebar_open: true, split: 0.5, blame: Default::default() }
     }
 }
 
@@ -131,7 +134,7 @@ mod tests {
         ws.repos = vec!["/a".into(), "/b".into()];
         ws.open_tabs = vec!["/b".into()];
         ws.active_tab = Some(0);
-        let cfg = Config { workspaces: vec![ws, Workspace::new("Other")], current: 1, view: ViewPrefs { sidebar_open: false, split: 0.3 }, hidden_refs: [(PathBuf::from("/a"), vec!["refs/heads/x".to_string()])].into(), file: None };
+        let cfg = Config { workspaces: vec![ws, Workspace::new("Other")], current: 1, view: ViewPrefs { sidebar_open: false, split: 0.3, ..Default::default() }, hidden_refs: [(PathBuf::from("/a"), vec!["refs/heads/x".to_string()])].into(), file: None };
         let back: Config = serde_json::from_str(&serde_json::to_string(&cfg).unwrap()).unwrap();
         assert_eq!(back.current, 1);
         assert_eq!(back.ws().name, "Other");
