@@ -1,6 +1,6 @@
 //! The repository screen: toolbar, sidebar, history, commit details, staging and diffs.
 
-use crate::app::{Action, DiffDoc, Dialog, FileOpen, FileSel, FlatRow, FollowUp, LineSel, OpKind, Record, RepoData, RepoView, Selection, Summary};
+use crate::app::{Action, DiffDoc, Dialog, FileOpen, FileSel, FlatRow, FollowUp, LineKey, LineSel, OpKind, Record, RepoData, RepoView, Selection, Summary};
 use crate::git::{self, Change, FileChange, LineKind, RefKind};
 use crate::graph::Target;
 use crate::{highlight, preview};
@@ -1589,6 +1589,7 @@ fn commit_panel(ui: &mut Ui, rv: &mut RepoView, prefs: &mut DiffPrefs, actions: 
                 });
                 ui.add_space(8.0);
                 let (a, r): (u32, u32) = d.doc.files.iter().fold((0, 0), |(a, r), f| (a + f.added, r + f.removed));
+                let narrow = ui.available_width() < DIFF_OPTIONS_INLINE;
                 ui.horizontal(|ui| {
                     ui.label(RichText::new(format!("{} file{} changed", d.doc.files.len(), if d.doc.files.len() == 1 { "" } else { "s" })).strong());
                     ui.label(RichText::new(format!("+{a}")).color(ADD_FG));
@@ -1598,10 +1599,15 @@ fn commit_panel(ui: &mut Ui, rv: &mut RepoView, prefs: &mut DiffPrefs, actions: 
                             if let Some(all) = fold_buttons(ui, &d.doc) {
                                 fold_all = Some(all);
                             }
-                            diff_options(ui, prefs, actions);
+                            if !narrow {
+                                diff_options(ui, prefs, actions);
+                            }
                         });
                     }
                 });
+                if narrow && !d.doc.files.is_empty() {
+                    ui.with_layout(Layout::right_to_left(Align::Center), |ui| diff_options(ui, prefs, actions));
+                }
                 ui.spacing_mut().item_spacing.y = 1.0;
                 for (i, f) in d.doc.files.iter().enumerate() {
                     let resp = file_line(ui, &f.path, f.old_path.as_deref(), &f.change, false, Some((f.added, f.removed)));
@@ -2035,19 +2041,18 @@ pub(crate) fn file_history_menu(ui: &mut Ui, path: &str, at: Option<&str>, chang
 
 /// Lines picked in a commit's diff: offer their history.
 fn commit_line_bar(ui: &mut Ui, doc: &DiffDoc, sel: &mut LineSel, hash: &str, actions: &mut Vec<Action>) {
-    if sel.rows.is_empty() {
+    if sel.lines.is_empty() {
         return;
     }
     if !ui.ctx().text_edit_focused() && ui.input(|i| i.key_pressed(egui::Key::Escape)) {
-        sel.rows.clear();
+        sel.lines.clear();
         return;
     }
     let mut fi = None;
     let (mut new, mut old) = (Vec::new(), Vec::new());
-    for &r in &sel.rows {
-        if let Some(FlatRow::Line(f, hi, li)) = doc.rows.get(r) {
-            fi = Some(*f);
-            let l = &doc.files[*f].hunks[*hi].lines[*li];
+    for &key in &sel.lines {
+        if let Some(l) = doc.line(key) {
+            fi = Some(key.0);
             new.extend(l.new_no);
             old.extend(l.old_no.filter(|_| l.kind == LineKind::Del));
         }
@@ -2066,12 +2071,12 @@ fn commit_line_bar(ui: &mut Ui, doc: &DiffDoc, sel: &mut LineSel, hash: &str, ac
     ui.painter().line_segment([rect.left_bottom(), rect.right_bottom()], Stroke::new(1.0, BORDER));
     let mut child = ui.new_child(egui::UiBuilder::new().max_rect(rect.shrink2(vec2(12.0, 3.0))).layout(Layout::left_to_right(Align::Center)));
     let ui = &mut child;
-    let n = sel.rows.len();
+    let n = sel.lines.len();
     ui.label(RichText::new(format!("{n} line{} picked", if n == 1 { "" } else { "s" })).strong().color(TEXT));
     ui.label(RichText::new(format!("in {}", file.path)).color(DIM));
     ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
         if ui.button("Clear").on_hover_text("Esc").clicked() {
-            sel.rows.clear();
+            sel.lines.clear();
         }
         let label = if a == z { "History of this line" } else { "History of these lines" };
         if ui.button(label).on_hover_text(format!("Every commit that changed {path} lines {a}–{z}")).clicked() {
@@ -2281,31 +2286,50 @@ fn discard_note(f: &FileChange) -> &'static str {
 
 /// "N files · +a −r" with Collapse all / Expand all. Returns Some(fold everything?) when clicked.
 fn fold_bar(ui: &mut Ui, doc: &DiffDoc, prefs: &mut DiffPrefs, actions: &mut Vec<Action>) -> Option<bool> {
-    let (rect, _) = ui.allocate_exact_size(vec2(ui.available_width(), 30.0), Sense::hover());
+    // In a narrow pane the diff options get a line of their own.
+    let narrow = ui.available_width() < DIFF_OPTIONS_INLINE;
+    let (rect, _) = ui.allocate_exact_size(vec2(ui.available_width(), if narrow { 56.0 } else { 30.0 }), Sense::hover());
     ui.painter().rect_filled(rect, 0.0, PANEL);
     ui.painter().line_segment([rect.left_bottom(), rect.right_bottom()], Stroke::new(1.0, BORDER));
-    let mut child = ui.new_child(egui::UiBuilder::new().max_rect(rect.shrink2(vec2(12.0, 3.0))).layout(Layout::left_to_right(Align::Center)));
-    let ui = &mut child;
+    let top = Rect::from_min_size(rect.min, vec2(rect.width(), 30.0));
+    let mut child = ui.new_child(egui::UiBuilder::new().max_rect(top.shrink2(vec2(12.0, 3.0))).layout(Layout::left_to_right(Align::Center)));
+    let ui2 = &mut child;
     let n = doc.files.len();
     let (a, r) = doc.files.iter().fold((0, 0), |(a, r), f| (a + f.added, r + f.removed));
-    ui.label(RichText::new(format!("{n} file{}", if n == 1 { "" } else { "s" })).strong());
-    ui.label(RichText::new(format!("+{a}")).color(ADD_FG));
-    ui.label(RichText::new(format!("−{r}")).color(DEL_FG));
+    ui2.label(RichText::new(format!("{n} file{}", if n == 1 { "" } else { "s" })).strong());
+    ui2.label(RichText::new(format!("+{a}")).color(ADD_FG));
+    ui2.label(RichText::new(format!("−{r}")).color(DEL_FG));
     let mut out = None;
-    ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+    ui2.with_layout(Layout::right_to_left(Align::Center), |ui| {
         out = fold_buttons(ui, doc);
-        diff_options(ui, prefs, actions);
+        if !narrow {
+            diff_options(ui, prefs, actions);
+        }
     });
+    if narrow {
+        let below = Rect::from_min_max(pos2(rect.left(), top.bottom() - 4.0), rect.max);
+        let mut child = ui.new_child(egui::UiBuilder::new().max_rect(below.shrink2(vec2(12.0, 1.0))).layout(Layout::right_to_left(Align::Center)));
+        diff_options(&mut child, prefs, actions);
+    }
     out
 }
+
+/// Panes narrower than this put the diff options below the file counts.
+const DIFF_OPTIONS_INLINE: f32 = 640.0;
 
 /// How diffs are shown (laid out right to left, next to the fold buttons).
 fn diff_options(ui: &mut Ui, prefs: &mut DiffPrefs, actions: &mut Vec<Action>) {
     let before = *prefs;
     ui.checkbox(&mut prefs.ignore_whitespace, "Ignore whitespace")
         .on_hover_text("Leave out changes to spaces and indentation (-w). Lines and hunks can't be staged while it's on.");
+    let layout = if prefs.split { "Side by side" } else { "Unified" };
+    let combo = egui::ComboBox::from_id_salt("diff_layout").selected_text(layout).show_ui(ui, |ui| {
+        ui.selectable_value(&mut prefs.split, false, "Unified").on_hover_text("Removed and added lines one above the other");
+        ui.selectable_value(&mut prefs.split, true, "Side by side").on_hover_text("Before on the left, after on the right");
+    });
+    combo.response.widget_info(|| egui::WidgetInfo::labeled(egui::Role::ComboBox, true, layout));
     if *prefs != before {
-        actions.push(Action::DiffPrefsChanged);
+        actions.push(Action::DiffPrefsChanged { reload: prefs.ignore_whitespace != before.ignore_whitespace });
     }
 }
 
@@ -2337,43 +2361,33 @@ fn line_bar(ui: &mut Ui, doc: &DiffDoc, sel: &mut LineSel, repo: &Path, actions:
     if !(0..doc.files.len()).any(|fi| doc.editable(fi) && !doc.files[fi].hunks.is_empty()) {
         return;
     }
-    if !sel.rows.is_empty() && !ui.ctx().text_edit_focused() && ui.input(|i| i.key_pressed(egui::Key::Escape)) {
-        sel.rows.clear();
+    if !sel.lines.is_empty() && !ui.ctx().text_edit_focused() && ui.input(|i| i.key_pressed(egui::Key::Escape)) {
+        sel.lines.clear();
     }
     let (rect, _) = ui.allocate_exact_size(vec2(ui.available_width(), 30.0), Sense::hover());
-    let fill = if sel.rows.is_empty() { PANEL } else { Color32::from_rgb(32, 48, 66) };
+    let fill = if sel.lines.is_empty() { PANEL } else { Color32::from_rgb(32, 48, 66) };
     ui.painter().rect_filled(rect, 0.0, fill);
     ui.painter().line_segment([rect.left_bottom(), rect.right_bottom()], Stroke::new(1.0, BORDER));
     let mut child = ui.new_child(egui::UiBuilder::new().max_rect(rect.shrink2(vec2(12.0, 3.0))).layout(Layout::left_to_right(Align::Center)));
     let ui = &mut child;
-    let n = sel.rows.len();
+    let n = sel.lines.len();
     if n == 0 {
         ui.label(RichText::new("Click a changed line to pick it · Shift-click or drag to pick several · then stage just those lines").size(12.0).color(FAINT));
         return;
     }
     // Picks always belong to one file (picking elsewhere starts over).
-    let Some(fi) = sel.rows.iter().find_map(|&r| match doc.rows.get(r) {
-        Some(FlatRow::Line(fi, ..)) => Some(*fi),
-        _ => None,
-    }) else {
+    let Some(&(fi, ..)) = sel.lines.iter().find(|k| doc.line(**k).is_some()) else {
         return;
     };
     let mode = doc.modes[fi];
-    let picked: git::LineSelection = sel
-        .rows
-        .iter()
-        .filter_map(|&r| match doc.rows.get(r) {
-            Some(FlatRow::Line(f, hi, li)) if *f == fi => Some((*hi, *li)),
-            _ => None,
-        })
-        .collect();
+    let picked: git::LineSelection = sel.lines.iter().filter(|k| k.0 == fi && doc.line(**k).is_some()).map(|&(_, hi, li)| (hi, li)).collect();
     let n = picked.len();
     let file = doc.files[fi].clone();
     ui.label(RichText::new(format!("{n} line{} picked", if n == 1 { "" } else { "s" })).strong().color(TEXT));
     ui.label(RichText::new(format!("in {}", file.path)).color(DIM));
     ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
         if ui.button("Clear").on_hover_text("Esc").clicked() {
-            sel.rows.clear();
+            sel.lines.clear();
         }
         match mode {
             DiffMode::Unstaged | DiffMode::Untracked => {
@@ -2404,78 +2418,85 @@ fn line_bar(ui: &mut Ui, doc: &DiffDoc, sel: &mut LineSel, repo: &Path, actions:
     });
 }
 
-/// Pick lines with clicks and drags (only rows of changed lines count).
-/// What the mouse did to a diff row.
+/// What the mouse did to a line of a diff.
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub enum PickEvent {
-    /// A drag began on this row.
+    /// A drag began on this line.
     DragStart,
-    /// The pointer is over this row while a drag is in progress.
+    /// The pointer is level with this line while a drag is in progress.
     DragOver,
     Click { shift: bool, command: bool },
 }
 
-/// Update the picked lines for one mouse event. Only rows of changed lines can be picked;
-/// ranges skip over unchanged rows.
-pub fn apply_pick(doc: &DiffDoc, sel: &mut LineSel, ri: usize, event: PickEvent) {
-    let changed = |r: usize| match doc.rows.get(r) {
-        Some(FlatRow::Line(fi, hi, li)) => matches!(doc.files[*fi].hunks[*hi].lines[*li].kind, LineKind::Add | LineKind::Del),
-        _ => false,
-    };
-    let file_of = |r: usize| match doc.rows.get(r) {
-        Some(FlatRow::Line(fi, ..)) => Some(*fi),
-        _ => None,
-    };
+/// Update the picked lines for one mouse event on line `key`. Only changed lines
+/// can be picked; ranges run in the file's order and skip unchanged lines.
+pub fn apply_pick(doc: &DiffDoc, sel: &mut LineSel, key: LineKey, event: PickEvent) {
+    let changed = |k: LineKey| doc.line(k).is_some_and(|l| matches!(l.kind, LineKind::Add | LineKind::Del));
     // Ranges stay inside the file where they started.
-    let range = |a: usize, b: usize| {
-        (a.min(b)..=a.max(b)).filter(|&r| changed(r) && file_of(r) == file_of(a)).collect::<std::collections::BTreeSet<usize>>()
+    let range = |a: LineKey, b: LineKey| -> std::collections::BTreeSet<LineKey> {
+        // A line in another file stretches the range to this file's end (or start).
+        let b = match b.0.cmp(&a.0) {
+            std::cmp::Ordering::Equal => b,
+            std::cmp::Ordering::Greater => (a.0, usize::MAX, usize::MAX),
+            std::cmp::Ordering::Less => (a.0, 0, 0),
+        };
+        let (lo, hi) = (a.min(b), a.max(b));
+        let Some(f) = doc.files.get(a.0) else { return Default::default() };
+        f.hunks
+            .iter()
+            .enumerate()
+            .flat_map(|(h, hunk)| (0..hunk.lines.len()).map(move |l| (a.0, h, l)))
+            .filter(|k| (lo..=hi).contains(k) && changed(*k))
+            .collect()
     };
     match event {
         PickEvent::DragStart => {
-            sel.anchor = Some(ri);
+            sel.anchor = Some(key);
             sel.dragging = true;
-            sel.rows = range(ri, ri);
+            sel.lines = range(key, key);
         }
         PickEvent::DragOver => {
             if let (true, Some(a)) = (sel.dragging, sel.anchor) {
-                sel.rows = range(a, ri);
+                sel.lines = range(a, key);
             }
         }
         PickEvent::Click { shift: true, .. } if sel.anchor.is_some() => {
-            sel.rows = range(sel.anchor.unwrap(), ri);
+            sel.lines = range(sel.anchor.unwrap(), key);
         }
         PickEvent::Click { command: true, .. } => {
             // Picks from another file are dropped: one file at a time.
-            if sel.rows.iter().any(|&r| file_of(r) != file_of(ri)) {
-                sel.rows.clear();
+            if sel.lines.iter().any(|k| k.0 != key.0) {
+                sel.lines.clear();
             }
-            if !sel.rows.remove(&ri) && changed(ri) {
-                sel.rows.insert(ri);
+            if !sel.lines.remove(&key) && changed(key) {
+                sel.lines.insert(key);
             }
-            sel.anchor = Some(ri);
+            sel.anchor = Some(key);
         }
         PickEvent::Click { .. } => {
-            if sel.rows.len() == 1 && sel.rows.contains(&ri) {
-                sel.rows.clear();
+            if sel.lines.len() == 1 && sel.lines.contains(&key) {
+                sel.lines.clear();
             } else {
-                sel.rows = range(ri, ri);
-                sel.anchor = Some(ri);
+                sel.lines = range(key, key);
+                sel.anchor = Some(key);
             }
         }
     }
 }
 
-fn handle_line_pick(ui: &Ui, doc: &DiffDoc, ri: usize, resp: &egui::Response, sel: &mut LineSel) {
+/// Picking with the mouse in one line's cell (`resp`). Dragging counts the line
+/// the pointer is level with, on the same side when side by side.
+fn handle_line_pick(ui: &Ui, doc: &DiffDoc, key: LineKey, resp: &egui::Response, sel: &mut LineSel) {
     let mods = ui.input(|i| i.modifiers);
     if resp.drag_started() {
-        apply_pick(doc, sel, ri, PickEvent::DragStart);
+        apply_pick(doc, sel, key, PickEvent::DragStart);
     } else if resp.clicked() {
-        apply_pick(doc, sel, ri, PickEvent::Click { shift: mods.shift, command: mods.command });
+        apply_pick(doc, sel, key, PickEvent::Click { shift: mods.shift, command: mods.command });
     }
     if sel.dragging {
         if let Some(pos) = ui.input(|i| i.pointer.interact_pos()) {
-            if resp.rect.y_range().contains(pos.y) {
-                apply_pick(doc, sel, ri, PickEvent::DragOver);
+            if resp.rect.y_range().contains(pos.y) && (!doc.split || resp.rect.x_range().contains(pos.x)) {
+                apply_pick(doc, sel, key, PickEvent::DragOver);
             }
         }
     }
@@ -2521,6 +2542,70 @@ fn paint_image_strip(ui: &Ui, rect: Rect, fi: usize, k: usize, pv: &preview::Ima
     }
 }
 
+/// Width of the line-number gutter of each half of the side-by-side view.
+const SPLIT_GUTTER: f32 = 50.0;
+
+/// Where one line of a diff is drawn: the whole row (unified), or one half of
+/// it (side by side).
+struct Cell {
+    rect: Rect,
+    gutter: f32,
+    /// Line numbers, right-aligned this far from the cell's left edge.
+    nums: [(f32, Option<u32>); 2],
+    /// Where the code starts (moved left as the view scrolls sideways).
+    text_x: f32,
+    /// The code is cut off left of this.
+    clip_left: f32,
+}
+
+/// Draw one line of a diff and let it be picked (when `sel` is given and the
+/// file allows it): background, line numbers, the +/− mark and the code.
+fn line_cell(ui: &mut Ui, doc: &DiffDoc, key: LineKey, cell: &Cell, sel: Option<&mut LineSel>, id: (&str, usize, usize)) {
+    let (fi, hi, li) = key;
+    let l = &doc.files[fi].hunks[hi].lines[li];
+    let rect = cell.rect;
+    let y = rect.center().y;
+    let p = ui.painter().with_clip_rect(ui.clip_rect().intersect(rect));
+    let changed_line = matches!(l.kind, LineKind::Add | LineKind::Del);
+    let mut picked = false;
+    let mut hovered = false;
+    if let Some(sel) = sel.filter(|_| doc.editable(fi) || doc.modes[fi] == DiffMode::Commit) {
+        let resp = ui.interact(rect, ui.scope_id().with(id), Sense::click_and_drag());
+        name_it(&resp, egui::Role::Row, format!("line {}", l.text));
+        handle_line_pick(ui, doc, key, &resp, sel);
+        picked = sel.lines.contains(&key);
+        hovered = changed_line && resp.hovered();
+        if hovered {
+            ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
+        }
+    }
+    let (bg, fg, mark) = match l.kind {
+        LineKind::Add => (ADD_BG, ADD_FG, "+"),
+        LineKind::Del => (DEL_BG, DEL_FG, "−"),
+        LineKind::Context => (Color32::TRANSPARENT, CODE, ""),
+        LineKind::NoNewline => (Color32::TRANSPARENT, FAINT, ""),
+    };
+    if bg != Color32::TRANSPARENT {
+        p.rect_filled(rect, 0.0, bg);
+    }
+    p.rect_filled(Rect::from_min_size(rect.min, vec2(cell.gutter, DIFF_ROW)), 0.0, Color32::from_black_alpha(40));
+    for (x, n) in cell.nums {
+        if let Some(n) = n {
+            p.text(pos2(rect.left() + x, y), Align2::RIGHT_CENTER, n.to_string(), theme::mono(11.5), FAINT);
+        }
+    }
+    if picked {
+        p.rect_filled(rect, 0.0, Color32::from_rgba_unmultiplied(90, 160, 255, 48));
+        p.rect_filled(Rect::from_min_size(rect.min, vec2(4.0, DIFF_ROW)), 0.0, BLUE);
+    } else if hovered {
+        p.rect_filled(rect, 0.0, Color32::from_white_alpha(10));
+        p.rect_filled(Rect::from_min_size(rect.min, vec2(4.0, DIFF_ROW)), 0.0, BLUE.gamma_multiply(0.4));
+    }
+    p.text(pos2(rect.left() + cell.gutter + 8.0, y), Align2::LEFT_CENTER, mark, theme::mono(12.5), fg);
+    let code = p.with_clip_rect(p.clip_rect().intersect(Rect::from_x_y_ranges(cell.clip_left..=rect.right(), rect.y_range())));
+    paint_code(&code, pos2(cell.text_x, y), doc, fi, hi, li, fg, ui.visuals().dark_mode);
+}
+
 pub fn diff_view(
     ui: &mut Ui,
     doc: &DiffDoc,
@@ -2545,7 +2630,14 @@ pub fn diff_view(
     }
     let char_w = ui.fonts_mut(|f| f.glyph_width(&theme::mono(12.5), 'M'));
     let gutter = 92.0;
-    let content_w = (gutter + 26.0 + doc.max_cols as f32 * char_w + 20.0).max(ui.available_width());
+    let text_w = doc.max_cols as f32 * char_w + 20.0;
+    let content_w = if doc.split {
+        // Wide enough to scroll each half's longest line into view.
+        let w = ui.available_width();
+        w + (text_w - (w / 2.0 - SPLIT_GUTTER - 22.0)).max(0.0)
+    } else {
+        (gutter + 26.0 + text_w).max(ui.available_width())
+    };
     let mut sa = egui::ScrollArea::both().auto_shrink(false).id_salt(("diff", repo, mode as u8));
     if let Some(r) = scroll_to.take() {
         // Never ask for more than the view can scroll, or it overshoots and slides back.
@@ -2684,46 +2776,32 @@ pub fn diff_view(
                     }
                     FlatRow::Line(fi, hi, li) => {
                         let l = &doc.files[fi].hunks[hi].lines[li];
-                        let changed_line = matches!(l.kind, LineKind::Add | LineKind::Del);
-                        let mut picked = false;
-                        let mut hovered = false;
-                        if let Some(sel) = line_sel.as_deref_mut().filter(|_| doc.editable(fi) || doc.modes[fi] == DiffMode::Commit) {
-                            let resp = ui.interact(rect, ui.scope_id().with(("diff_line", ri)), Sense::click_and_drag());
-                            name_it(&resp, egui::Role::Row, format!("line {}", l.text));
-                            handle_line_pick(ui, doc, ri, &resp, sel);
-                            picked = sel.rows.contains(&ri);
-                            hovered = changed_line && resp.hovered();
-                            if hovered {
-                                ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
-                            }
+                        let cell = Cell { rect, gutter, nums: [(40.0, l.old_no), (84.0, l.new_no)], text_x: tx, clip_left: rect.left() };
+                        line_cell(ui, doc, (fi, hi, li), &cell, line_sel.as_deref_mut(), ("diff_line", ri, 0));
+                    }
+                    FlatRow::Pair(fi, hi, old, new) => {
+                        // Both halves stay on screen and scroll sideways together.
+                        let scroll_x = clip.left() - rect.left();
+                        let mid = (clip.left() + clip.width() / 2.0).round();
+                        let halves = [(Rect::from_x_y_ranges(clip.left()..=mid, rect.y_range()), old), (Rect::from_x_y_ranges(mid..=clip.right(), rect.y_range()), new)];
+                        for (side, (half, li)) in halves.into_iter().enumerate() {
+                            let Some(li) = li else {
+                                // Nothing on this side: the other side's line is new, or gone.
+                                p.rect_filled(half, 0.0, Color32::from_black_alpha(36));
+                                continue;
+                            };
+                            let l = &doc.files[fi].hunks[hi].lines[li];
+                            let num = if side == 0 { l.old_no } else { l.new_no };
+                            let cell = Cell {
+                                rect: half,
+                                gutter: SPLIT_GUTTER,
+                                nums: [(SPLIT_GUTTER - 8.0, num), (0.0, None)],
+                                text_x: half.left() + SPLIT_GUTTER + 22.0 - scroll_x,
+                                clip_left: half.left() + SPLIT_GUTTER + 16.0,
+                            };
+                            line_cell(ui, doc, (fi, hi, li), &cell, line_sel.as_deref_mut(), ("diff_line", ri, side + 1));
                         }
-                        let (bg, fg, mark) = match l.kind {
-                            LineKind::Add => (ADD_BG, ADD_FG, "+"),
-                            LineKind::Del => (DEL_BG, DEL_FG, "−"),
-                            LineKind::Context => (Color32::TRANSPARENT, CODE, ""),
-                            LineKind::NoNewline => (Color32::TRANSPARENT, FAINT, ""),
-                        };
-                        if bg != Color32::TRANSPARENT {
-                            p.rect_filled(rect, 0.0, bg);
-                        }
-                        let gr = Rect::from_min_size(rect.min, vec2(gutter, DIFF_ROW));
-                        p.rect_filled(gr, 0.0, Color32::from_black_alpha(40));
-                        let nf = theme::mono(11.5);
-                        if let Some(n) = l.old_no {
-                            p.text(pos2(rect.left() + 40.0, y), Align2::RIGHT_CENTER, n.to_string(), nf.clone(), FAINT);
-                        }
-                        if let Some(n) = l.new_no {
-                            p.text(pos2(rect.left() + 84.0, y), Align2::RIGHT_CENTER, n.to_string(), nf, FAINT);
-                        }
-                        if picked {
-                            p.rect_filled(rect, 0.0, Color32::from_rgba_unmultiplied(90, 160, 255, 48));
-                            p.rect_filled(Rect::from_min_size(rect.min, vec2(4.0, DIFF_ROW)), 0.0, BLUE);
-                        } else if hovered {
-                            p.rect_filled(rect, 0.0, Color32::from_white_alpha(10));
-                            p.rect_filled(Rect::from_min_size(rect.min, vec2(4.0, DIFF_ROW)), 0.0, BLUE.gamma_multiply(0.4));
-                        }
-                        p.text(pos2(rect.left() + gutter + 8.0, y), Align2::LEFT_CENTER, mark, theme::mono(12.5), fg);
-                        paint_code(&p, pos2(tx, y), doc, fi, hi, li, fg, ui.visuals().dark_mode);
+                        p.line_segment([pos2(mid, rect.top()), pos2(mid, rect.bottom())], Stroke::new(1.0, BORDER));
                     }
                 }
             }
@@ -2761,20 +2839,37 @@ mod tests {
         PickEvent::Click { shift, command }
     }
 
+    /// The line drawn in row `row` of the unified diff.
+    fn key_at(d: &DiffDoc, row: usize) -> Option<LineKey> {
+        match d.rows[row] {
+            FlatRow::Line(fi, hi, li) => Some((fi, hi, li)),
+            _ => None,
+        }
+    }
+
+    /// A mouse event on row `row` (rows that aren't lines can't be clicked as lines).
+    fn pick(d: &DiffDoc, sel: &mut LineSel, row: usize, event: PickEvent) {
+        if let Some(key) = key_at(d, row) {
+            apply_pick(d, sel, key, event);
+        }
+    }
+
+    /// The rows of the picked lines.
     fn picked(sel: &LineSel) -> Vec<usize> {
-        sel.rows.iter().copied().collect()
+        let d = doc();
+        (0..d.rows.len()).filter(|&r| key_at(&d, r).is_some_and(|k| sel.lines.contains(&k))).collect()
     }
 
     #[test]
     fn click_picks_one_changed_line_and_click_again_unpicks() {
         let d = doc();
         let mut sel = LineSel::default();
-        apply_pick(&d, &mut sel, 2, click(false, false));
+        pick(&d, &mut sel, 2, click(false, false));
         assert_eq!(picked(&sel), [2]);
-        apply_pick(&d, &mut sel, 3, click(false, false));
+        pick(&d, &mut sel, 3, click(false, false));
         assert_eq!(picked(&sel), [3], "a plain click replaces the pick");
-        apply_pick(&d, &mut sel, 3, click(false, false));
-        assert!(sel.rows.is_empty());
+        pick(&d, &mut sel, 3, click(false, false));
+        assert!(sel.lines.is_empty());
     }
 
     #[test]
@@ -2782,22 +2877,22 @@ mod tests {
         let d = doc();
         let mut sel = LineSel::default();
         for row in [0, 1, 4, 7] {
-            apply_pick(&d, &mut sel, row, click(false, false));
-            assert!(sel.rows.is_empty(), "row {row}");
+            pick(&d, &mut sel, row, click(false, false));
+            assert!(sel.lines.is_empty(), "row {row}");
         }
-        apply_pick(&d, &mut sel, 1, click(false, true));
-        assert!(sel.rows.is_empty());
+        pick(&d, &mut sel, 1, click(false, true));
+        assert!(sel.lines.is_empty());
     }
 
     #[test]
     fn shift_click_picks_a_range_skipping_unchanged_lines() {
         let d = doc();
         let mut sel = LineSel::default();
-        apply_pick(&d, &mut sel, 2, click(false, false));
-        apply_pick(&d, &mut sel, 8, click(true, false));
+        pick(&d, &mut sel, 2, click(false, false));
+        pick(&d, &mut sel, 8, click(true, false));
         assert_eq!(picked(&sel), [2, 3, 5, 6, 8]);
         // Ranges work upwards too, from the same anchor.
-        apply_pick(&d, &mut sel, 1, click(true, false));
+        pick(&d, &mut sel, 1, click(true, false));
         assert_eq!(picked(&sel), [2]);
     }
 
@@ -2805,7 +2900,7 @@ mod tests {
     fn shift_click_without_an_anchor_acts_like_a_click() {
         let d = doc();
         let mut sel = LineSel::default();
-        apply_pick(&d, &mut sel, 5, click(true, false));
+        pick(&d, &mut sel, 5, click(true, false));
         assert_eq!(picked(&sel), [5]);
     }
 
@@ -2813,11 +2908,11 @@ mod tests {
     fn ctrl_click_adds_and_removes_single_lines() {
         let d = doc();
         let mut sel = LineSel::default();
-        apply_pick(&d, &mut sel, 2, click(false, true));
-        apply_pick(&d, &mut sel, 6, click(false, true));
-        apply_pick(&d, &mut sel, 8, click(false, true));
+        pick(&d, &mut sel, 2, click(false, true));
+        pick(&d, &mut sel, 6, click(false, true));
+        pick(&d, &mut sel, 8, click(false, true));
         assert_eq!(picked(&sel), [2, 6, 8]);
-        apply_pick(&d, &mut sel, 6, click(false, true));
+        pick(&d, &mut sel, 6, click(false, true));
         assert_eq!(picked(&sel), [2, 8]);
     }
 
@@ -2825,19 +2920,19 @@ mod tests {
     fn dragging_picks_everything_between_start_and_pointer() {
         let d = doc();
         let mut sel = LineSel::default();
-        apply_pick(&d, &mut sel, 3, PickEvent::DragStart);
+        pick(&d, &mut sel, 3, PickEvent::DragStart);
         assert!(sel.dragging);
         assert_eq!(picked(&sel), [3]);
-        apply_pick(&d, &mut sel, 6, PickEvent::DragOver);
+        pick(&d, &mut sel, 6, PickEvent::DragOver);
         assert_eq!(picked(&sel), [3, 5, 6]);
         // Moving back shrinks the pick.
-        apply_pick(&d, &mut sel, 4, PickEvent::DragOver);
+        pick(&d, &mut sel, 4, PickEvent::DragOver);
         assert_eq!(picked(&sel), [3]);
-        apply_pick(&d, &mut sel, 2, PickEvent::DragOver);
+        pick(&d, &mut sel, 2, PickEvent::DragOver);
         assert_eq!(picked(&sel), [2, 3]);
         // Once the drag has ended, hovering changes nothing.
         sel.dragging = false;
-        apply_pick(&d, &mut sel, 8, PickEvent::DragOver);
+        pick(&d, &mut sel, 8, PickEvent::DragOver);
         assert_eq!(picked(&sel), [2, 3]);
     }
 
@@ -2845,17 +2940,10 @@ mod tests {
     fn picked_rows_map_to_the_right_patch_lines() {
         let d = doc();
         let mut sel = LineSel::default();
-        apply_pick(&d, &mut sel, 3, click(false, false));
-        apply_pick(&d, &mut sel, 8, click(false, true));
-        let lines: git::LineSelection = sel
-            .rows
-            .iter()
-            .filter_map(|&r| match d.rows[r] {
-                FlatRow::Line(_, hi, li) => Some((hi, li)),
-                _ => None,
-            })
-            .collect();
-        assert_eq!(lines.into_iter().collect::<Vec<_>>(), [(0, 2), (1, 0)]);
+        pick(&d, &mut sel, 3, click(false, false));
+        pick(&d, &mut sel, 8, click(false, true));
+        let lines: Vec<(usize, usize)> = sel.lines.iter().map(|&(_, hi, li)| (hi, li)).collect();
+        assert_eq!(lines, [(0, 2), (1, 0)]);
     }
 
     #[test]
@@ -2866,14 +2954,51 @@ mod tests {
         );
         let d = DiffDoc::new(files, true);
         let mut sel = LineSel::default();
-        apply_pick(&d, &mut sel, 2, click(false, false));
-        apply_pick(&d, &mut sel, 8, click(true, false));
-        assert_eq!(picked(&sel), [2, 3], "a shift-click range doesn't spill into the next file");
-        apply_pick(&d, &mut sel, 7, click(false, true));
-        assert_eq!(picked(&sel), [7], "ctrl-click in another file starts over there");
-        apply_pick(&d, &mut sel, 3, PickEvent::DragStart);
-        apply_pick(&d, &mut sel, 8, PickEvent::DragOver);
-        assert_eq!(picked(&sel), [3], "dragging stays in the file where it began");
+        let keys = |sel: &LineSel| sel.lines.iter().copied().collect::<Vec<_>>();
+        pick(&d, &mut sel, 2, click(false, false));
+        pick(&d, &mut sel, 8, click(true, false));
+        assert_eq!(keys(&sel), [(0, 0, 0), (0, 0, 1)], "a shift-click range doesn't spill into the next file");
+        pick(&d, &mut sel, 7, click(false, true));
+        assert_eq!(keys(&sel), [(1, 0, 0)], "ctrl-click in another file starts over there");
+        pick(&d, &mut sel, 3, PickEvent::DragStart);
+        pick(&d, &mut sel, 8, PickEvent::DragOver);
+        assert_eq!(keys(&sel), [(0, 0, 1)], "dragging stays in the file where it began");
+    }
+
+    #[test]
+    fn side_by_side_rows_put_removed_lines_left_and_added_lines_right() {
+        let mut d = doc();
+        d.set_split(true);
+        let pairs: Vec<(Option<usize>, Option<usize>)> = d
+            .rows
+            .iter()
+            .filter_map(|r| match *r {
+                FlatRow::Pair(_, _, o, n) => Some((o, n)),
+                _ => None,
+            })
+            .collect();
+        // Hunk 1: " a", "-b"/"+B", " c", "+d", "+e"; hunk 2: "-x".
+        assert_eq!(pairs, [(Some(0), Some(0)), (Some(1), Some(2)), (Some(3), Some(3)), (None, Some(4)), (None, Some(5)), (Some(0), None)]);
+        assert_eq!(d.rows.len(), 8, "two hunk headers and six rows, one fewer than unified");
+        d.set_split(false);
+        assert_eq!(d.rows.len(), 9);
+    }
+
+    #[test]
+    fn picks_are_the_same_lines_in_either_layout() {
+        let mut d = doc();
+        let mut sel = LineSel::default();
+        // Pick "+B" and, with shift, everything to "+e" while side by side…
+        d.set_split(true);
+        apply_pick(&d, &mut sel, (0, 0, 2), click(false, false));
+        apply_pick(&d, &mut sel, (0, 0, 5), click(true, false));
+        assert_eq!(sel.lines.iter().copied().collect::<Vec<_>>(), [(0, 0, 2), (0, 0, 4), (0, 0, 5)]);
+        // …and the same lines are picked when shown unified again.
+        d.set_split(false);
+        assert_eq!(picked(&sel), [3, 5, 6]);
+        // A removed line's cell picks the removed line, not the added one facing it.
+        apply_pick(&d, &mut sel, (0, 0, 1), click(false, false));
+        assert_eq!(picked(&sel), [2]);
     }
 
     #[test]

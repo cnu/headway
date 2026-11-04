@@ -205,6 +205,8 @@ pub enum FlatRow {
     /// One strip of a changed picture (file, strip): strip 0 holds the titles.
     Image(usize, usize),
     Gap,
+    /// A side-by-side row of a hunk (file, hunk, line shown left, line shown right).
+    Pair(usize, usize, Option<usize>, Option<usize>),
 }
 
 pub struct DiffDoc {
@@ -231,10 +233,12 @@ pub struct DiffDoc {
     pub syntax: Arc<Vec<std::sync::OnceLock<highlight::Sides>>>,
     /// The words that changed in lines facing each other: (file, hunk, line) →
     /// byte ranges, and whether only whitespace changed.
-    pub marks: HashMap<(usize, usize, usize), diffmodel::LineMarks>,
+    pub marks: HashMap<LineKey, diffmodel::LineMarks>,
     /// Whitespace changes are left out, so the hunks don't match the files and
     /// lines and hunks can't be staged from them.
     pub whitespace_ignored: bool,
+    /// Shown side by side (before on the left, after on the right).
+    pub split: bool,
 }
 
 /// Files with more changed lines than this start folded in the uncommitted view.
@@ -264,6 +268,7 @@ impl DiffDoc {
             syntax: Arc::new((0..n).map(|_| Default::default()).collect()),
             marks: HashMap::new(),
             whitespace_ignored: false,
+            split: false,
         };
         for (fi, f) in doc.files.iter().enumerate() {
             for (hi, h) in f.hunks.iter().enumerate() {
@@ -381,8 +386,10 @@ impl DiffDoc {
                 }
                 for (hi, h) in f.hunks.iter().enumerate() {
                     self.rows.push(FlatRow::Hunk(fi, hi));
-                    for li in 0..h.lines.len() {
-                        self.rows.push(FlatRow::Line(fi, hi, li));
+                    if self.split {
+                        self.rows.extend(diffmodel::align(&h.lines).into_iter().map(|a| FlatRow::Pair(fi, hi, a.old, a.new)));
+                    } else {
+                        self.rows.extend((0..h.lines.len()).map(|li| FlatRow::Line(fi, hi, li)));
                     }
                 }
             }
@@ -390,6 +397,19 @@ impl DiffDoc {
                 self.rows.push(FlatRow::Gap);
             }
         }
+    }
+
+    /// Show the changes side by side, or unified.
+    pub fn set_split(&mut self, split: bool) {
+        if self.split != split {
+            self.split = split;
+            self.rebuild();
+        }
+    }
+
+    /// A line of the diff.
+    pub fn line(&self, (fi, hi, li): LineKey) -> Option<&git::DiffLine> {
+        self.files.get(fi)?.hunks.get(hi)?.lines.get(li)
     }
 
     pub fn is_collapsed(&self, fi: usize) -> bool {
@@ -434,11 +454,15 @@ pub struct FileSel {
     pub untracked: bool,
 }
 
-/// Lines picked in the diff of an uncommitted file (row indices into the diff).
+/// One line of a diff: (file, hunk, line within the hunk).
+pub type LineKey = (usize, usize, usize);
+
+/// Lines picked in a diff. Kept by line rather than by row, so a pick means the
+/// same lines whether the diff is shown unified or side by side.
 #[derive(Default)]
 pub struct LineSel {
-    pub rows: std::collections::BTreeSet<usize>,
-    pub anchor: Option<usize>,
+    pub lines: std::collections::BTreeSet<LineKey>,
+    pub anchor: Option<LineKey>,
     pub dragging: bool,
 }
 
@@ -662,8 +686,9 @@ pub enum Action {
     ToggleAmend,
     FetchAll,
     PullAll,
-    /// How diffs are shown changed: show the open ones again.
-    DiffPrefsChanged,
+    /// How diffs are shown changed: show the open ones that way, reading them
+    /// again (`reload`) when what they contain changes.
+    DiffPrefsChanged { reload: bool },
 }
 
 impl Action {
@@ -937,13 +962,14 @@ impl HeadwayApp {
             rv.detail_loading = true;
         }
         let p = path.to_path_buf();
-        let ws = self.cfg.view.diff.ignore_whitespace;
+        let (ws, split) = (self.cfg.view.diff.ignore_whitespace, self.cfg.view.diff.split);
         self.spawn_stream(move |send| {
             // Parsing and flattening a big diff can take a while: do it here, not in the UI.
             let d = git::commit_detail(&p, &hash, ws).map(|mut info| {
                 let files = std::mem::take(&mut info.files);
                 let mut doc = DiffDoc::new(files, true);
                 doc.whitespace_ignored = ws;
+                doc.set_split(split);
                 doc.load_previews(&p, Some(&info.hash));
                 Detail { info, doc }
             });
@@ -963,7 +989,7 @@ impl HeadwayApp {
         rv.wd_gen += 1;
         let generation = rv.wd_gen;
         let p = path.to_path_buf();
-        let ws = self.cfg.view.diff.ignore_whitespace;
+        let (ws, split) = (self.cfg.view.diff.ignore_whitespace, self.cfg.view.diff.split);
         self.spawn_stream(move |send| {
             let doc = git::worktree_diffs(&p, &st, ws).map(|(unstaged, staged)| {
                 let with_sub = |files: Vec<DiffFile>, list: &[git::FileChange]| {
@@ -980,6 +1006,7 @@ impl HeadwayApp {
                     ("STAGED".to_string(), views::DiffMode::Staged, with_sub(staged, &st.staged)),
                 ]);
                 doc.whitespace_ignored = ws;
+                doc.set_split(split);
                 doc.load_previews(&p, None);
                 doc
             });
@@ -1130,6 +1157,7 @@ impl HeadwayApp {
             // Line history came with its changes.
             let mut doc = DiffDoc::new(diff.into_iter().collect(), true);
             doc.commit = Some(c.hash.clone());
+            doc.set_split(self.cfg.view.diff.split);
             h.diff = Some(Ok(doc));
             return;
         }
@@ -1139,11 +1167,12 @@ impl HeadwayApp {
             _ => std::iter::once(c.path.clone()).chain(c.old_path.clone()).collect(),
         };
         let p = path.to_path_buf();
-        let ws = self.cfg.view.diff.ignore_whitespace;
+        let (ws, split) = (self.cfg.view.diff.ignore_whitespace, self.cfg.view.diff.split);
         self.spawn_stream(move |send| {
             let doc = git::commit_files(&p, &c.hash, &paths, ws).map(|files| {
                 let mut doc = DiffDoc::new(files, true);
                 doc.whitespace_ignored = ws;
+                doc.set_split(split);
                 doc.load_previews(&p, Some(&c.hash));
                 doc
             });
@@ -1701,8 +1730,18 @@ impl HeadwayApp {
                 None => self.refresh_overview(),
             },
             Action::RefreshOverview => self.refresh_overview(),
-            Action::DiffPrefsChanged => {
+            Action::DiffPrefsChanged { reload } => {
                 self.save();
+                let split = self.cfg.view.diff.split;
+                for rv in self.tabs.values_mut() {
+                    let history = rv.file_view.as_mut().and_then(|f| f.history.as_mut()).and_then(|h| h.diff.as_mut()).and_then(|d| d.as_mut().ok());
+                    for doc in [rv.detail.as_mut().map(|d| &mut d.doc), rv.wd_doc.as_mut(), history].into_iter().flatten() {
+                        doc.set_split(split);
+                    }
+                }
+                if !reload {
+                    return;
+                }
                 let Some(p) = active else { return };
                 let Some(rv) = self.tabs.get(&p) else { return };
                 let commit = match &rv.selection {

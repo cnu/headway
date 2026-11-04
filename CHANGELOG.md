@@ -21,6 +21,11 @@ workflow uses that version's section as the GitHub release notes.
   (above the diff, remembered) leaves such changes out with `-w`; files with
   nothing else changed say so, and lines and hunks can't be staged until it's
   off again.
+- **Side by side**: show a diff as before and after in two columns (remembered
+  with the other diff options). Edited lines face their new version, added and
+  removed lines face a gap, and both columns scroll together. Pick, stage,
+  unstage and discard lines and hunks just as in the unified view; picks stay
+  put when switching between the two.
 - **Blame and file history**: right-click a file in a commit's details, the
   changes list or a diff, or find any file or folder with Ctrl/Cmd+P. Blame
   shows who last changed each line, grouped by commit, with an age colour

@@ -2025,3 +2025,62 @@ fn ignore_whitespace_hides_reindented_files_and_stops_line_staging() {
     assert!(!shows(&h, git::WHITESPACE_ONLY));
     assert_eq!(h.get_all_by_label("Stage hunk").count(), 1, "a.rs's block can be staged again");
 }
+
+#[test]
+fn side_by_side_diffs_stage_lines_and_hunks() {
+    let s = scratch("split");
+    let r = new_repo(&s.root, "shop");
+    let base: String = (1..=30).map(|i| format!("line {i}\n")).collect();
+    commit(&r, "a.txt", &base, "Start");
+    // Two blocks: line 2 reworded plus a line added, and line 28 reworded.
+    write(&r, "a.txt", &base.replace("line 2\n", "line two\nline extra\n").replace("line 28\n", "line twenty-eight\n"));
+    let mut h = app(&s, &[&r], true);
+
+    // Switch the layout; the choice is remembered.
+    click(&mut h, "Unified");
+    click(&mut h, "Side by side");
+    assert!(h.state().cfg.view.diff.split);
+    assert!(std::fs::read_to_string(s.root.join("settings.json")).unwrap().contains("\"split\": true"));
+    let removed = h.get_all_by_label("line line 2").next().unwrap().rect();
+    let added = h.get_all_by_label("line line two").next().unwrap().rect();
+    assert!(removed.right() <= added.left() + 1.0, "before on the left, after on the right");
+    assert!((removed.center().y - added.center().y).abs() < 1.0, "a reworded line faces its new version");
+
+    // Stage just the added line from the right-hand side.
+    click(&mut h, "line line extra");
+    assert!(shows(&h, "1 line picked"));
+    click(&mut h, "Stage lines");
+    let cached = git_ok(&r, &["diff", "--cached"]);
+    assert!(cached.contains("+line extra\n") && !cached.contains("line two") && !cached.contains("-line 2\n"), "{cached}");
+
+    // Then the reworded line: its old version on the left and new one on the right.
+    click(&mut h, "line line 2");
+    h.get_all_by_label("line line two").next().unwrap().click_modifiers(egui::Modifiers::COMMAND);
+    settle(&mut h);
+    assert!(shows(&h, "2 lines picked"));
+    click(&mut h, "Stage lines");
+    let cached = git_ok(&r, &["diff", "--cached"]);
+    assert!(cached.contains("-line 2\n+line two\n+line extra\n"), "{cached}");
+
+    // Blocks work too: the one left in the unstaged changes.
+    click(&mut h, "Stage hunk");
+    assert!(git_ok(&r, &["diff"]).is_empty(), "everything is staged");
+    click(&mut h, "Unstage hunk");
+    let unstaged = git_ok(&r, &["diff"]);
+    assert!(unstaged.contains("-line 2\n+line two\n+line extra\n") && !unstaged.contains("twenty-eight"), "{unstaged}");
+
+    // Discarding from a side works the same way.
+    click(&mut h, "line line extra");
+    click(&mut h, "Discard lines");
+    click_last(&mut h, "Discard");
+    let text = std::fs::read_to_string(r.join("a.txt")).unwrap();
+    assert!(!text.contains("line extra") && text.contains("line two\n"), "only the picked line is thrown away");
+
+    // Back to one above the other.
+    click(&mut h, "Side by side");
+    click(&mut h, "Unified");
+    assert!(!h.state().cfg.view.diff.split);
+    let removed = h.get_all_by_label("line line 2").next().unwrap().rect();
+    let added = h.get_all_by_label("line line two").next().unwrap().rect();
+    assert!(added.top() > removed.top() && (added.left() - removed.left()).abs() < 1.0, "unified again: the new line is below the old one");
+}

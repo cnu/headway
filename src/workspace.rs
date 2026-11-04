@@ -57,6 +57,8 @@ pub struct ViewPrefs {
 pub struct DiffPrefs {
     /// Changes to spaces and indentation are left out (`-w`).
     pub ignore_whitespace: bool,
+    /// Before and after side by side, instead of one above the other.
+    pub split: bool,
 }
 
 impl Default for ViewPrefs {
