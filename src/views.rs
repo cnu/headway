@@ -27,6 +27,7 @@ pub fn repo(
         .exact_size(46.0)
         .frame(egui::Frame::new().fill(PANEL).inner_margin(Margin::symmetric(14, 0)).stroke(Stroke::new(1.0, BORDER)))
         .show(ui, |ui| toolbar(ui, rv, busy, &mut view.sidebar_open, actions));
+    crate::resolver::banner(ui, rv, actions);
 
     egui::Panel::left("sidebar")
         .default_size(210.0)
@@ -53,6 +54,12 @@ pub fn repo(
                 }
             });
         });
+        return;
+    }
+
+    // A conflicted file being resolved takes the whole width.
+    if rv.resolver.as_ref().is_some_and(|r| r.shown) {
+        egui::CentralPanel::default().frame(egui::Frame::new().fill(BG)).show(ui, |ui| crate::resolver::show(ui, rv, actions));
         return;
     }
 
@@ -1404,7 +1411,7 @@ fn change_color(c: &Change) -> Color32 {
     match c {
         Change::Modified | Change::TypeChange => WARN,
         Change::Added | Change::Untracked => ACCENT,
-        Change::Deleted | Change::Conflict => DANGER,
+        Change::Deleted | Change::Conflict(_) => DANGER,
         Change::Renamed | Change::Copied => BLUE,
     }
 }
@@ -1539,10 +1546,9 @@ fn staging_panel(ui: &mut Ui, rv: &mut RepoView, actions: &mut Vec<Action>) {
                         let f = &files[i];
                         match kind {
                             ListKind::Conflicts => {
-                                let sel = FileSel { path: f.path.clone(), staged: false, untracked: false };
-                                let (resp, b) = file_row_buttons(ui, f, rv.file_sel.as_ref() == Some(&sel), &["Mark resolved"]);
+                                let (resp, b) = file_row_buttons(ui, f, false, &["Mark resolved"]);
                                 if resp.clicked() {
-                                    actions.push(Action::SelectFile(sel));
+                                    actions.push(Action::OpenConflict(f.path.clone()));
                                 }
                                 if b == Some(0) {
                                     actions.push(Action::args(&path, format!("Mark {} resolved", f.path), &["add", "--", &f.path]));
@@ -1782,7 +1788,7 @@ const DIFF_ROW: f32 = 19.0;
 /// data files) every frame would freeze the window.
 pub const MAX_LINE_CHARS: usize = 1000;
 
-fn display_line(text: &str) -> String {
+pub fn display_line(text: &str) -> String {
     let mut out: String = text.chars().take(MAX_LINE_CHARS).collect::<String>().replace('\t', "    ");
     if text.len() > out.len() && text.chars().nth(MAX_LINE_CHARS).is_some() {
         out.push_str("  … (line shortened)");

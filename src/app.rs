@@ -5,6 +5,7 @@ use crate::git::{self, Branch, Change, Commit, CommitDetail, DiffFile, GitResult
 use crate::graph::{self, Graph};
 use crate::theme::{self, *};
 use crate::workspace::{Config, Workspace};
+use crate::resolver::Resolver;
 use crate::{overview, views};
 use egui::{Align, Color32, CornerRadius, Id, Layout, Margin, RichText, Sense, Stroke, Ui};
 use std::collections::HashMap;
@@ -39,6 +40,8 @@ pub struct RepoData {
     /// Branches hidden from the history (full ref names).
     pub hidden: Vec<String>,
     pub limit: usize,
+    /// A merge, rebase, cherry-pick or revert waiting to be continued or aborted.
+    pub operation: Option<git::Operation>,
 }
 
 fn load_repo(path: &Path, limit: usize, hidden: Vec<String>) -> Result<RepoData, String> {
@@ -58,6 +61,7 @@ fn load_repo(path: &Path, limit: usize, hidden: Vec<String>) -> Result<RepoData,
         let wt = s.spawn(|| git::worktrees(path));
         let ru = s.spawn(|| git::remote_urls(path));
         let sm = s.spawn(|| git::submodules(path));
+        let op = s.spawn(|| git::operation(path));
         let status = st.join().map_err(crashed)??;
         let commits = lg.join().map_err(crashed)??;
         let (branches, tags) = br.join().map_err(crashed)??;
@@ -66,6 +70,7 @@ fn load_repo(path: &Path, limit: usize, hidden: Vec<String>) -> Result<RepoData,
         let worktrees = wt.join().map_err(crashed)?.unwrap_or_default();
         let remote_urls = ru.join().map_err(crashed)?.unwrap_or_default();
         let submodules = sm.join().map_err(crashed)?.unwrap_or_default();
+        let operation = op.join().map_err(crashed)?.unwrap_or_default();
         let graph = graph::layout(&commits);
         // Commits your branches or tags reach can have their messages edited.
         let local_tips: Vec<&str> = commits
@@ -78,7 +83,7 @@ fn load_repo(path: &Path, limit: usize, hidden: Vec<String>) -> Result<RepoData,
         let remote_tips: Vec<&str> =
             commits.iter().filter(|c| c.refs.iter().any(|r| r.kind == git::RefKind::Remote)).map(|c| c.hash.as_str()).collect();
         let pushed = reachable(&commits, remote_tips.into_iter());
-        Ok(RepoData { status, commits, graph, branches, tags, stashes, remotes, worktrees, remote_urls, submodules, on_branch, pushed, hidden: hidden.clone(), limit })
+        Ok(RepoData { status, commits, graph, branches, tags, stashes, remotes, worktrees, remote_urls, submodules, on_branch, pushed, hidden: hidden.clone(), limit, operation })
     })
 }
 
@@ -386,6 +391,9 @@ pub struct RepoView {
     pub list_scroll_to: Option<usize>,
     /// History list scroll position and visible height, as of the last frame.
     pub list_view: (f32, f32),
+    /// The conflict resolver, when open (it replaces history and details).
+    pub resolver: Option<Resolver>,
+    conflict_gen: u64,
 }
 
 impl RepoView {
@@ -413,6 +421,8 @@ impl RepoView {
             reset_detail_scroll: false,
             list_scroll_to: None,
             list_view: (0.0, 0.0),
+            resolver: None,
+            conflict_gen: 0,
         }
     }
 
@@ -455,6 +465,8 @@ enum Msg {
     Summary(PathBuf, Result<Summary, String>),
     Detail(PathBuf, String, Result<Detail, String>),
     WorkDiff(PathBuf, u64, Result<DiffDoc, String>),
+    /// Conflicted files read for the resolver.
+    Conflicts(PathBuf, u64, Vec<(String, Result<git::ConflictFile, String>)>),
     SamplesReady,
     /// A folder was chosen to add; carries the repositories found in it.
     Picked(PathBuf, Vec<PathBuf>),
@@ -490,6 +502,9 @@ pub enum Action {
     SelectRef(String),
     SelectWorkingDir,
     SelectFile(FileSel),
+    /// Open a conflicted file (by path) in the resolver.
+    OpenConflict(String),
+    CloseResolver,
     Git { repo: PathBuf, label: String, op: GitFn, kind: OpKind },
     /// A git action with something to do in the app once it succeeds.
     GitThen { repo: PathBuf, label: String, op: GitFn, then: FollowUp },
@@ -774,6 +789,24 @@ impl HeadwayApp {
         });
     }
 
+    /// Read conflicted files for the resolver in the background.
+    fn load_conflicts(&mut self, path: &Path, files: Vec<(String, git::ConflictKind)>) {
+        let Some(rv) = self.tabs.get_mut(path) else { return };
+        if files.is_empty() {
+            return;
+        }
+        rv.conflict_gen += 1;
+        let generation = rv.conflict_gen;
+        let p = path.to_path_buf();
+        self.spawn(move || {
+            let read = files.into_iter().map(|(f, kind)| {
+                let r = git::conflict_file(&p, &f, kind);
+                (f, r)
+            });
+            Msg::Conflicts(p.clone(), generation, read.collect())
+        });
+    }
+
     fn toast(&mut self, text: impl Into<String>, error: bool) {
         let now = self.ctx.input(|i| i.time);
         self.toasts.push(Toast { text: text.into(), error, until: now + if error { 8.0 } else { 3.5 } });
@@ -866,6 +899,13 @@ impl HeadwayApp {
                             }
                             rv.line_sel = LineSel::default();
                         }
+                    }
+                }
+                Msg::Conflicts(path, generation, files) => {
+                    if let Some(rv) = self.tabs.get_mut(&path)
+                        && let Some(res) = rv.resolver.as_mut().filter(|_| rv.conflict_gen == generation)
+                    {
+                        res.loaded(files);
                     }
                 }
                 Msg::SamplesReady => {
@@ -965,6 +1005,7 @@ impl HeadwayApp {
     fn on_repo_loaded(&mut self, path: PathBuf, res: Result<RepoData, String>) {
         let mut want_detail = None;
         let mut want_wd = false;
+        let mut want_conflicts = Vec::new();
         {
             let Some(rv) = self.tabs.get_mut(&path) else { return };
             rv.loading = false;
@@ -1020,6 +1061,15 @@ impl HeadwayApp {
                         }
                         None => {}
                     }
+                    // Resolved files leave the resolver (keeping unsaved choices in the
+                    // rest); it closes once nothing is conflicted.
+                    if let Some(res) = &mut rv.resolver {
+                        if data.status.conflicts.is_empty() {
+                            rv.resolver = None;
+                        } else {
+                            want_conflicts = res.sync(&data.status.conflicts);
+                        }
+                    }
                     rv.data = Some(data);
                     rv.filter_key = None;
                 }
@@ -1030,6 +1080,9 @@ impl HeadwayApp {
         }
         if want_wd {
             self.load_work_diff(&path);
+        }
+        if !want_conflicts.is_empty() {
+            self.load_conflicts(&path, want_conflicts);
         }
     }
 
@@ -1184,6 +1237,29 @@ impl HeadwayApp {
                         }
                     }
                     rv.file_sel = Some(sel);
+                }
+            }
+            Action::OpenConflict(file) => {
+                let Some(p) = active else { return };
+                let Some(rv) = self.tabs.get_mut(&p) else { return };
+                let Some(conflicts) = rv.data.as_ref().map(|d| d.status.conflicts.clone()) else { return };
+                // Coming back keeps the choices made earlier.
+                if let Some(res) = &mut rv.resolver {
+                    res.shown = true;
+                    if let Some(i) = res.files.iter().position(|f| f.path == file) {
+                        res.select(i);
+                    }
+                    return;
+                }
+                let mut res = Resolver::new(&conflicts, &file);
+                let load = res.sync(&conflicts);
+                rv.resolver = Some(res);
+                self.load_conflicts(&p, load);
+            }
+            Action::CloseResolver => {
+                let Some(p) = active else { return };
+                if let Some(res) = self.tabs.get_mut(&p).and_then(|rv| rv.resolver.as_mut()) {
+                    res.shown = false;
                 }
             }
             Action::Git { repo, label, op, kind } => {

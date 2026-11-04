@@ -67,6 +67,11 @@ fn subjects(dir: &Path, rev: &str) -> Vec<String> {
 
 /// The app with a workspace of `repos`; `open` opens the first one as a tab.
 fn app(s: &Scratch, repos: &[&Path], open: bool) -> Harness<'static, HeadwayApp> {
+    app_sized(s, repos, open, egui::vec2(1600.0, 1000.0))
+}
+
+/// Like [`app`], in a window of this size.
+fn app_sized(s: &Scratch, repos: &[&Path], open: bool, size: egui::Vec2) -> Harness<'static, HeadwayApp> {
     let mut ws = Workspace::new("Office");
     ws.repos = repos.iter().map(|p| p.to_path_buf()).collect();
     if open {
@@ -75,7 +80,7 @@ fn app(s: &Scratch, repos: &[&Path], open: bool) -> Harness<'static, HeadwayApp>
     }
     let cfg = Config::for_test(vec![ws], s.root.join("settings.json"));
     let mut h = Harness::builder()
-        .with_size(egui::vec2(1600.0, 1000.0))
+        .with_size(size)
         // Frames at a normal 60 per second (double-clicks need two clicks within 0.3 s).
         .with_step_dt(1.0 / 60.0)
         // Same fallback fonts as the real window, for symbols the built-in font lacks.
@@ -1348,4 +1353,300 @@ fn folder_picker_answers_odd_requests_and_more_badges() {
     click_last(&mut h, "Remove");
     assert!(!shows(&h, "Close shop-side"));
     assert!(!wt.exists());
+}
+
+// ---------------------------------------------------------------------------
+// Merge conflicts
+
+/// `main` and `feature` change lines 2, 10 and 18 of a 20-line a.txt and the one
+/// line of b.txt differently, and the merge has stopped on all four conflicts.
+fn conflicted_merge(s: &Scratch) -> (PathBuf, Vec<String>) {
+    let r = new_repo(&s.root, "shop");
+    let base: Vec<String> = (1..=20).map(|i| format!("line {i}\n")).collect();
+    write(&r, "b.txt", "colour\n");
+    commit(&r, "a.txt", &base.concat(), "Base");
+    let side = |who: &str| {
+        let mut v = base.clone();
+        for i in [1, 9, 17] {
+            v[i] = format!("{who} {}\n", i + 1);
+        }
+        v.concat()
+    };
+    git_ok(&r, &["checkout", "-q", "-b", "feature"]);
+    write(&r, "b.txt", "color\n");
+    commit(&r, "a.txt", &side("feature"), "Feature edits");
+    git_ok(&r, &["checkout", "-q", "main"]);
+    write(&r, "b.txt", "colours\n");
+    commit(&r, "a.txt", &side("main"), "Main edits");
+    assert!(git::run(&r, &["merge", "feature"]).is_err(), "conflict");
+    (r, base)
+}
+
+fn disabled(h: &Harness<'static, HeadwayApp>, label: &str) -> bool {
+    h.get_by_label(label).accesskit_node().is_disabled()
+}
+
+/// Click a clickable control with this name (not plain text that says the same).
+fn click_control(h: &mut Harness<'static, HeadwayApp>, label: &str) {
+    h.get_all_by_label(label)
+        .find(|n| n.accesskit_node().role() != egui::Role::Label)
+        .unwrap_or_else(|| panic!("no control “{label}”"))
+        .click();
+    settle(h);
+}
+
+fn alt(h: &mut Harness<'static, HeadwayApp>, k: egui::Key) {
+    h.key_press_modifiers(egui::Modifiers::ALT, k);
+    settle(h);
+}
+
+#[test]
+fn walk_through_every_conflict_and_continue_the_merge() {
+    let s = scratch("resolve");
+    let (r, base) = conflicted_merge(&s);
+    let mut h = app(&s, &[&r], true);
+
+    // The banner says what's going on; Continue waits for the conflicts.
+    assert!(shows(&h, "Merging feature into main · 2 conflicted files"));
+    assert!(disabled(&h, "Continue"));
+
+    // Clicking a conflicted file opens every conflict in the repository, in place of the history.
+    click(&mut h, "a.txt");
+    assert!(shows(&h, "Conflict 1 of 4"));
+    assert!(shows(&h, "CONFLICTED FILES · 2"));
+    assert!(shows(&h, "main (ours)") && shows(&h, "feature (theirs)"));
+    assert!(!shows(&h, "Resize history and details"), "the history is out of the way");
+    // Line numbers are the file's own: "main 2" sits on line 3, under the marker.
+    assert!(shows(&h, "   3"));
+    // The common ancestor shows on request.
+    assert!(!shows(&h, "line 10"));
+    click(&mut h, "Show base");
+    assert!(shows(&h, "line 10"));
+    click(&mut h, "Show base");
+
+    // A choice moves on to the next conflict.
+    click(&mut h, "Take main");
+    assert!(shows(&h, "✓ took main") && shows(&h, "Conflict 2 of 4"));
+    // Alt+↑/↓ move between conflicts; Alt+→ takes theirs.
+    alt(&mut h, egui::Key::ArrowUp);
+    assert!(shows(&h, "Conflict 1 of 4"));
+    alt(&mut h, egui::Key::ArrowDown);
+    alt(&mut h, egui::Key::ArrowRight);
+    assert!(shows(&h, "✓ took feature") && shows(&h, "Conflict 3 of 4"));
+    // The last region of a.txt done, on into b.txt.
+    click(&mut h, "Both, main first");
+    assert!(shows(&h, "Conflict 4 of 4") && shows(&h, "colours"));
+    click(&mut h, "↑ Prev conflict");
+    assert!(shows(&h, "Conflict 3 of 4"));
+    click_last(&mut h, "Undo");
+    click_last(&mut h, "Edit");
+    click_text_containing(&mut h, "feature 18");
+    ctrl(&mut h, egui::Key::A);
+    type_text(&mut h, "both 18");
+    click(&mut h, "Done");
+    assert!(shows(&h, "Conflict 4 of 4"), "on to b.txt");
+    alt(&mut h, egui::Key::ArrowLeft);
+    assert!(shows(&h, "4 of 4 conflicts have a choice · 2 files ready to save"));
+
+    // The whole result, before anything is written.
+    click_control(&mut h, "a.txt");
+    click(&mut h, "Preview result");
+    assert!(shows(&h, "both 18") && !shows(&h, "<<<<<<< HEAD"));
+    click(&mut h, "Preview result");
+    assert!(std::fs::read_to_string(r.join("a.txt")).unwrap().contains("<<<<<<<"), "nothing written yet");
+
+    click(&mut h, "Save & mark all ready (2)");
+    let mut want = base.clone();
+    want[1] = "main 2\n".into();
+    want[9] = "feature 10\n".into();
+    want[17] = "both 18\n".into();
+    assert_eq!(std::fs::read_to_string(r.join("a.txt")).unwrap(), want.concat());
+    assert_eq!(std::fs::read_to_string(r.join("b.txt")).unwrap(), "colours\n");
+    // b.txt is main's version again, so only a.txt differs from HEAD; neither is conflicted.
+    assert_eq!(staged_files(&r), ["a.txt"]);
+    assert!(git::status(&r).unwrap().conflicts.is_empty());
+    // Nothing is left, so the resolver closes and Continue is ready.
+    assert!(!shows(&h, "← Back to changes"));
+    assert!(shows(&h, "Merging feature into main · all conflicts resolved"));
+    assert!(!disabled(&h, "Continue"));
+    click(&mut h, "Continue");
+    assert!(!shows_containing(&h, "Merging feature"));
+    assert_eq!(head_subject(&r), "Merge branch 'feature'");
+    assert_eq!(git_ok(&r, &["rev-list", "--parents", "-1", "HEAD"]).split(' ').count(), 3);
+}
+
+#[test]
+fn deleted_and_binary_conflicts_abort_and_skip() {
+    let s = scratch("resolve-kinds");
+    let r = new_repo(&s.root, "shop");
+    commit(&r, "gone.txt", "1\n", "Base");
+    commit(&r, "pic.bin", "\0base", "Picture");
+    git_ok(&r, &["checkout", "-q", "-b", "other"]);
+    git_ok(&r, &["rm", "-q", "gone.txt"]);
+    commit(&r, "pic.bin", "\0theirs", "Other side");
+    git_ok(&r, &["checkout", "-q", "main"]);
+    write(&r, "gone.txt", "changed\n");
+    commit(&r, "pic.bin", "\0ours", "Main side");
+    assert!(git::run(&r, &["merge", "other"]).is_err());
+    let mut h = app(&s, &[&r], true);
+    assert!(shows(&h, "Merging other into main · 2 conflicted files"));
+
+    // Delete/modify: what each side did, then keep the file or delete it.
+    click(&mut h, "gone.txt");
+    assert!(shows(&h, "other deleted the file") && shows(&h, "main's changes since the common ancestor"));
+    assert!(shows(&h, "+ changed") && shows(&h, "− 1"));
+    click(&mut h, "Keep the file (main's version)");
+    // On to the next file: a binary one gets whole-file choices only.
+    assert!(shows(&h, "Binary file · changed on both sides"));
+    assert!(!shows(&h, "Take main"));
+    click(&mut h, "Use other's version");
+    assert!(shows(&h, "✓ Use other's version"));
+    assert_eq!(std::fs::read_to_string(r.join("gone.txt")).unwrap(), "changed\n");
+    click(&mut h, "Save & mark all ready (2)");
+    assert_eq!(std::fs::read(r.join("pic.bin")).unwrap(), b"\0theirs");
+    assert!(shows(&h, "Merging other into main · all conflicts resolved"));
+    assert!(!shows(&h, "← Back to changes"), "the resolver closed");
+
+    // Abort asks first, in the app, and says what's lost.
+    click(&mut h, "Abort");
+    assert!(shows_containing(&h, "Stop merging other into main?"));
+    // Keeping gone.txt as it was changed nothing; the picture's resolution would be lost.
+    assert!(shows_containing(&h, "your resolution of 1 file"));
+    click_last(&mut h, "Abort merge");
+    assert!(!shows_containing(&h, "Merging other"));
+    assert_eq!(std::fs::read(r.join("pic.bin")).unwrap(), b"\0ours");
+
+    // A rebase can skip the commit that stopped.
+    git_ok(&r, &["checkout", "-q", "other"]);
+    assert!(git::run(&r, &["rebase", "main"]).is_err());
+    ctrl(&mut h, egui::Key::R);
+    assert!(shows(&h, "Rebasing other onto main · commit 1 of 1 · 2 conflicted files"));
+    click(&mut h, "Resolve conflicts");
+    assert!(shows(&h, "Conflict 1 of 2"));
+    assert!(disabled(&h, "Open in merge tool"), "no merge.tool is set");
+    click(&mut h, "Skip");
+    click_last(&mut h, "Skip commit");
+    assert!(!shows_containing(&h, "Rebasing"));
+    assert!(!shows(&h, "← Back to changes"));
+    assert_eq!(git_ok(&r, &["rev-parse", "other"]), git_ok(&r, &["rev-parse", "main"]));
+}
+
+#[test]
+fn one_file_at_a_time_in_a_narrow_window() {
+    let s = scratch("resolve-narrow");
+    let r = new_repo(&s.root, "shop");
+    let base: Vec<String> = (1..=30).map(|i| format!("line {i}\n")).collect();
+    let side = |who: &str| {
+        let mut v = base.clone();
+        v[1] = format!("{who} 2\n");
+        v[24] = format!("{who} 25\n");
+        v.concat()
+    };
+    write(&r, "src/b.txt", "keep\nold\n");
+    write(&r, "d.txt", "one\ntwo\n");
+    commit(&r, "a.txt", &base.concat(), "Base");
+    git_ok(&r, &["checkout", "-q", "-b", "feature"]);
+    write(&r, "src/b.txt", "keep\nnew\n");
+    write(&r, "c.txt", "theirs\n");
+    write(&r, "d.txt", "one\nTWO\n");
+    commit(&r, "a.txt", &side("feature"), "Feature edits");
+    git_ok(&r, &["checkout", "-q", "main"]);
+    // main drops the line feature changed, adds its own c.txt and deletes d.txt.
+    write(&r, "src/b.txt", "keep\n");
+    write(&r, "c.txt", "ours\n");
+    git_ok(&r, &["rm", "-q", "d.txt"]);
+    commit(&r, "a.txt", &side("main"), "Main edits");
+    assert!(git::run(&r, &["merge", "feature"]).is_err());
+    let mut h = app_sized(&s, &[&r], true, egui::vec2(1000.0, 900.0));
+
+    click(&mut h, "a.txt");
+    assert!(shows(&h, "Conflict 1 of 5"));
+    // A long unchanged stretch folds to its ends; a click shows it.
+    assert!(!shows(&h, "line 12"));
+    h.get_all_by_label_contains("unchanged lines").next().unwrap().click();
+    settle(&mut h);
+    assert!(shows(&h, "line 12"));
+
+    // Choices survive a refresh.
+    click(&mut h, "Take main");
+    ctrl(&mut h, egui::Key::R);
+    assert!(shows(&h, "✓ took main"));
+    // A chosen region can be edited (or not) and undone.
+    click(&mut h, "↑ Prev conflict");
+    click(&mut h, "Edit");
+    click(&mut h, "Cancel");
+    click(&mut h, "Undo");
+    // Marking resolved with conflicts left asks first.
+    click(&mut h, "Save & mark resolved");
+    assert!(shows_containing(&h, "2 conflicts in a.txt still have conflict markers"));
+    click_last(&mut h, "Cancel");
+    // Save writes the choices so far and leaves the file conflicted.
+    click(&mut h, "Take main");
+    click(&mut h, "Save");
+    let text = std::fs::read_to_string(r.join("a.txt")).unwrap();
+    assert!(text.contains("main 2\n") && text.contains("<<<<<<<"), "{text}");
+    assert!(shows(&h, "1 of 1 left") && shows(&h, "Conflict 1 of 4"));
+    // A whole side, straight from git; then it has no markers left to choose.
+    click(&mut h, "Take all from feature");
+    assert_eq!(std::fs::read_to_string(r.join("a.txt")).unwrap(), side("feature"));
+    assert!(shows(&h, "no conflict markers left"));
+    click(&mut h, "Save & mark resolved");
+    // On to the next file: added on both sides, and deleting it can be undone.
+    assert!(shows(&h, "added on both main and feature · 1 of 1 left"));
+    click_control(&mut h, "Delete the file");
+    assert!(shows(&h, "This file will be deleted."));
+    click(&mut h, "Undo");
+    click_control(&mut h, "Delete the file");
+    // Deleted on main, changed on feature: what feature changed, stacked in a narrow window.
+    click(&mut h, "↓ Next conflict");
+    assert!(shows(&h, "main deleted the file") && shows(&h, "feature's changes since the common ancestor"));
+    assert!(shows(&h, "+ TWO"));
+    click(&mut h, "Keep the file (feature's version)");
+    // src/b.txt: main's side of the region is empty.
+    assert!(shows(&h, "(nothing)") && shows(&h, "src"));
+
+    // Back to the history keeps every choice for later.
+    click(&mut h, "← Back to changes");
+    assert!(shows(&h, "Resize history and details"));
+    click(&mut h, "Resolve conflicts");
+    click_control(&mut h, "d.txt");
+    assert!(shows(&h, "✓ Keep the file (feature's version)"));
+
+    // The external merge tool, once merge.tool is set.
+    git_ok(&r, &["config", "merge.tool", "takeTheirs"]);
+    git_ok(&r, &["config", "mergetool.takeTheirs.cmd", "cp \"$REMOTE\" \"$MERGED\""]);
+    git_ok(&r, &["config", "mergetool.takeTheirs.trustExitCode", "true"]);
+    git_ok(&r, &["config", "mergetool.keepBackup", "false"]);
+    ctrl(&mut h, egui::Key::R);
+    click_control(&mut h, "b.txt");
+    click(&mut h, "Open in merge tool");
+    assert_eq!(std::fs::read_to_string(r.join("src/b.txt")).unwrap(), "keep\nnew\n");
+
+    // The two remaining choices are saved together.
+    assert!(shows(&h, "2 of 2 conflicts have a choice · 2 files ready to save"));
+    click(&mut h, "Save & mark all ready (2)");
+    assert!(git::status(&r).unwrap().conflicts.is_empty());
+    assert!(!r.join("c.txt").exists());
+    assert_eq!(std::fs::read_to_string(r.join("d.txt")).unwrap(), "one\nTWO\n");
+    assert!(shows(&h, "Merging feature into main · all conflicts resolved"));
+}
+
+#[test]
+fn a_conflicting_stash_pop_uses_the_names_git_gave_each_side() {
+    let s = scratch("resolve-stash");
+    let r = new_repo(&s.root, "shop");
+    commit(&r, "a.txt", "start\n", "Start");
+    write(&r, "a.txt", "stashed\n");
+    git_ok(&r, &["stash", "-q"]);
+    commit(&r, "a.txt", "committed\n", "Change");
+    assert!(git::run(&r, &["stash", "pop"]).is_err());
+    let mut h = app(&s, &[&r], true);
+    // No merge, rebase, cherry-pick or revert: no banner, but the file can still be resolved.
+    assert!(!shows(&h, "Continue"));
+    click(&mut h, "a.txt");
+    assert!(shows(&h, "Updated upstream (ours)") && shows(&h, "Stashed changes (theirs)"));
+    click(&mut h, "Take Stashed changes");
+    click(&mut h, "Save & mark all ready (1)");
+    assert_eq!(std::fs::read_to_string(r.join("a.txt")).unwrap(), "stashed\n");
+    assert!(!shows(&h, "← Back to changes"));
 }

@@ -9,6 +9,22 @@ workflow uses that version's section as the GitHub release notes.
 
 ## [Unreleased]
 
+### Added
+
+- **Merge conflicts**: a banner shows the merge, rebase, cherry-pick or revert
+  in progress (with Continue, Abort and, for sequences, Skip; Abort asks first
+  and says what will be lost). The resolver walks through every conflict in
+  the repository one at a time (Prev/Next, Alt+↑/↓), with each file's progress
+  in a list: take one side (Alt+←/→), both in either order, or edit the result,
+  labelled with the real branch or commit names. Line numbers, the common
+  ancestor on request, ours and theirs side by side on wide windows, and a
+  preview of the whole result. Choices are kept until you save; save one file
+  or every ready file at once. Delete/modify conflicts show what the changing
+  side did before you keep or delete the file; binary files get whole-file
+  choices. Take a whole side, or open your `merge.tool`. diff3 and zdiff3
+  markers work.
+  Development builds add a **price-rules** sample stopped in a conflicted merge.
+
 ## [0.1.0] - 2026-11-04
 
 First release.

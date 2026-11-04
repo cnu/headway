@@ -148,7 +148,7 @@ pub enum Change {
     Copied,
     TypeChange,
     Untracked,
-    Conflict,
+    Conflict(ConflictKind),
 }
 
 impl Change {
@@ -161,7 +161,7 @@ impl Change {
             Change::Copied => "C",
             Change::TypeChange => "T",
             Change::Untracked => "?",
-            Change::Conflict => "!",
+            Change::Conflict(_) => "!",
         }
     }
 
@@ -175,6 +175,44 @@ impl Change {
             'T' => Change::TypeChange,
             _ => return None,
         })
+    }
+}
+
+/// How the two sides of a merge disagree about a file (the status code git reports).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ConflictKind {
+    /// UU: both sides changed it.
+    BothModified,
+    /// AA: both sides added a file with this name.
+    BothAdded,
+    /// DU: our side deleted it, their side changed it.
+    DeletedByUs,
+    /// UD: their side deleted it, our side changed it.
+    DeletedByThem,
+    /// AU: only our side has it (usually a rename on one side).
+    AddedByUs,
+    /// UA: only their side has it.
+    AddedByThem,
+    /// DD: both sides deleted (or renamed) it.
+    BothDeleted,
+}
+
+impl ConflictKind {
+    fn from_code(xy: &str) -> ConflictKind {
+        match xy {
+            "AA" => ConflictKind::BothAdded,
+            "DU" => ConflictKind::DeletedByUs,
+            "UD" => ConflictKind::DeletedByThem,
+            "AU" => ConflictKind::AddedByUs,
+            "UA" => ConflictKind::AddedByThem,
+            "DD" => ConflictKind::BothDeleted,
+            _ => ConflictKind::BothModified,
+        }
+    }
+
+    /// Both sides have the file, so its contents can be merged region by region.
+    pub fn has_regions(self) -> bool {
+        matches!(self, ConflictKind::BothModified | ConflictKind::BothAdded)
     }
 }
 
@@ -292,8 +330,9 @@ pub fn status(repo: &Path) -> GitResult<Status> {
             }
             b'u' => {
                 let fields: Vec<&str> = entry.splitn(11, ' ').collect();
-                if let Some(p) = fields.last() {
-                    st.conflicts.push(FileChange { path: p.to_string(), old_path: None, change: Change::Conflict, submodule: false });
+                if let (Some(xy), Some(p)) = (fields.get(1), fields.last()) {
+                    let change = Change::Conflict(ConflictKind::from_code(xy));
+                    st.conflicts.push(FileChange { path: p.to_string(), old_path: None, change, submodule: false });
                 }
             }
             b'?' => {
@@ -743,7 +782,7 @@ pub enum LineKind {
     NoNewline,
 }
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, PartialEq)]
 pub struct DiffLine {
     pub kind: LineKind,
     pub old_no: Option<u32>,
@@ -1387,6 +1426,589 @@ pub fn scan_for_repos(dir: &Path) -> Vec<PathBuf> {
         }
     }
     found
+}
+
+// ---------------------------------------------------------------------------
+// Merges, rebases, cherry-picks and reverts in progress, and their conflicts
+
+/// Which git command stopped part-way.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum OpType {
+    Merge,
+    Rebase,
+    CherryPick,
+    Revert,
+}
+
+impl OpType {
+    /// The git command, for `git <cmd> --continue` and friends.
+    pub fn command(self) -> &'static str {
+        match self {
+            OpType::Merge => "merge",
+            OpType::Rebase => "rebase",
+            OpType::CherryPick => "cherry-pick",
+            OpType::Revert => "revert",
+        }
+    }
+}
+
+/// A merge, rebase, cherry-pick or revert waiting to be continued or aborted.
+#[derive(Clone, Debug, PartialEq)]
+pub struct Operation {
+    pub kind: OpType,
+    /// The branch being changed (None when HEAD is detached).
+    pub branch: Option<String>,
+    /// Name for the "ours" side of each conflict: a branch name, or a short commit id.
+    pub ours: String,
+    /// Name for the "theirs" side.
+    pub theirs: String,
+    /// The commit being applied (rebase, cherry-pick, revert): "a3e4377 “Subject”".
+    pub commit: Option<String>,
+    /// Rebase: which commit of how many is being replayed.
+    pub step: Option<(usize, usize)>,
+    /// Cherry-pick and revert sequences: commits still waiting after this one.
+    pub remaining: usize,
+    /// Where HEAD was before it started (short id), for the Abort warning.
+    pub before: Option<String>,
+    /// The external merge tool from `merge.tool`, if one is set.
+    pub merge_tool: Option<String>,
+}
+
+impl Operation {
+    /// One line for the banner: "Merging feature/x into main".
+    pub fn title(&self) -> String {
+        let branch = self.branch.clone().unwrap_or_else(|| "detached HEAD".into());
+        let commit = self.commit.clone().unwrap_or_else(|| self.theirs.clone());
+        let mut s = match self.kind {
+            OpType::Merge => format!("Merging {} into {branch}", self.theirs),
+            OpType::Rebase => format!("Rebasing {branch} onto {}", self.ours),
+            OpType::CherryPick => format!("Cherry-picking {commit}"),
+            OpType::Revert => format!("Reverting {commit}"),
+        };
+        if let Some((n, of)) = self.step {
+            s += &format!(" · commit {n} of {of}");
+        }
+        if self.remaining > 0 {
+            s += &format!(" · {} more after this", self.remaining);
+        }
+        s
+    }
+
+    /// Skip only makes sense when there's a sequence of commits to carry on with.
+    pub fn can_skip(&self) -> bool {
+        self.kind == OpType::Rebase || self.remaining > 0
+    }
+}
+
+/// Path of a file inside the repository's git folder (right for linked worktrees too).
+fn git_path(repo: &Path, name: &str) -> GitResult<PathBuf> {
+    Ok(repo.join(run(repo, &["rev-parse", "--git-path", name])?.trim_end_matches(['\n', '\r'])))
+}
+
+fn read_git_file(repo: &Path, name: &str) -> Option<String> {
+    let p = git_path(repo, name).ok()?;
+    std::fs::read_to_string(p).ok().map(|s| s.trim().to_string())
+}
+
+/// A commit's best name: a local branch pointing at it, else a remote branch, a tag, or its short id.
+fn name_commit(repo: &Path, rev: &str) -> String {
+    let refs = run(repo, &["for-each-ref", "--points-at", rev, "--format=%(refname)", "refs/heads", "refs/remotes", "refs/tags"]).unwrap_or_default();
+    for prefix in ["refs/heads/", "refs/remotes/", "refs/tags/"] {
+        if let Some(n) = refs.lines().find_map(|r| r.strip_prefix(prefix)).filter(|n| !n.ends_with("/HEAD")) {
+            return n.to_string();
+        }
+    }
+    short_id(repo, rev)
+}
+
+fn short_id(repo: &Path, rev: &str) -> String {
+    run(repo, &["rev-parse", "--short", rev]).map(|s| s.trim().to_string()).unwrap_or_else(|_| rev.chars().take(7).collect())
+}
+
+/// "a3e4377 “Subject”"
+fn commit_title(repo: &Path, rev: &str) -> Option<String> {
+    let out = run(repo, &["log", "-1", "--format=%h%x1f%s", rev]).ok()?;
+    let (id, subject) = out.trim_end().split_once('\x1f')?;
+    Some(format!("{id} “{subject}”"))
+}
+
+/// Entries in a sequencer todo list (comments and blank lines aside).
+fn todo_count(text: &str) -> usize {
+    text.lines().filter(|l| !l.trim().is_empty() && !l.trim_start().starts_with('#')).count()
+}
+
+/// The merge, rebase, cherry-pick or revert in progress, if any.
+pub fn operation(repo: &Path) -> GitResult<Option<Operation>> {
+    let exists = |name: &str| git_path(repo, name).is_ok_and(|p| p.exists());
+    let branch = run(repo, &["symbolic-ref", "-q", "--short", "HEAD"]).ok().map(|s| s.trim().to_string()).filter(|s| !s.is_empty());
+    let head_name = || branch.clone().unwrap_or_else(|| short_id(repo, "HEAD"));
+    let merge_tool = run(repo, &["config", "merge.tool"]).ok().map(|s| s.trim().to_string()).filter(|s| !s.is_empty());
+    let before = || run(repo, &["rev-parse", "-q", "--verify", "ORIG_HEAD"]).ok().map(|s| short_id(repo, s.trim()));
+    let op = if exists("rebase-merge") || exists("rebase-apply") {
+        let dir = if exists("rebase-merge") { "rebase-merge" } else { "rebase-apply" };
+        let file = |name: &str| read_git_file(repo, &format!("{dir}/{name}"));
+        let rebased = file("head-name").and_then(|h| h.strip_prefix("refs/heads/").map(String::from));
+        let onto = file("onto").map(|o| name_commit(repo, &o)).unwrap_or_else(|| "?".into());
+        let (n, of) = if dir == "rebase-merge" { (file("msgnum"), file("end")) } else { (file("next"), file("last")) };
+        let step = n.and_then(|n| n.parse().ok()).zip(of.and_then(|o| o.parse().ok()));
+        // REBASE_HEAD is the commit that stopped; older gits only leave stopped-sha.
+        let stopped = if exists("REBASE_HEAD") { Some("REBASE_HEAD".to_string()) } else { file("stopped-sha") };
+        let commit = stopped.as_deref().and_then(|c| commit_title(repo, c));
+        Operation {
+            kind: OpType::Rebase,
+            branch: rebased,
+            ours: onto,
+            theirs: commit.clone().unwrap_or_else(|| "the commit being replayed".into()),
+            commit,
+            step,
+            remaining: 0,
+            before: file("orig-head").map(|o| short_id(repo, &o)),
+            merge_tool,
+        }
+    } else if exists("MERGE_HEAD") {
+        Operation {
+            kind: OpType::Merge,
+            branch: branch.clone(),
+            ours: head_name(),
+            theirs: name_commit(repo, "MERGE_HEAD"),
+            commit: None,
+            step: None,
+            remaining: 0,
+            before: Some(short_id(repo, "HEAD")),
+            merge_tool,
+        }
+    } else if exists("CHERRY_PICK_HEAD") || exists("REVERT_HEAD") {
+        let pick = exists("CHERRY_PICK_HEAD");
+        let head = if pick { "CHERRY_PICK_HEAD" } else { "REVERT_HEAD" };
+        let commit = commit_title(repo, head);
+        // The sequencer's todo list still includes the commit that stopped.
+        let remaining = read_git_file(repo, "sequencer/todo").map(|t| todo_count(&t).saturating_sub(1)).unwrap_or(0);
+        let theirs = if pick {
+            commit.clone().unwrap_or_else(|| short_id(repo, head))
+        } else {
+            format!("before {}", short_id(repo, head))
+        };
+        Operation {
+            kind: if pick { OpType::CherryPick } else { OpType::Revert },
+            branch: branch.clone(),
+            ours: head_name(),
+            theirs,
+            commit,
+            step: None,
+            remaining,
+            before: before(),
+            merge_tool,
+        }
+    } else {
+        return Ok(None);
+    };
+    Ok(Some(op))
+}
+
+/// Carry on after the conflicts are resolved. A merge uses `message` when given
+/// (else the prepared merge message); nothing ever opens an editor.
+pub fn continue_operation(repo: &Path, kind: OpType, message: Option<&str>) -> GitResult<String> {
+    let env = [("GIT_EDITOR", "true")];
+    match (kind, message.map(str::trim).filter(|m| !m.is_empty())) {
+        (OpType::Merge, Some(m)) => run_stdin_env(repo, &["commit", "-F", "-"], m, &env),
+        _ => run_env(repo, &[kind.command(), "--continue"], &env),
+    }
+}
+
+pub fn abort_operation(repo: &Path, kind: OpType) -> GitResult<String> {
+    run(repo, &[kind.command(), "--abort"])
+}
+
+/// Leave out the commit that stopped and go on with the rest.
+pub fn skip_operation(repo: &Path, kind: OpType) -> GitResult<String> {
+    run_env(repo, &[kind.command(), "--skip"], &[("GIT_EDITOR", "true")])
+}
+
+fn run_env(repo: &Path, args: &[&str], env: &[(&str, &str)]) -> GitResult<String> {
+    let out = base_cmd(repo).args(args).envs(env.iter().copied()).output().map_err(|e| format!("Could not start git: {e}"))?;
+    if out.status.success() {
+        Ok(String::from_utf8_lossy(&out.stdout).into_owned())
+    } else {
+        let err = String::from_utf8_lossy(&out.stderr).trim().to_string();
+        Err(if err.is_empty() { String::from_utf8_lossy(&out.stdout).trim().to_string() } else { err })
+    }
+}
+
+fn run_bytes(repo: &Path, args: &[&str]) -> GitResult<Vec<u8>> {
+    let out = base_cmd(repo).args(args).output().map_err(|e| format!("Could not start git: {e}"))?;
+    if out.status.success() { Ok(out.stdout) } else { Err(String::from_utf8_lossy(&out.stderr).trim().to_string()) }
+}
+
+/// Which side a whole-file choice takes.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Side {
+    Ours,
+    Theirs,
+}
+
+/// Replace the whole working file with one side's version (it stays unresolved until marked).
+pub fn take_side(repo: &Path, path: &str, side: Side) -> GitResult<String> {
+    let flag = if side == Side::Ours { "--ours" } else { "--theirs" };
+    run(repo, &["checkout", flag, "--", path])
+}
+
+pub fn mark_resolved(repo: &Path, path: &str) -> GitResult<String> {
+    run(repo, &["add", "--", path])
+}
+
+/// Resolve a delete/modify (or one-sided) conflict by keeping the file: our
+/// version when we have one, else theirs, else the common ancestor's.
+pub fn keep_file(repo: &Path, path: &str) -> GitResult<String> {
+    let stages = index_stages(repo, path)?;
+    let stage = [2u8, 3, 1].into_iter().find(|s| stages.iter().any(|e| e.stage == *s)).ok_or("This file has no version to keep")?;
+    run(repo, &["checkout-index", "-f", &format!("--stage={stage}"), "--", path])?;
+    mark_resolved(repo, path)
+}
+
+/// Resolve a conflict by deleting the file.
+pub fn delete_file(repo: &Path, path: &str) -> GitResult<String> {
+    run(repo, &["rm", "-q", "-f", "--", path])
+}
+
+/// Write the resolved contents, then (optionally) mark the file resolved.
+pub fn save_resolution(repo: &Path, path: &str, text: &str, mark: bool) -> GitResult<String> {
+    std::fs::write(repo.join(path), text).map_err(|e| format!("Couldn't save {path}: {e}"))?;
+    if mark { mark_resolved(repo, path) } else { Ok(String::new()) }
+}
+
+/// A choice for one conflicted file, applied (and marked resolved) by [`resolve_files`].
+#[derive(Clone, Debug, PartialEq)]
+pub enum Resolution {
+    /// Write these contents.
+    Text(String, String),
+    /// Take one side's whole version.
+    Side(String, Side),
+    /// Keep the file (delete/modify conflicts).
+    Keep(String),
+    Delete(String),
+}
+
+/// Apply each file's choice and mark it resolved. Carries on past a file that
+/// fails, then reports every failure.
+pub fn resolve_files(repo: &Path, choices: &[Resolution]) -> GitResult<String> {
+    let mut errors = Vec::new();
+    for c in choices {
+        let res = match c {
+            Resolution::Text(path, text) => save_resolution(repo, path, text, true),
+            Resolution::Side(path, side) => take_side(repo, path, *side).and_then(|_| mark_resolved(repo, path)),
+            Resolution::Keep(path) => keep_file(repo, path),
+            Resolution::Delete(path) => delete_file(repo, path),
+        };
+        if let Err(e) = res {
+            errors.push(e);
+        }
+    }
+    if errors.is_empty() { Ok(String::new()) } else { Err(errors.join("\n")) }
+}
+
+/// Open the configured merge tool on one file and wait for it to close.
+pub fn run_merge_tool(repo: &Path, path: &str) -> GitResult<String> {
+    run(repo, &["mergetool", "--no-prompt", "--", path])
+}
+
+/// One version of a conflicted file in the index (stage 1 base, 2 ours, 3 theirs).
+#[derive(Clone, Debug, PartialEq)]
+pub struct IndexStage {
+    pub stage: u8,
+    pub oid: String,
+}
+
+fn index_stages(repo: &Path, path: &str) -> GitResult<Vec<IndexStage>> {
+    let out = run(repo, &["ls-files", "-u", "-z", "--", path])?;
+    Ok(out
+        .split('\0')
+        .filter_map(|e| {
+            // "<mode> <oid> <stage>\t<path>"
+            let (meta, _) = e.split_once('\t')?;
+            let f: Vec<&str> = meta.split(' ').collect();
+            Some(IndexStage { oid: f.get(1)?.to_string(), stage: f.get(2)?.parse().ok()? })
+        })
+        .collect())
+}
+
+/// Text between conflict markers, line by line. Each line keeps its own ending
+/// ("\n", "\r\n" or none at the very end), so writing it back changes nothing.
+#[derive(Clone, Debug, PartialEq)]
+pub struct Region {
+    pub ours: Vec<String>,
+    /// The common ancestor's lines (diff3 / zdiff3 markers, or read from the index).
+    pub base: Option<Vec<String>>,
+    pub theirs: Vec<String>,
+    /// The marker lines exactly as found, to put an unresolved region back as it was.
+    pub markers: [String; 4],
+}
+
+impl Region {
+    /// The names git wrote after the opening and closing markers ("HEAD", "Stashed changes"…).
+    pub fn labels(&self) -> (String, String) {
+        let name = |m: &str| m.trim_end().trim_start_matches(['<', '>']).trim().to_string();
+        (name(&self.markers[0]), name(&self.markers[3]))
+    }
+
+    /// The region as it is in the file, markers and all.
+    pub fn original(&self) -> String {
+        let mut s = self.markers[0].clone();
+        s.extend(self.ours.iter().cloned());
+        if let Some(base) = &self.base
+            && !self.markers[1].is_empty()
+        {
+            s += &self.markers[1];
+            s.extend(base.iter().cloned());
+        }
+        s += &self.markers[2];
+        s.extend(self.theirs.iter().cloned());
+        s += &self.markers[3];
+        s
+    }
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub enum Segment {
+    /// Lines both sides agree on.
+    Same(Vec<String>),
+    Conflict(Region),
+}
+
+/// Split a conflicted file into agreed text and conflict regions. Understands the
+/// default, diff3 and zdiff3 marker styles and any `conflict-marker-size`. A
+/// region that never ends is left as ordinary text.
+pub fn parse_conflicts(text: &str, marker_size: usize) -> Vec<Segment> {
+    let is_marker = |line: &str, c: char| {
+        let body = line.trim_end_matches(['\n', '\r']);
+        body.len() >= marker_size
+            && body.chars().take(marker_size).all(|x| x == c)
+            && body[marker_size..].chars().next().is_none_or(|x| x == ' ')
+    };
+    #[derive(PartialEq)]
+    enum In {
+        Text,
+        Ours,
+        Base,
+        Theirs,
+    }
+    let mut out = Vec::new();
+    let mut same: Vec<String> = Vec::new();
+    // The lines of the region being read (kept to fall back to plain text).
+    let mut pending: Vec<String> = Vec::new();
+    let mut region = Region { ours: vec![], base: None, theirs: vec![], markers: Default::default() };
+    let mut state = In::Text;
+    for line in text.split_inclusive('\n') {
+        let l = line.to_string();
+        match state {
+            In::Text => {
+                if is_marker(line, '<') {
+                    region = Region { ours: vec![], base: None, theirs: vec![], markers: [l.clone(), String::new(), String::new(), String::new()] };
+                    pending = vec![l];
+                    state = In::Ours;
+                } else {
+                    same.push(l);
+                }
+                continue;
+            }
+            In::Ours | In::Base if is_marker(line, '=') => {
+                region.markers[2] = l.clone();
+                state = In::Theirs;
+            }
+            In::Ours if is_marker(line, '|') => {
+                region.markers[1] = l.clone();
+                region.base = Some(Vec::new());
+                state = In::Base;
+            }
+            In::Ours => region.ours.push(l.clone()),
+            In::Base => region.base.get_or_insert_with(Vec::new).push(l.clone()),
+            In::Theirs if is_marker(line, '>') => {
+                region.markers[3] = l;
+                if !same.is_empty() {
+                    out.push(Segment::Same(std::mem::take(&mut same)));
+                }
+                out.push(Segment::Conflict(std::mem::replace(&mut region, Region { ours: vec![], base: None, theirs: vec![], markers: Default::default() })));
+                pending.clear();
+                state = In::Text;
+                continue;
+            }
+            In::Theirs => region.theirs.push(l.clone()),
+        }
+        pending.push(l);
+    }
+    // An unfinished region is just text.
+    same.extend(pending);
+    if !same.is_empty() {
+        out.push(Segment::Same(same));
+    }
+    out
+}
+
+/// The file uses Windows line endings.
+pub fn uses_crlf(text: &str) -> bool {
+    text.contains("\r\n")
+}
+
+/// Everything the resolver needs about one conflicted file.
+#[derive(Clone, Debug, PartialEq)]
+pub struct ConflictFile {
+    pub path: String,
+    pub kind: ConflictKind,
+    /// Binary (or not valid UTF-8): only whole-file choices.
+    pub binary: bool,
+    /// The working file as read (empty when binary or missing).
+    pub text: String,
+    pub segments: Vec<Segment>,
+    /// The base was read from the index for each region (markers without a base section).
+    pub index_base: bool,
+    /// Size in bytes of the base, ours and theirs versions, where they exist.
+    pub sizes: [Option<u64>; 3],
+    /// Delete/modify and one-sided text files: what each side did, to compare.
+    pub sided: Option<SidedView>,
+}
+
+/// A text file only one side still has, compared with the common ancestor.
+#[derive(Clone, Debug, PartialEq)]
+pub struct SidedView {
+    /// The stage that still has the file: 2 (ours) or 3 (theirs); 1 when both deleted it.
+    pub stage: u8,
+    /// That version against the common ancestor, every line (all added when there's no ancestor).
+    pub changes: Vec<DiffLine>,
+    /// The common ancestor's lines: what the other side deleted.
+    pub base: Vec<String>,
+}
+
+impl ConflictFile {
+    pub fn regions(&self) -> impl Iterator<Item = &Region> {
+        self.segments.iter().filter_map(|s| match s {
+            Segment::Conflict(r) => Some(r),
+            Segment::Same(_) => None,
+        })
+    }
+}
+
+fn looks_binary(bytes: &[u8]) -> bool {
+    bytes[..bytes.len().min(8000)].contains(&0) || std::str::from_utf8(bytes).is_err()
+}
+
+fn marker_size(repo: &Path, path: &str) -> usize {
+    // "path: conflict-marker-size: 9", or "unspecified".
+    run(repo, &["check-attr", "conflict-marker-size", "--", path])
+        .ok()
+        .and_then(|o| o.trim_end().rsplit(": ").next().and_then(|v| v.parse().ok()))
+        .unwrap_or(7)
+}
+
+/// Read a conflicted file: its kind, its regions and (when the markers don't
+/// include it) each region's common-ancestor text, rebuilt from the index stages.
+pub fn conflict_file(repo: &Path, path: &str, kind: ConflictKind) -> GitResult<ConflictFile> {
+    let stages = index_stages(repo, path)?;
+    let mut sizes = [None; 3];
+    for s in &stages {
+        if (1..=3).contains(&s.stage) {
+            sizes[s.stage as usize - 1] = run(repo, &["cat-file", "-s", &s.oid]).ok().and_then(|n| n.trim().parse().ok());
+        }
+    }
+    let bytes = std::fs::read(repo.join(path)).unwrap_or_default();
+    let mut binary = looks_binary(&bytes);
+    if !binary && bytes.is_empty() {
+        // A missing working file: judge by whichever version the index has.
+        if let Some(s) = stages.first() {
+            binary = run_bytes(repo, &["cat-file", "blob", &s.oid]).is_ok_and(|b| looks_binary(&b));
+        }
+    }
+    let mut file = ConflictFile { path: path.to_string(), kind, binary, text: String::new(), segments: vec![], index_base: false, sizes, sided: None };
+    if binary {
+        return Ok(file);
+    }
+    if !kind.has_regions() {
+        file.sided = sided_view(repo, &stages).ok();
+        return Ok(file);
+    }
+    file.text = String::from_utf8(bytes).unwrap_or_default();
+    let size = marker_size(repo, path);
+    file.segments = parse_conflicts(&file.text, size);
+    let needs_base = file.regions().any(|r| r.base.is_none());
+    // Only trusted when the rebuilt merge has as many regions as the file (it wasn't hand-edited).
+    if needs_base
+        && kind.has_regions()
+        && let Ok(bases) = bases_from_index(repo, &stages, size)
+        && bases.len() == file.regions().count()
+    {
+        let mut it = bases.into_iter();
+        for seg in &mut file.segments {
+            if let Segment::Conflict(r) = seg {
+                let b = it.next();
+                if r.base.is_none() {
+                    r.base = b;
+                }
+            }
+        }
+        file.index_base = true;
+    }
+    Ok(file)
+}
+
+/// What happened to a file one side deleted: the surviving version against the ancestor.
+fn sided_view(repo: &Path, stages: &[IndexStage]) -> GitResult<SidedView> {
+    let oid = |n: u8| stages.iter().find(|s| s.stage == n).map(|s| s.oid.as_str());
+    let stage = [2u8, 3].into_iter().find(|n| oid(*n).is_some()).unwrap_or(1);
+    let text = |o: &str| run(repo, &["cat-file", "blob", o]);
+    let base: Vec<String> = match oid(1) {
+        Some(b) => text(b)?.split_inclusive('\n').map(|l| l.trim_end_matches(['\n', '\r']).to_string()).collect(),
+        None => vec![],
+    };
+    let changes = match (oid(1), oid(stage)) {
+        (Some(b), Some(k)) if stage != 1 => {
+            // Whole-file context, so every line shows.
+            let out = run(repo, &["diff", "--no-ext-diff", "-U1000000", b, k])?;
+            let lines: Vec<DiffLine> = parse_patch(&out).into_iter().flat_map(|f| f.hunks).flat_map(|h| h.lines).collect();
+            if lines.is_empty() {
+                // Same as the ancestor.
+                base.iter().enumerate().map(|(i, t)| DiffLine { kind: LineKind::Context, old_no: Some(i as u32 + 1), new_no: Some(i as u32 + 1), text: t.clone() }).collect()
+            } else {
+                lines
+            }
+        }
+        (None, Some(k)) => text(k)?
+            .split_inclusive('\n')
+            .enumerate()
+            .map(|(i, l)| DiffLine { kind: LineKind::Add, old_no: None, new_no: Some(i as u32 + 1), text: l.trim_end_matches(['\n', '\r']).to_string() })
+            .collect(),
+        _ => vec![],
+    };
+    Ok(SidedView { stage, changes, base })
+}
+
+/// Merge the three index versions again with diff3 markers to learn each region's base.
+fn bases_from_index(repo: &Path, stages: &[IndexStage], marker_size: usize) -> GitResult<Vec<Vec<String>>> {
+    let blob = |n: u8| -> GitResult<Vec<u8>> {
+        match stages.iter().find(|s| s.stage == n) {
+            Some(s) => run_bytes(repo, &["cat-file", "blob", &s.oid]),
+            None => Ok(Vec::new()),
+        }
+    };
+    let dir = std::env::temp_dir().join(format!("headway-merge-{}-{}", std::process::id(), std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_nanos()).unwrap_or(0)));
+    std::fs::create_dir_all(&dir).map_err(|e| e.to_string())?;
+    let result = (|| {
+        let mut files = Vec::new();
+        for (n, name) in [(2u8, "ours"), (1, "base"), (3, "theirs")] {
+            let p = dir.join(name);
+            std::fs::write(&p, blob(n)?).map_err(|e| e.to_string())?;
+            files.push(p.to_string_lossy().into_owned());
+        }
+        let size = format!("--marker-size={marker_size}");
+        // Exits with the number of conflicts, so any exit code is fine.
+        let merged = run_any(repo, &["merge-file", "-p", "--diff3", &size, &files[0], &files[1], &files[2]])?;
+        Ok(parse_conflicts(&merged, marker_size)
+            .into_iter()
+            .filter_map(|s| match s {
+                Segment::Conflict(r) => Some(r.base.unwrap_or_default()),
+                Segment::Same(_) => None,
+            })
+            .collect())
+    })();
+    let _ = std::fs::remove_dir_all(&dir);
+    result
 }
 
 #[cfg(test)]
@@ -2093,6 +2715,358 @@ submodule.old.url git@host:old.git
         let _ = std::fs::remove_dir_all(&dir);
     }
 
+    // -----------------------------------------------------------------------
+    // Merges, rebases, cherry-picks and reverts in progress
+
+    #[test]
+    fn conflict_markers_in_every_style() {
+        let merge = "a\n<<<<<<< HEAD\nours\n=======\ntheirs\n>>>>>>> x\nb\n";
+        let segs = parse_conflicts(merge, 7);
+        assert_eq!(segs.len(), 3);
+        let Segment::Conflict(r) = &segs[1] else { panic!("{segs:?}") };
+        assert_eq!((r.ours.clone(), r.theirs.clone(), r.base.clone()), (vec!["ours\n".to_string()], vec!["theirs\n".to_string()], None));
+        assert_eq!(segs[0], Segment::Same(vec!["a\n".into()]));
+        assert_eq!(r.original(), "<<<<<<< HEAD\nours\n=======\ntheirs\n>>>>>>> x\n");
+
+        // diff3 and zdiff3 both carry the base after |||||||.
+        let diff3 = "<<<<<<< ours\no\n||||||| base\nb1\nb2\n=======\nt\n>>>>>>> theirs\n";
+        let Segment::Conflict(r) = &parse_conflicts(diff3, 7)[0] else { panic!() };
+        assert_eq!(r.base, Some(vec!["b1\n".to_string(), "b2\n".to_string()]));
+        assert_eq!(r.original(), diff3);
+        // An empty side is fine, and Windows line endings stay on each line.
+        let crlf = "x\r\n<<<<<<< HEAD\r\n=======\r\nnew\r\n>>>>>>> y\r\n";
+        let segs = parse_conflicts(crlf, 7);
+        let Segment::Conflict(r) = &segs[1] else { panic!() };
+        assert!(r.ours.is_empty() && r.theirs == vec!["new\r\n".to_string()]);
+        assert!(uses_crlf(crlf));
+        // A bigger marker size; 7-character lines inside are ordinary text.
+        let nine = "<<<<<<<<< a\n=======\n=========\nt\n>>>>>>>>> b";
+        let Segment::Conflict(r) = &parse_conflicts(nine, 9)[0] else { panic!() };
+        assert_eq!(r.ours, vec!["=======\n".to_string()]);
+        assert_eq!(r.markers[3], ">>>>>>>>> b", "no newline at the very end");
+        // A marker needs a space or nothing after it; an unfinished region is plain text.
+        let odd = "<<<<<<<x\n<<<<<<< a\nfoo\n";
+        assert_eq!(parse_conflicts(odd, 7), vec![Segment::Same(vec!["<<<<<<<x\n".into(), "<<<<<<< a\n".into(), "foo\n".into()])]);
+        assert!(parse_conflicts("", 7).is_empty());
+    }
+
+    /// main and `feature` change lines 2, 10 and 18 of a 20-line file differently.
+    fn diverged(name: &str) -> PathBuf {
+        let dir = temp_repo(name);
+        let base: Vec<String> = (1..=20).map(|i| format!("line {i}\n")).collect();
+        commit_file_with(&dir, "a.txt", &base.concat(), "Base");
+        run(&dir, &["checkout", "-q", "-b", "feature"]).unwrap();
+        let mut f = base.clone();
+        for i in [1, 9, 17] {
+            f[i] = format!("feature {}\n", i + 1);
+        }
+        commit_file_with(&dir, "a.txt", &f.concat(), "Feature edits");
+        run(&dir, &["checkout", "-q", "main"]).unwrap();
+        let mut m = base;
+        for i in [1, 9, 17] {
+            m[i] = format!("main {}\n", i + 1);
+        }
+        commit_file_with(&dir, "a.txt", &m.concat(), "Main edits");
+        dir
+    }
+
+    #[test]
+    fn merge_conflict_names_both_sides_and_continues() {
+        let dir = diverged("op-merge");
+        assert_eq!(operation(&dir).unwrap(), None);
+        assert!(run(&dir, &["merge", "feature"]).is_err());
+        let op = operation(&dir).unwrap().unwrap();
+        assert_eq!((op.kind, op.branch.as_deref(), op.ours.as_str(), op.theirs.as_str()), (OpType::Merge, Some("main"), "main", "feature"));
+        assert_eq!(op.title(), "Merging feature into main");
+        assert!(!op.can_skip() && op.merge_tool.is_none());
+        let st = status(&dir).unwrap();
+        assert_eq!(st.conflicts[0].change, Change::Conflict(ConflictKind::BothModified));
+
+        // Default markers have no base, so it's rebuilt from the index for each region.
+        let f = conflict_file(&dir, "a.txt", ConflictKind::BothModified).unwrap();
+        assert!(!f.binary && f.index_base);
+        let regions: Vec<&Region> = f.regions().collect();
+        assert_eq!(regions.len(), 3);
+        assert_eq!(regions[1].ours, vec!["main 10\n".to_string()]);
+        assert_eq!(regions[1].theirs, vec!["feature 10\n".to_string()]);
+        assert_eq!(regions[1].base, Some(vec!["line 10\n".to_string()]));
+        // Continue is refused while the file is unresolved.
+        assert!(continue_operation(&dir, OpType::Merge, None).is_err());
+        save_resolution(&dir, "a.txt", "resolved\n", true).unwrap();
+        continue_operation(&dir, OpType::Merge, Some("Merge feature, by hand")).unwrap();
+        assert_eq!(operation(&dir).unwrap(), None);
+        assert_eq!(message_of(&dir, "HEAD"), "Merge feature, by hand");
+        assert_eq!(run(&dir, &["rev-list", "--parents", "-1", "HEAD"]).unwrap().split(' ').count(), 3);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn zdiff3_markers_carry_their_own_base_and_merge_continues_with_its_message() {
+        let dir = diverged("op-zdiff3");
+        run(&dir, &["config", "merge.conflictStyle", "zdiff3"]).unwrap();
+        assert!(run(&dir, &["merge", "feature"]).is_err());
+        let f = conflict_file(&dir, "a.txt", ConflictKind::BothModified).unwrap();
+        assert!(!f.index_base);
+        assert!(f.regions().all(|r| r.base.as_ref().is_some_and(|b| b.len() == 1)));
+        // Whole-file choices, then mark resolved and continue with git's own message.
+        take_side(&dir, "a.txt", Side::Theirs).unwrap();
+        assert!(std::fs::read_to_string(dir.join("a.txt")).unwrap().contains("feature 10"));
+        take_side(&dir, "a.txt", Side::Ours).unwrap();
+        assert!(std::fs::read_to_string(dir.join("a.txt")).unwrap().contains("main 10"));
+        mark_resolved(&dir, "a.txt").unwrap();
+        continue_operation(&dir, OpType::Merge, None).unwrap();
+        assert!(message_of(&dir, "HEAD").starts_with("Merge branch 'feature'"));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn rebase_conflicts_count_steps_skip_and_abort() {
+        for (name, backend) in [("op-rebase", "--merge"), ("op-rebase-apply", "--apply")] {
+            let dir = diverged(name);
+            run(&dir, &["checkout", "-q", "feature"]).unwrap();
+            commit_file_with(&dir, "b.txt", "more\n", "Second feature commit");
+            let before = run(&dir, &["rev-parse", "feature"]).unwrap();
+            assert!(run(&dir, &["rebase", backend, "main"]).is_err());
+            let op = operation(&dir).unwrap().unwrap();
+            assert_eq!(op.kind, OpType::Rebase, "{backend}");
+            assert_eq!((op.branch.as_deref(), op.ours.as_str()), (Some("feature"), "main"), "{backend}");
+            assert_eq!(op.step, Some((1, 2)), "{backend}");
+            assert!(op.theirs.ends_with("“Feature edits”"), "{backend}: {}", op.theirs);
+            assert!(op.title().starts_with("Rebasing feature onto main · commit 1 of 2"), "{}", op.title());
+            assert!(op.can_skip());
+            assert_eq!(op.before.as_deref(), Some(&short_id(&dir, before.trim())[..]));
+            abort_operation(&dir, OpType::Rebase).unwrap();
+            assert_eq!(operation(&dir).unwrap(), None);
+            assert_eq!(run(&dir, &["rev-parse", "feature"]).unwrap(), before);
+            // Skipping the conflicting commit replays the rest.
+            assert!(run(&dir, &["rebase", backend, "main"]).is_err());
+            skip_operation(&dir, OpType::Rebase).unwrap();
+            assert_eq!(operation(&dir).unwrap(), None);
+            assert_eq!(message_of(&dir, "HEAD"), "Second feature commit");
+            assert_eq!(message_of(&dir, "HEAD~1"), "Main edits");
+            let _ = std::fs::remove_dir_all(&dir);
+        }
+    }
+
+    #[test]
+    fn cherry_pick_alone_and_in_a_sequence() {
+        let dir = diverged("op-pick");
+        run(&dir, &["checkout", "-q", "feature"]).unwrap();
+        commit_file_with(&dir, "a.txt", "feature rewrite\n", "Rewrite on feature");
+        run(&dir, &["checkout", "-q", "main"]).unwrap();
+        assert!(run(&dir, &["cherry-pick", "feature~1"]).is_err());
+        let op = operation(&dir).unwrap().unwrap();
+        assert_eq!((op.kind, op.ours.as_str(), op.remaining), (OpType::CherryPick, "main", 0));
+        assert!(op.theirs.ends_with("“Feature edits”") && op.title().starts_with("Cherry-picking "), "{}", op.title());
+        assert!(!op.can_skip(), "a single pick has nothing to skip to");
+        abort_operation(&dir, OpType::CherryPick).unwrap();
+
+        // Two picks: the first stops, one more waits; skip it and the second stops too.
+        assert!(run(&dir, &["cherry-pick", "feature~1", "feature"]).is_err());
+        let op = operation(&dir).unwrap().unwrap();
+        assert_eq!(op.remaining, 1);
+        assert!(op.can_skip() && op.title().ends_with("· 1 more after this"), "{}", op.title());
+        assert!(skip_operation(&dir, OpType::CherryPick).is_err(), "the next pick conflicts as well");
+        let op = operation(&dir).unwrap().unwrap();
+        assert!(op.theirs.ends_with("“Rewrite on feature”"), "{}", op.theirs);
+        save_resolution(&dir, "a.txt", "picked\n", true).unwrap();
+        continue_operation(&dir, OpType::CherryPick, None).unwrap();
+        assert_eq!(operation(&dir).unwrap(), None);
+        assert_eq!(message_of(&dir, "HEAD"), "Rewrite on feature");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn revert_conflict_is_detected_and_continues() {
+        let dir = diverged("op-revert");
+        commit_file_with(&dir, "a.txt", "rewritten\n", "Rewrite");
+        assert!(run(&dir, &["revert", "--no-edit", "HEAD~1"]).is_err());
+        let op = operation(&dir).unwrap().unwrap();
+        assert_eq!(op.kind, OpType::Revert);
+        assert!(op.title().starts_with("Reverting ") && op.title().contains("“Main edits”"), "{}", op.title());
+        assert!(op.theirs.starts_with("before "));
+        save_resolution(&dir, "a.txt", "reverted\n", true).unwrap();
+        continue_operation(&dir, OpType::Revert, None).unwrap();
+        assert_eq!(operation(&dir).unwrap(), None);
+        assert!(message_of(&dir, "HEAD").starts_with("Revert \"Main edits\""));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn delete_modify_add_add_and_binary_conflicts() {
+        let dir = temp_repo("op-kinds");
+        commit_file_with(&dir, "gone-here.txt", "1\n", "Base 1");
+        commit_file_with(&dir, "gone-there.txt", "1\n", "Base 2");
+        std::fs::write(dir.join("pic.bin"), [0u8, 1, 2]).unwrap();
+        commit_file_with(&dir, "pic.bin", "\0base", "Base 3");
+        run(&dir, &["checkout", "-q", "-b", "other"]).unwrap();
+        commit_file_with(&dir, "gone-here.txt", "changed there\n", "Change");
+        run(&dir, &["rm", "-q", "gone-there.txt"]).unwrap();
+        commit_file_with(&dir, "both.txt", "theirs\n", "Add both + delete");
+        commit_file_with(&dir, "pic.bin", "\0theirs", "Bin theirs");
+        run(&dir, &["checkout", "-q", "main"]).unwrap();
+        run(&dir, &["rm", "-q", "gone-here.txt"]).unwrap();
+        commit_file_with(&dir, "gone-there.txt", "changed here\n", "Delete + change");
+        commit_file_with(&dir, "both.txt", "ours\n", "Add both");
+        commit_file_with(&dir, "pic.bin", "\0ours!", "Bin ours");
+        assert!(run(&dir, &["merge", "other"]).is_err());
+
+        let kinds: HashMap<String, Change> = status(&dir).unwrap().conflicts.into_iter().map(|c| (c.path, c.change)).collect();
+        assert_eq!(kinds["gone-here.txt"], Change::Conflict(ConflictKind::DeletedByUs));
+        assert_eq!(kinds["gone-there.txt"], Change::Conflict(ConflictKind::DeletedByThem));
+        assert_eq!(kinds["both.txt"], Change::Conflict(ConflictKind::BothAdded));
+        assert_eq!(kinds["pic.bin"], Change::Conflict(ConflictKind::BothModified));
+        assert!(ConflictKind::BothAdded.has_regions() && !ConflictKind::DeletedByUs.has_regions());
+
+        // Add/add has markers with an empty base.
+        let f = conflict_file(&dir, "both.txt", ConflictKind::BothAdded).unwrap();
+        assert_eq!(f.regions().count(), 1);
+        assert_eq!(f.regions().next().unwrap().base, Some(vec![]));
+        let bin = conflict_file(&dir, "pic.bin", ConflictKind::BothModified).unwrap();
+        assert!(bin.binary && bin.segments.is_empty());
+        assert_eq!(bin.sizes, [Some(5), Some(6), Some(7)]);
+        let gone = conflict_file(&dir, "gone-there.txt", ConflictKind::DeletedByThem).unwrap();
+        assert_eq!(gone.sizes, [Some(2), Some(13), None]);
+        // What each side did: ours changed "1" to "changed here", theirs deleted "1".
+        let sided = gone.sided.unwrap();
+        assert_eq!((sided.stage, sided.base.clone()), (2, vec!["1".to_string()]));
+        let changes: Vec<(LineKind, &str)> = sided.changes.iter().map(|l| (l.kind.clone(), l.text.as_str())).collect();
+        assert_eq!(changes, [(LineKind::Del, "1"), (LineKind::Add, "changed here")]);
+        let here = conflict_file(&dir, "gone-here.txt", ConflictKind::DeletedByUs).unwrap().sided.unwrap();
+        assert_eq!(here.stage, 3, "only theirs still has it");
+
+        // Keep takes the side that still has the file; delete removes it everywhere.
+        // Every file's choice is applied in one go.
+        resolve_files(
+            &dir,
+            &[
+                Resolution::Keep("gone-here.txt".into()),
+                Resolution::Delete("gone-there.txt".into()),
+                Resolution::Delete("both.txt".into()),
+                Resolution::Side("pic.bin".into(), Side::Theirs),
+            ],
+        )
+        .unwrap();
+        assert_eq!(std::fs::read_to_string(dir.join("gone-here.txt")).unwrap(), "changed there\n");
+        assert!(!dir.join("gone-there.txt").exists());
+        assert!(status(&dir).unwrap().conflicts.is_empty());
+        assert_eq!(std::fs::read(dir.join("pic.bin")).unwrap(), b"\0theirs");
+        continue_operation(&dir, OpType::Merge, None).unwrap();
+        assert_eq!(run(&dir, &["ls-files"]).unwrap(), "gone-here.txt\npic.bin\n");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn operations_in_a_linked_worktree_stay_in_that_worktree() {
+        let dir = diverged("op-worktree");
+        let wt = std::env::temp_dir().join(format!("headway-test-op-worktree-wt-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&wt);
+        run(&dir, &["branch", "side", "main"]).unwrap();
+        add_worktree(&dir, &wt, "side", None).unwrap();
+        assert!(run(&wt, &["merge", "feature"]).is_err());
+        let op = operation(&wt).unwrap().unwrap();
+        assert_eq!((op.kind, op.ours.as_str(), op.theirs.as_str()), (OpType::Merge, "side", "feature"));
+        assert_eq!(operation(&dir).unwrap(), None, "the main worktree isn't merging");
+        assert_eq!(conflict_file(&wt, "a.txt", ConflictKind::BothModified).unwrap().regions().count(), 3);
+        abort_operation(&wt, OpType::Merge).unwrap();
+        assert_eq!(operation(&wt).unwrap(), None);
+        let _ = std::fs::remove_dir_all(&wt);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn external_merge_tool_and_custom_marker_size() {
+        let dir = diverged("op-tool");
+        std::fs::write(dir.join(".gitattributes"), "a.txt conflict-marker-size=10\n").unwrap();
+        assert!(run(&dir, &["merge", "feature"]).is_err());
+        assert!(std::fs::read_to_string(dir.join("a.txt")).unwrap().contains("<<<<<<<<<< "));
+        assert_eq!(marker_size(&dir, "a.txt"), 10);
+        let f = conflict_file(&dir, "a.txt", ConflictKind::BothModified).unwrap();
+        assert_eq!(f.regions().count(), 3);
+        assert!(f.index_base);
+
+        // A "tool" that just takes their side.
+        run(&dir, &["config", "merge.tool", "takeTheirs"]).unwrap();
+        run(&dir, &["config", "mergetool.takeTheirs.cmd", "cp \"$REMOTE\" \"$MERGED\""]).unwrap();
+        run(&dir, &["config", "mergetool.takeTheirs.trustExitCode", "true"]).unwrap();
+        run(&dir, &["config", "mergetool.keepBackup", "false"]).unwrap();
+        assert_eq!(operation(&dir).unwrap().unwrap().merge_tool.as_deref(), Some("takeTheirs"));
+        run_merge_tool(&dir, "a.txt").unwrap();
+        assert!(status(&dir).unwrap().conflicts.is_empty(), "the tool's result is staged");
+        assert!(std::fs::read_to_string(dir.join("a.txt")).unwrap().contains("feature 10"));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_commit_no_branch_points_at_is_named_by_its_id() {
+        let dir = diverged("op-unnamed");
+        run(&dir, &["checkout", "-q", "feature"]).unwrap();
+        commit_file_with(&dir, "b.txt", "later\n", "Later");
+        run(&dir, &["checkout", "-q", "main"]).unwrap();
+        assert!(run(&dir, &["merge", "feature~1"]).is_err());
+        let op = operation(&dir).unwrap().unwrap();
+        assert_eq!(op.theirs, short_id(&dir, "feature~1"));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn resolving_carries_on_past_a_failure_and_reports_it() {
+        let dir = diverged("op-resolve-fail");
+        assert!(run(&dir, &["merge", "feature"]).is_err());
+        let e = resolve_files(&dir, &[Resolution::Keep("not-conflicted.txt".into()), Resolution::Text("a.txt".into(), "done\n".into())]).unwrap_err();
+        assert!(e.contains("no version to keep"), "{e}");
+        assert!(status(&dir).unwrap().conflicts.is_empty(), "a.txt was still resolved");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Put versions of `path` straight into the index as conflict stages.
+    fn stage_versions(dir: &Path, path: &str, versions: &[(u8, &[u8])]) {
+        let mut info = String::new();
+        for (stage, bytes) in versions {
+            let tmp = dir.join(format!(".blob{stage}"));
+            std::fs::write(&tmp, bytes).unwrap();
+            let oid = run(dir, &["hash-object", "-w", tmp.to_str().unwrap()]).unwrap();
+            std::fs::remove_file(tmp).unwrap();
+            info += &format!("100644 {} {stage}\t{path}\n", oid.trim());
+        }
+        run(dir, &["update-index", "--force-remove", "--", path]).unwrap();
+        run_stdin(dir, &["update-index", "--index-info"], &info).unwrap();
+    }
+
+    #[test]
+    fn one_sided_files_without_an_ancestor_and_files_both_sides_deleted() {
+        let dir = temp_repo("op-sided");
+        commit_file_with(&dir, "seed.txt", "x\n", "Seed");
+        // Only theirs has it, with no common ancestor: every line is new.
+        stage_versions(&dir, "new.txt", &[(3, b"one\ntwo\n")]);
+        // Both sides deleted it: only the ancestor is left.
+        stage_versions(&dir, "old.txt", &[(1, b"gone\n")]);
+        // Ours kept it unchanged while theirs deleted it.
+        stage_versions(&dir, "same.txt", &[(1, b"keep\n"), (2, b"keep\n")]);
+        // A binary file that isn't in the folder: judged by the index.
+        stage_versions(&dir, "pic.bin", &[(2, b"\0a"), (3, b"\0b")]);
+        let kinds: HashMap<String, Change> = status(&dir).unwrap().conflicts.into_iter().map(|c| (c.path, c.change)).collect();
+        assert_eq!(kinds["new.txt"], Change::Conflict(ConflictKind::AddedByThem));
+        assert_eq!(kinds["old.txt"], Change::Conflict(ConflictKind::BothDeleted));
+        assert_eq!(kinds["same.txt"], Change::Conflict(ConflictKind::DeletedByThem));
+
+        let new = conflict_file(&dir, "new.txt", ConflictKind::AddedByThem).unwrap().sided.unwrap();
+        assert_eq!(new.stage, 3);
+        assert!(new.base.is_empty());
+        let lines: Vec<(LineKind, Option<u32>, &str)> = new.changes.iter().map(|l| (l.kind.clone(), l.new_no, l.text.as_str())).collect();
+        assert_eq!(lines, [(LineKind::Add, Some(1), "one"), (LineKind::Add, Some(2), "two")]);
+        let old = conflict_file(&dir, "old.txt", ConflictKind::BothDeleted).unwrap().sided.unwrap();
+        assert_eq!((old.stage, old.base.clone(), old.changes.len()), (1, vec!["gone".to_string()], 0));
+        let same = conflict_file(&dir, "same.txt", ConflictKind::DeletedByThem).unwrap().sided.unwrap();
+        assert_eq!(same.changes.iter().map(|l| (l.kind.clone(), l.text.as_str())).collect::<Vec<_>>(), [(LineKind::Context, "keep")]);
+        assert!(conflict_file(&dir, "pic.bin", ConflictKind::BothModified).unwrap().binary);
+
+        // Keeping a both-deleted file brings the ancestor's version back.
+        keep_file(&dir, "old.txt").unwrap();
+        assert_eq!(std::fs::read_to_string(dir.join("old.txt")).unwrap(), "gone\n");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     #[test]
     fn rewriting_raw_commits() {
         let raw = "tree t\nparent p1\nparent p2\nauthor A <a> 1 +0000\ncommitter C <c> 2 +0000\nencoding ISO-8859-1\ngpgsig -----BEGIN PGP SIGNATURE-----\n line\n -----END PGP SIGNATURE-----\nmergetag object m\n type commit\n\nSubject\n\nBody\n";
@@ -2293,7 +3267,7 @@ index 4444444..0000000
         let mut st = Status {
             staged: vec![fc("a", Change::Modified)],
             unstaged: vec![fc("a", Change::Modified), fc("b", Change::Untracked)],
-            conflicts: vec![fc("c", Change::Conflict)],
+            conflicts: vec![fc("c", Change::Conflict(ConflictKind::BothModified))],
             ..Default::default()
         };
         st.changes = st.count_changes();

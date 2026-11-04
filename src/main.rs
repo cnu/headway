@@ -7,6 +7,7 @@ mod app;
 mod git;
 mod graph;
 mod overview;
+mod resolver;
 mod samples;
 mod theme;
 mod views;

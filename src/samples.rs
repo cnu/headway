@@ -62,8 +62,15 @@ mod imp {
             .unwrap_or(0)
     }
 
-    const SAMPLES: [(&str, fn(&mut Builder)); 3] =
-        [("web-shop", build_web_shop), ("api-server", build_api), ("design-tokens", build_tokens)];
+    /// Fills a fresh repository with a sample project.
+    type Make = fn(&mut Builder);
+
+    const SAMPLES: [(&str, Make); 4] = [
+        ("web-shop", build_web_shop),
+        ("api-server", build_api),
+        ("design-tokens", build_tokens),
+        ("price-rules", build_price_rules),
+    ];
 
     pub fn sample_workspace() -> Workspace {
         let root = samples_dir();
@@ -182,6 +189,36 @@ mod imp {
         b.commit(SAM, "Start a changelog", 100);
     }
 
+    /// A merge stopped on conflicts: a text file with three conflicting regions, a
+    /// file one side deleted while the other changed it, and a binary file.
+    fn build_price_rules(b: &mut Builder) {
+        let pricing = |tax: &str, round: &str, label: &str| {
+            format!(
+                "export const CURRENCY = 'EUR';\n\n{tax}\n\nexport function net(price) {{\n  return price;\n}}\n\nexport function gross(price) {{\n  const total = price * (1 + TAX_RATE);\n{round}\n}}\n\nexport function describe(item) {{\n  const price = gross(item.price);\n  const name = item.name;\n  const sku = item.sku;\n{label}\n}}\n"
+            )
+        };
+        b.write("README.md", "# Price rules\n\nHow the shop works out prices.\n");
+        b.write("src/pricing.js", &pricing("export const TAX_RATE = 0.2;", "  return total;", "  return `${name}: ${price}`;"));
+        b.write("src/legacy-tax.js", "// Old tax tables, kept for invoices before 2024.\nexport const TABLE = { standard: 0.19 };\n");
+        b.write("assets/badge.png", "\u{0}PNG badge v1");
+        b.commit(SAM, "Start the price rules", 0);
+        b.git(&["checkout", "-q", "-b", "feature/discounts"]);
+        b.write("src/pricing.js", &pricing("export const TAX_RATE = 0.2;\nexport const DISCOUNT = 0.1;", "  return Math.round(total * (1 - DISCOUNT) * 100) / 100;", "  return `${name} (${sku}): ${price} after discount`;"));
+        b.commit(ALEX, "Apply a 10% discount to every price", 30);
+        b.git(&["rm", "-q", "src/legacy-tax.js"]);
+        b.write("assets/badge.png", "\u{0}PNG badge with discount ribbon");
+        b.commit(ALEX, "Drop the legacy tax table and add a sale badge", 4);
+        b.git(&["checkout", "-q", "main"]);
+        b.write("src/pricing.js", &pricing("export const TAX_RATE = 0.21;", "  return Math.round(total * 100) / 100;", "  return `${name}: ${price} incl. VAT`;"));
+        b.commit(JO, "Raise VAT to 21% and round to cents", 20);
+        b.write("src/legacy-tax.js", "// Old tax tables, kept for invoices before 2024.\nexport const TABLE = { standard: 0.19, reduced: 0.07 };\n");
+        b.write("assets/badge.png", "\u{0}PNG badge v2 (new colours)");
+        b.write("README.md", "# Price rules\n\nHow the shop works out prices, including VAT.\n");
+        b.commit(SAM, "Add the reduced rate and refresh the badge", 6);
+        // Stops with conflicts, so there's something to resolve.
+        b.git(&["-c", "user.name=Sam Okafor", "-c", "user.email=sam@example.com", "merge", "feature/discounts"]);
+    }
+
     #[cfg(test)]
     mod tests {
         use super::*;
@@ -209,6 +246,29 @@ mod imp {
             assert_eq!(ws.repos.len(), SAMPLES.len());
             assert_eq!(ws.open_tabs, [ws.repos[0].clone()]);
             assert_eq!(ws.active_tab, Some(0));
+        }
+
+        #[test]
+        fn price_rules_stops_in_a_conflicted_merge() {
+            use crate::git::{self, Change, ConflictKind, OpType};
+            let dir = std::env::temp_dir().join(format!("headway-sample-price-rules-{}", std::process::id()));
+            let _ = std::fs::remove_dir_all(&dir);
+            build_one(&dir, build_price_rules);
+            let op = git::operation(&dir).unwrap().expect("a merge in progress");
+            assert_eq!((op.kind, op.ours.as_str(), op.theirs.as_str()), (OpType::Merge, "main", "feature/discounts"));
+            let st = git::status(&dir).unwrap();
+            let kinds: Vec<(&str, Change)> = st.conflicts.iter().map(|c| (c.path.as_str(), c.change.clone())).collect();
+            assert_eq!(
+                kinds,
+                [
+                    ("assets/badge.png", Change::Conflict(ConflictKind::BothModified)),
+                    ("src/legacy-tax.js", Change::Conflict(ConflictKind::DeletedByThem)),
+                    ("src/pricing.js", Change::Conflict(ConflictKind::BothModified)),
+                ]
+            );
+            assert!(git::conflict_file(&dir, "assets/badge.png", ConflictKind::BothModified).unwrap().binary);
+            assert_eq!(git::conflict_file(&dir, "src/pricing.js", ConflictKind::BothModified).unwrap().regions().count(), 3);
+            let _ = std::fs::remove_dir_all(&dir);
         }
     }
 }
