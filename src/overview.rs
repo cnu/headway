@@ -184,6 +184,17 @@ fn card(
                             actions.push(Action::Copy(path.display().to_string()));
                             ui.close();
                         }
+                        let undo = match summary {
+                            Some(Ok(s)) => s.undo.as_ref(),
+                            _ => None,
+                        };
+                        let text = undo.map_or("Undo".to_string(), |(_, what)| format!("Undo: {what}"));
+                        if ui.add_enabled(undo.is_some() && !busy, egui::Button::new(text)).on_disabled_hover_text("Nothing to undo yet").clicked() {
+                            if let Some((id, _)) = undo {
+                                actions.push(Action::Undo { repo: path.clone(), id: Some(*id) });
+                            }
+                            ui.close();
+                        }
                         ui.separator();
                         if crate::samples::sample_name(path).is_some()
                             && ui.button("Reset sample project…").on_hover_text("Throw away everything in this sample and start it fresh").clicked()
@@ -447,6 +458,7 @@ mod tests {
             main_repo: main_repo.map(PathBuf::from),
             worktrees: vec![],
             submodules: (0, 0),
+            undo: None,
         })
     }
 

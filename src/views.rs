@@ -1,6 +1,6 @@
 //! The repository screen: toolbar, sidebar, history, commit details, staging and diffs.
 
-use crate::app::{Action, DiffDoc, Dialog, FileSel, FlatRow, FollowUp, LineSel, OpKind, RepoData, RepoView, Selection, Summary};
+use crate::app::{Action, DiffDoc, Dialog, FileSel, FlatRow, FollowUp, LineSel, OpKind, Record, RepoData, RepoView, Selection, Summary};
 use crate::git::{self, Change, FileChange, LineKind, RefKind};
 use crate::graph::Target;
 use crate::theme::{self, *};
@@ -75,6 +75,7 @@ pub fn repo(
         .show(ui, |ui| match rv.selection.clone() {
             Some(Selection::WorkingDir) | None => staging_panel(ui, rv, actions),
             Some(Selection::Commit(_)) => commit_panel(ui, rv, actions),
+            Some(Selection::Reflog) => reflog_panel(ui, rv, actions),
         });
     let edge = detail.response.rect.left();
 
@@ -158,7 +159,7 @@ fn toolbar(ui: &mut Ui, rv: &mut RepoView, busy: &[String], sidebar_open: &mut b
         }
         let behind = (head.behind > 0).then(|| head.behind.to_string());
         if tool_button(ui, "⬇", "Pull", behind, has_remote && head.upstream.is_some(), "Bring in new commits from the remote branch").clicked() {
-            actions.push(Action::args(&path, "Pull", &["-c", "pull.rebase=false", "pull", "--no-edit"]));
+            actions.push(Action::args(&path, "Pull", &["-c", "pull.rebase=false", "pull", "--no-edit"]).undoable(git::Undoable::Tree { save_work: false }, "pull"));
         }
         let ahead = (head.ahead > 0).then(|| head.ahead.to_string());
         let push_tip = if head.upstream.is_some() { "Send your commits to the remote branch" } else { "Publish this branch to the remote" };
@@ -177,6 +178,8 @@ fn toolbar(ui: &mut Ui, rv: &mut RepoView, busy: &[String], sidebar_open: &mut b
         }
 
         ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+            let menu = ui.menu_button(RichText::new("⋯").size(15.0).color(DIM), |ui| repo_menu(ui, &path, data, actions));
+            name_it(&menu.response, egui::Role::Button, "Repository menu");
             if !busy.is_empty() {
                 ui.add(egui::Spinner::new().size(14.0).color(ACCENT)).on_hover_text(busy.join("\n"));
             }
@@ -197,6 +200,36 @@ fn toolbar(ui: &mut Ui, rv: &mut RepoView, busy: &[String], sidebar_open: &mut b
             ui.data_mut(|d| d.insert_temp(focus_key, focused_now));
         });
     });
+}
+
+/// The ⋯ menu at the right of the toolbar.
+fn repo_menu(ui: &mut Ui, path: &Path, data: &RepoData, actions: &mut Vec<Action>) {
+    ui.set_min_width(240.0);
+    let undo_key = ui.ctx().format_shortcut(&egui::KeyboardShortcut::new(egui::Modifiers::COMMAND, egui::Key::Z));
+    let text = match &data.undo {
+        Some(e) => format!("Undo: {}", e.what),
+        None => "Undo".to_string(),
+    };
+    let tip = match &data.undo {
+        Some(e) => format!("Done {}", theme::relative(e.time)),
+        None => "Nothing to undo yet".to_string(),
+    };
+    let undo = ui.add_enabled(data.undo.is_some(), egui::Button::new(text).shortcut_text(undo_key)).on_hover_text(&tip).on_disabled_hover_text(&tip);
+    if undo.clicked() {
+        if let Some(e) = &data.undo {
+            actions.push(Action::Undo { repo: path.to_path_buf(), id: Some(e.id) });
+        }
+        ui.close();
+    }
+    if ui.button("Reflog").on_hover_text("Everywhere HEAD and your branches have been").clicked() {
+        actions.push(Action::ShowReflog(None));
+        ui.close();
+    }
+    ui.separator();
+    if ui.button("Copy folder path").clicked() {
+        actions.push(Action::Copy(path.display().to_string()));
+        ui.close();
+    }
 }
 
 fn tool_button(ui: &mut Ui, icon: &str, label: &str, badge: Option<String>, enabled: bool, tip: &str) -> egui::Response {
@@ -222,7 +255,7 @@ fn sep(ui: &mut Ui) {
 // Action builders
 
 fn checkout(path: &Path, name: &str) -> Action {
-    Action::args(path, format!("Switch to {name}"), &["checkout", name])
+    Action::args(path, format!("Switch to {name}"), &["checkout", name]).undoable(git::Undoable::Tree { save_work: false }, format!("switch to {name}"))
 }
 
 fn new_branch(path: &Path, at: &str, label: &str) -> Action {
@@ -453,6 +486,14 @@ fn sidebar(
         let Some(data) = &rv.data else { return };
         let current = data.status.head.branch.clone().unwrap_or_default();
 
+        let reflog_open = rv.selection == Some(Selection::Reflog);
+        let resp = side_row(ui, "↺", PURPLE, "Reflog", None, reflog_open);
+        if resp.clicked() {
+            actions.push(Action::ShowReflog(None));
+        }
+        resp.on_hover_text("Everywhere HEAD and your branches have been, to find lost commits");
+        ui.add_space(4.0);
+
         let locals: Vec<_> = data.branches.iter().filter(|b| !b.remote).collect();
         let elsewhere = branches_in_other_worktrees(data);
         section(ui, "branches", "BRANCHES", locals.len(), true, |ui| {
@@ -508,7 +549,7 @@ fn sidebar(
                             format!("Bring the changes from “{name}” into “{current}”?"),
                             "Merge",
                             false,
-                            Action::args(&path, format!("Merge {name}"), &["merge", "--no-edit", &name]),
+                            Action::args(&path, format!("Merge {name}"), &["merge", "--no-edit", &name]).undoable(git::Undoable::Tree { save_work: false }, format!("merge {name}")),
                         ));
                     }
                     if ui.add_enabled(!b.is_head && !current.is_empty(), egui::Button::new(format!("Rebase {current} onto {name}"))).clicked() {
@@ -517,11 +558,14 @@ fn sidebar(
                             format!("Replay the commits of “{current}” on top of “{name}”? This rewrites the history of “{current}”."),
                             "Rebase",
                             false,
-                            Action::args(&path, format!("Rebase onto {name}"), &["rebase", &name]),
+                            Action::args(&path, format!("Rebase onto {name}"), &["rebase", &name]).undoable(git::Undoable::Tree { save_work: false }, format!("rebase onto {name}")),
                         ));
                     }
                     if ui.button("New branch from here…").clicked() {
                         actions.push(new_branch(&path, &name, &name));
+                    }
+                    if ui.button("Show reflog").on_hover_text("Everywhere this branch has pointed").clicked() {
+                        actions.push(Action::ShowReflog(Some(format!("refs/heads/{name}"))));
                     }
                     if !data.remotes.is_empty() && ui.button("Push").clicked() {
                         actions.push(push_action(&path, Some(&name), b.upstream.is_some(), data.remotes.first()));
@@ -536,7 +580,7 @@ fn sidebar(
                             format!("Delete the branch “{name}”? The commits stay if another branch contains them."),
                             "Delete",
                             true,
-                            Action::args(&path, format!("Delete {name}"), &["branch", "-d", &name]),
+                            Action::args(&path, format!("Delete {name}"), &["branch", "-d", &name]).undoable(git::Undoable::Refs, format!("delete branch {name}")),
                         ));
                     }
                     if ui.add_enabled(!b.is_head, egui::Button::new(RichText::new("Force delete…").color(DANGER))).clicked() {
@@ -545,7 +589,7 @@ fn sidebar(
                             format!("Delete “{name}” even if its commits aren't merged anywhere? They may be lost."),
                             "Force delete",
                             true,
-                            Action::args(&path, format!("Delete {name}"), &["branch", "-D", &name]),
+                            Action::args(&path, format!("Delete {name}"), &["branch", "-D", &name]).undoable(git::Undoable::Refs, format!("delete branch {name}")),
                         ));
                     }
                 });
@@ -769,7 +813,7 @@ fn sidebar(
                                     actions.push(checkout_remote(&path, &full, &local, exists));
                                 }
                                 if !current.is_empty() && ui.button(format!("Merge {full} into {current}")).clicked() {
-                                    actions.push(Action::args(&path, format!("Merge {full}"), &["merge", "--no-edit", &full]));
+                                    actions.push(Action::args(&path, format!("Merge {full}"), &["merge", "--no-edit", &full]).undoable(git::Undoable::Tree { save_work: false }, format!("merge {full}")));
                                 }
                                 if ui.button("New branch from here…").clicked() {
                                     actions.push(new_branch(&path, &full, &full));
@@ -849,7 +893,7 @@ fn sidebar(
                             format!("Delete the tag “{t}” from this computer?"),
                             "Delete",
                             true,
-                            Action::args(&path, format!("Delete tag {t}"), &["tag", "-d", &t]),
+                            Action::args(&path, format!("Delete tag {t}"), &["tag", "-d", &t]).undoable(git::Undoable::Refs, format!("delete tag {t}")),
                         ));
                     }
                 });
@@ -876,7 +920,7 @@ fn sidebar(
                             format!("Throw away the stashed changes “{}”?", s.message),
                             "Drop",
                             true,
-                            Action::args(&path, "Drop stash", &["stash", "drop", &r]),
+                            Action::args(&path, "Drop stash", &["stash", "drop", &r]).undoable(git::Undoable::Refs, format!("drop stash “{}”", s.message)),
                         ));
                     }
                 });
@@ -889,7 +933,7 @@ fn checkout_remote(path: &Path, full: &str, local: &str, exists: bool) -> Action
     if exists {
         checkout(path, local)
     } else {
-        Action::args(path, format!("Check out {full}"), &["checkout", "--track", full])
+        Action::args(path, format!("Check out {full}"), &["checkout", "--track", full]).undoable(git::Undoable::Tree { save_work: false }, format!("check out {full}"))
     }
 }
 
@@ -922,6 +966,7 @@ fn commit_list(ui: &mut Ui, rv: &mut RepoView, actions: &mut Vec<Action>) {
     let cur_row = match &rv.selection {
         Some(Selection::WorkingDir) | None => Some(0),
         Some(Selection::Commit(h)) => rv.filtered.iter().position(|&i| data.commits[i].hash == *h).map(|p| p + 1),
+        Some(Selection::Reflog) => None,
     };
     let mut scroll_offset = None;
     if !ui.ctx().text_edit_focused() && !ui.ctx().any_popup_open() {
@@ -1190,7 +1235,7 @@ fn commit_menu(ui: &mut Ui, path: &Path, data: &RepoData, c: &git::Commit, curre
             format!("Look at the files exactly as they were at {short}? You won't be on a branch until you switch back."),
             "Check out",
             false,
-            Action::args(path, format!("Check out {short}"), &["checkout", &hash]),
+            Action::args(path, format!("Check out {short}"), &["checkout", &hash]).undoable(git::Undoable::Tree { save_work: false }, format!("check out {short}")),
         ));
     }
     ui.separator();
@@ -1200,7 +1245,7 @@ fn commit_menu(ui: &mut Ui, path: &Path, data: &RepoData, c: &git::Commit, curre
             format!("Apply the changes of “{}” on top of {cur}?", c.summary),
             "Cherry-pick",
             false,
-            Action::args(path, format!("Cherry-pick {short}"), &["cherry-pick", &hash]),
+            Action::args(path, format!("Cherry-pick {short}"), &["cherry-pick", &hash]).undoable(git::Undoable::Tree { save_work: false }, format!("cherry-pick {short}")),
         ));
     }
     if ui.button("Undo this commit with a new commit (revert)").clicked() {
@@ -1209,9 +1254,30 @@ fn commit_menu(ui: &mut Ui, path: &Path, data: &RepoData, c: &git::Commit, curre
             format!("Create a new commit that undoes “{}”?", c.summary),
             "Revert",
             false,
-            Action::args(path, format!("Revert {short}"), &["revert", "--no-edit", &hash]),
+            Action::args(path, format!("Revert {short}"), &["revert", "--no-edit", &hash]).undoable(git::Undoable::Tree { save_work: false }, format!("revert {short}")),
         ));
     }
+    reset_menu(ui, path, data, &hash, actions);
+    ui.separator();
+    if ui.button("Copy commit id").clicked() {
+        actions.push(Action::Copy(hash.clone()));
+    }
+    if ui.button("Copy message").clicked() {
+        actions.push(Action::Copy(c.summary.clone()));
+    }
+}
+
+/// "Move <branch> to this commit", with the three kinds of reset. The confirmation
+/// names what moves, from where to where.
+fn reset_menu(ui: &mut Ui, path: &Path, data: &RepoData, hash: &str, actions: &mut Vec<Action>) {
+    let head = &data.status.head;
+    let short = &hash[..hash.len().min(7)];
+    let cur = head.branch.clone().unwrap_or_else(|| "the current position".into());
+    let moves = match (&head.branch, head.oid.as_deref()) {
+        (_, Some(o)) if o == hash => format!("{} is already at {short}.", head.branch.as_deref().unwrap_or("HEAD")),
+        (b, Some(o)) => format!("{} moves from {} to {short}.", b.as_deref().unwrap_or("HEAD (detached)"), &o[..o.len().min(7)]),
+        (b, None) => format!("{} moves to {short}.", b.as_deref().unwrap_or("HEAD")),
+    };
     ui.menu_button(format!("Move {cur} to this commit"), |ui| {
         for (mode, label, desc, danger) in [
             ("--soft", "Keep all changes, staged", "Your later commits' changes stay staged, ready to commit again.", false),
@@ -1222,21 +1288,19 @@ fn commit_menu(ui: &mut Ui, path: &Path, data: &RepoData, c: &git::Commit, curre
             if ui.button(text).on_hover_text(desc).clicked() {
                 actions.push(Action::confirm(
                     "Reset branch",
-                    format!("Move {cur} back to {short}?\n\n{desc}"),
+                    format!("Move {cur} to {short}?\n\n{moves}\n{desc}\n\nYou can undo this afterwards (Ctrl+Z)."),
                     "Reset",
                     danger,
-                    Action::args(path, format!("Reset to {short}"), &["reset", mode, &hash]),
+                    Action::args(path, format!("Reset to {short}"), &["reset", mode, hash]).undoable(reset_undo(mode), format!("reset {cur} to {short}")),
                 ));
             }
         }
     });
-    ui.separator();
-    if ui.button("Copy commit id").clicked() {
-        actions.push(Action::Copy(hash.clone()));
-    }
-    if ui.button("Copy message").clicked() {
-        actions.push(Action::Copy(c.summary.clone()));
-    }
+}
+
+/// What a `git reset` in this mode changes.
+fn reset_undo(mode: &str) -> git::Undoable {
+    if mode == "--hard" { git::Undoable::Tree { save_work: true } } else { git::Undoable::Index }
 }
 
 fn paint_row_bg(p: &egui::Painter, rect: Rect, selected: bool, hovered: bool) {
@@ -1277,6 +1341,121 @@ pub fn trunc(p: &egui::Painter, text: &str, font: egui::FontId, color: Color32, 
     let mut job = LayoutJob::single_section(text.to_string(), TextFormat::simple(font, color));
     job.wrap = TextWrapping { max_width: max_w.max(10.0), max_rows: 1, break_anywhere: true, overflow_character: Some('…') };
     p.layout_job(job)
+}
+
+// ---------------------------------------------------------------------------
+// Reflog
+
+fn reflog_panel(ui: &mut Ui, rv: &mut RepoView, actions: &mut Vec<Action>) {
+    let path = rv.path.clone();
+    let Some(data) = &rv.data else { return };
+    let shown = rv.reflog_ref.clone();
+    egui::Frame::new().inner_margin(Margin::symmetric(16, 12)).show(ui, |ui| {
+        ui.horizontal(|ui| {
+            ui.label(RichText::new("REFLOG").size(11.5).strong().color(DIM));
+            ui.add_space(6.0);
+            let picker = egui::ComboBox::from_id_salt(("reflog_ref", &path))
+                .selected_text(shown.strip_prefix("refs/heads/").unwrap_or(&shown))
+                .width(180.0)
+                .show_ui(ui, |ui| {
+                    if ui.selectable_label(shown == "HEAD", "HEAD").clicked() {
+                        actions.push(Action::ShowReflog(Some("HEAD".into())));
+                    }
+                    for b in data.branches.iter().filter(|b| !b.remote) {
+                        let full = format!("refs/heads/{}", b.name);
+                        if ui.selectable_label(shown == full, &b.name).clicked() {
+                            actions.push(Action::ShowReflog(Some(full)));
+                        }
+                    }
+                });
+            picker.response.widget_info(|| egui::WidgetInfo::labeled(egui::Role::ComboBox, true, format!("Reflog of {shown}")));
+        });
+        ui.add_space(4.0);
+        ui.label(RichText::new("Everywhere it has pointed, newest first. Right-click an entry to get back to it.").small().color(FAINT));
+    });
+    let list = match &rv.reflog {
+        None => {
+            ui.add_space(40.0);
+            ui.vertical_centered(|ui| ui.add(egui::Spinner::new().size(20.0).color(ACCENT)));
+            return;
+        }
+        Some(Err(e)) => {
+            ui.add_space(20.0);
+            ui.vertical_centered(|ui| ui.label(RichText::new(format!("Couldn't read the reflog\n{e}")).color(WARN)));
+            return;
+        }
+        Some(Ok(list)) if list.is_empty() => {
+            ui.add_space(20.0);
+            ui.vertical_centered(|ui| ui.label(RichText::new("Nothing recorded yet").color(FAINT)));
+            return;
+        }
+        Some(Ok(list)) => list,
+    };
+    egui::ScrollArea::vertical().auto_shrink(false).show_rows(ui, ROW_H, list.len(), |ui, range| {
+        ui.spacing_mut().item_spacing.y = 0.0;
+        for e in &list[range] {
+            reflog_row(ui, &path, data, e, actions);
+        }
+    });
+}
+
+fn reflog_color(action: &str) -> Color32 {
+    match action.split([' ', ':']).next().unwrap_or("") {
+        "commit" => ACCENT,
+        "reset" => WARN,
+        "checkout" => BLUE,
+        "merge" | "pull" | "rebase" | "cherry-pick" | "revert" => PURPLE,
+        _ => DIM,
+    }
+}
+
+fn reflog_row(ui: &mut Ui, path: &Path, data: &RepoData, e: &git::ReflogEntry, actions: &mut Vec<Action>) {
+    let w = ui.available_width();
+    let (rect, resp) = ui.allocate_exact_size(vec2(w, ROW_H), Sense::click());
+    let short = &e.hash[..e.hash.len().min(7)];
+    name_it(&resp, egui::Role::Button, format!("{short} {}: {}", e.action, e.message));
+    let p = ui.painter();
+    paint_row_bg(p, rect, false, resp.hovered());
+    let y = rect.center().y;
+    let mut x = rect.left() + 16.0;
+    p.text(pos2(x, y), Align2::LEFT_CENTER, short, theme::mono(12.0), DIM);
+    x += 64.0;
+    let action = trunc(p, &e.action, theme::prop(12.0), reflog_color(&e.action), 110.0);
+    let aw = action.size().x;
+    p.galley(pos2(x, y - action.size().y / 2.0), action, TEXT);
+    x += aw.max(70.0) + 10.0;
+    let when = p.layout_no_wrap(theme::relative(e.time), theme::prop(12.0), FAINT);
+    let when_w = when.size().x;
+    p.galley(pos2(rect.right() - 16.0 - when_w, y - when.size().y / 2.0), when, FAINT);
+    let msg_w = (rect.right() - 28.0 - when_w - x).max(0.0);
+    let msg = trunc(p, &e.message, theme::prop(13.0), TEXT, msg_w);
+    p.galley(pos2(x, y - msg.size().y / 2.0), msg, TEXT);
+
+    let in_history = data.commits.iter().any(|c| c.hash == e.hash);
+    if resp.double_clicked() && in_history {
+        actions.push(Action::SelectCommit(e.hash.clone()));
+    }
+    let tip = if in_history { "Double-click to show it in the history · right-click for options" } else { "Not on any branch any more · right-click for options" };
+    resp.on_hover_text(format!("{}\n{}\n{tip}", e.hash, theme::date_time(e.time))).context_menu(|ui| {
+        if ui.button("New branch here…").clicked() {
+            actions.push(new_branch(path, &e.hash, &format!("commit {short}")));
+        }
+        if ui.button("Check out (detached)…").clicked() {
+            actions.push(Action::confirm(
+                "Check out commit",
+                format!("Look at the files exactly as they were at {short}? You won't be on a branch until you switch back."),
+                "Check out",
+                false,
+                Action::args(path, format!("Check out {short}"), &["checkout", "--detach", &e.hash])
+                    .undoable(git::Undoable::Tree { save_work: false }, format!("check out {short}")),
+            ));
+        }
+        reset_menu(ui, path, data, &e.hash, actions);
+        ui.separator();
+        if ui.button("Copy commit id").clicked() {
+            actions.push(Action::Copy(e.hash.clone()));
+        }
+    });
 }
 
 // ---------------------------------------------------------------------------
@@ -1576,10 +1755,10 @@ fn staging_panel(ui: &mut Ui, rv: &mut RepoView, actions: &mut Vec<Action>) {
                         };
                                     actions.push(Action::confirm(
                                         "Discard changes",
-                                        format!("Really {what}?\n\n{}\n\nThis can't be undone.", f.path),
+                                        format!("Really {what}?\n\n{}\n\n{}", f.path, discard_note(f)),
                                         "Discard",
                                         true,
-                                        Action::git(&path, format!("Discard {}", f.path), move |p| git::discard(p, &fc)),
+                                        discard_file(&path, fc),
                                     ));
                                 }
                             }
@@ -1640,16 +1819,19 @@ fn staging_panel(ui: &mut Ui, rv: &mut RepoView, actions: &mut Vec<Action>) {
                     let msg = rv.commit_msg.clone();
                     let amend = rv.amend;
                     if (ui.add_enabled(can, btn).on_hover_text(tip).on_disabled_hover_text(tip).clicked() || (submit && can)) && can {
+                        let what = format!("{} “{}”", if amend { "amend" } else { "commit" }, msg.lines().next().unwrap_or("").trim());
                         actions.push(Action::Git {
                             repo: path.clone(),
                             label: if amend { "Amend commit".into() } else { "Commit".into() },
                             op: Box::new(move |p| git::commit(p, &msg, amend)),
                             kind: OpKind::Commit,
+                            record: Some(Record { undo: git::Undoable::Refs, what }),
                         });
                     }
                     if staged_n == 0 && unstaged_n > 0 && !rv.amend {
                         let msg = rv.commit_msg.clone();
                         if ui.add_enabled(has_msg && !conflicts, egui::Button::new("Stage all & commit")).on_hover_text("Include every change in this commit").clicked() {
+                            let what = format!("commit “{}”", msg.lines().next().unwrap_or("").trim());
                             actions.push(Action::Git {
                                 repo: path.clone(),
                                 label: "Commit".into(),
@@ -1658,6 +1840,7 @@ fn staging_panel(ui: &mut Ui, rv: &mut RepoView, actions: &mut Vec<Action>) {
                                     git::commit(p, &msg, false)
                                 }),
                                 kind: OpKind::Commit,
+                                record: Some(Record { undo: git::Undoable::Refs, what }),
                             });
                         }
                     }
@@ -1715,7 +1898,7 @@ fn amend_checkbox(ui: &mut Ui, amend: bool, actions: &mut Vec<Action>) {
 
 fn quiet(a: Action) -> Action {
     match a {
-        Action::Git { repo, label, op, .. } => Action::Git { repo, label, op, kind: OpKind::Quiet },
+        Action::Git { repo, label, op, record, .. } => Action::Git { repo, label, op, kind: OpKind::Quiet, record },
         other => other,
     }
 }
@@ -1854,13 +2037,32 @@ fn file_action(repo: &Path, button: &str, f: git::FileChange) -> Action {
             };
             Action::confirm(
                 "Discard changes",
-                format!("Really {what}?\n\n{path}\n\nThis can't be undone."),
+                format!("Really {what}?\n\n{path}\n\n{}", discard_note(&f)),
                 "Discard",
                 true,
-                Action::git(repo, format!("Discard {path}"), move |r| git::discard(r, &f)),
+                discard_file(repo, f),
             )
         }
     }
+}
+
+/// Discard a whole file, saving it first so the discard can be undone (not for
+/// submodules: putting one back moves the submodule, not a file).
+fn discard_file(repo: &Path, f: FileChange) -> Action {
+    let path = f.path.clone();
+    let a = Action::git(repo, format!("Discard {path}"), {
+        let f = f.clone();
+        move |r| git::discard(r, &f)
+    });
+    if f.submodule {
+        return a;
+    }
+    let what = if f.change == Change::Untracked { format!("delete {path}") } else { format!("discard changes to {path}") };
+    a.undoable(git::Undoable::Files(vec![path]), what)
+}
+
+fn discard_note(f: &FileChange) -> &'static str {
+    if f.submodule { "This can't be undone." } else { "You can undo this afterwards (Ctrl+Z)." }
 }
 
 /// "N files · +a −r" with Collapse all / Expand all. Returns Some(fold everything?) when clicked.
@@ -1943,10 +2145,11 @@ fn line_bar(ui: &mut Ui, doc: &DiffDoc, sel: &mut LineSel, repo: &Path, actions:
                     let (f, p) = (file.clone(), picked.clone());
                     actions.push(Action::confirm(
                         "Discard lines",
-                        format!("Throw away the changes on the {n} picked line{} from your file? This can't be undone.", if n == 1 { "" } else { "s" }),
+                        format!("Throw away the changes on the {n} picked line{} from your file? You can undo this afterwards (Ctrl+Z).", if n == 1 { "" } else { "s" }),
                         "Discard",
                         true,
-                        Action::git(repo, "Discard lines", move |r| git::discard_lines(r, &f, &p)),
+                        Action::git(repo, "Discard lines", move |r| git::discard_lines(r, &f, &p))
+                            .undoable(git::Undoable::Files(vec![file.path.clone()]), format!("discard {n} line{} in {}", if n == 1 { "" } else { "s" }, file.path)),
                     ));
                 }
                 let untracked = mode == DiffMode::Untracked;
@@ -2177,14 +2380,16 @@ pub fn diff_view(
                             x -= w + 4.0;
                             if row_button(ui, br, b, bi == 1, RAISED, ("hunk_btn", fi, hi, *b)).clicked() {
                                 let Some(patch) = doc.files[fi].hunk_patch(hi) else { continue };
+                                let file_path = doc.files[fi].path.clone();
                                 match (mode, bi) {
                                     (DiffMode::Unstaged, 0) => actions.push(quiet(Action::git(repo, "Stage hunk", move |r| git::apply_hunk(r, &patch, false, true)))),
                                     (DiffMode::Unstaged, _) => actions.push(Action::confirm(
                                         "Discard hunk",
-                                        "Throw away this block of changes from your file? This can't be undone.".into(),
+                                        "Throw away this block of changes from your file? You can undo this afterwards (Ctrl+Z).".into(),
                                         "Discard",
                                         true,
-                                        Action::git(repo, "Discard hunk", move |r| git::apply_hunk(r, &patch, true, false)),
+                                        Action::git(repo, "Discard hunk", move |r| git::apply_hunk(r, &patch, true, false))
+                                            .undoable(git::Undoable::Files(vec![file_path.clone()]), format!("discard hunk in {file_path}")),
                                     )),
                                     _ => actions.push(quiet(Action::git(repo, "Unstage hunk", move |r| git::apply_hunk(r, &patch, true, true)))),
                                 }

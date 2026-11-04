@@ -6,6 +6,7 @@
 mod app;
 mod git;
 mod graph;
+mod oplog;
 mod overview;
 mod resolver;
 mod samples;

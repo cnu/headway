@@ -432,6 +432,7 @@ fn continue_action(repo: &Path, kind: OpType, message: &str) -> Action {
         op: Box::new(move |p| git::continue_operation(p, kind, msg.as_deref())),
         // Clears the commit box once it's done.
         kind: OpKind::Commit,
+        record: None,
     }
 }
 

@@ -1650,3 +1650,93 @@ fn a_conflicting_stash_pop_uses_the_names_git_gave_each_side() {
     assert_eq!(std::fs::read_to_string(r.join("a.txt")).unwrap(), "stashed\n");
     assert!(!shows(&h, "← Back to changes"));
 }
+
+// ---------------------------------------------------------------------------
+// Undo and the reflog
+
+#[test]
+fn toast_undo_button_brings_discarded_lines_back() {
+    let s = scratch("undo-toast");
+    let r = new_repo(&s.root, "shop");
+    commit(&r, "a.txt", "one\ntwo\n", "Start shop");
+    let edited = "one\nNEW LINE\ntwo\n";
+    write(&r, "a.txt", edited);
+    let mut h = app(&s, &[&r], true);
+
+    click(&mut h, "line NEW LINE");
+    click(&mut h, "Discard lines");
+    click_last(&mut h, "Discard");
+    assert_eq!(std::fs::read_to_string(r.join("a.txt")).unwrap(), "one\ntwo\n");
+    assert!(shows(&h, "Discard lines: done"));
+
+    click(&mut h, "Undo");
+    assert_eq!(std::fs::read_to_string(r.join("a.txt")).unwrap(), edited);
+    assert!(shows(&h, "Undid discard 1 line in a.txt"));
+    // Nothing left to undo: the shortcut says so instead of guessing.
+    ctrl(&mut h, egui::Key::Z);
+    assert!(shows(&h, "Nothing to undo"));
+}
+
+#[test]
+fn undo_from_the_menu_and_with_the_shortcut() {
+    let s = scratch("undo-menu");
+    let r = new_repo(&s.root, "shop");
+    commit(&r, "a.txt", "one\n", "Start shop");
+    git_ok(&r, &["branch", "feature"]);
+    write(&r, "b.txt", "two\n");
+    git_ok(&r, &["add", "-A"]);
+    let mut h = app(&s, &[&r], true);
+
+    type_into(&mut h, "Describe your change", "Add cart page");
+    click(&mut h, "Commit 1 file to main");
+    assert_eq!(head_subject(&r), "Add cart page");
+
+    // The repository menu says what Undo will take back.
+    click(&mut h, "Repository menu");
+    h.get_all_by_label_contains("Undo: commit “Add cart page”").next().expect("the menu names the commit").click();
+    settle(&mut h);
+    assert_eq!(head_subject(&r), "Start shop");
+    assert_eq!(staged_files(&r), ["b.txt"], "the undone commit's changes are staged again");
+
+    // Delete a branch, then Ctrl+Z.
+    right_click(&mut h, "feature");
+    click(&mut h, "Force delete…");
+    click_last(&mut h, "Force delete");
+    assert!(git::run(&r, &["rev-parse", "--verify", "-q", "feature"]).is_err());
+    ctrl(&mut h, egui::Key::Z);
+    assert_eq!(git_ok(&r, &["rev-parse", "feature"]), git_ok(&r, &["rev-parse", "main"]));
+    assert!(shows(&h, "Undid delete branch feature"));
+}
+
+#[test]
+fn reflog_finds_a_lost_commit_and_resets_to_it() {
+    let s = scratch("reflog");
+    let r = new_repo(&s.root, "shop");
+    commit(&r, "a.txt", "one\n", "Start shop");
+    commit(&r, "b.txt", "two\n", "Add cart page");
+    git_ok(&r, &["reset", "-q", "--hard", "HEAD~1"]);
+    let mut h = app(&s, &[&r], true);
+    assert!(!shows(&h, "Add cart page"), "the commit left the history");
+
+    click(&mut h, "Reflog");
+    assert!(shows_containing(&h, "reset: moving to HEAD~1"));
+    h.get_all_by_label_contains("commit: Add cart page").next().expect("the lost commit is in the reflog").click_secondary();
+    settle(&mut h);
+    hover(&mut h, "Move main to this commit");
+    click(&mut h, "Discard everything after it");
+    assert!(shows_containing(&h, "main moves from"), "the confirmation names what moves");
+    click_last(&mut h, "Reset");
+    assert_eq!(head_subject(&r), "Add cart page");
+    assert!(shows(&h, "Add cart page"));
+
+    // And back again from the notification.
+    click(&mut h, "Undo");
+    assert_eq!(head_subject(&r), "Start shop");
+
+    // Another branch's reflog, picked from the list.
+    git_ok(&r, &["branch", "topic"]);
+    ctrl(&mut h, egui::Key::R);
+    click(&mut h, "Reflog of HEAD");
+    click_last(&mut h, "topic");
+    assert!(shows_containing(&h, "branch: Created from"));
+}

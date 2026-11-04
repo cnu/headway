@@ -42,6 +42,8 @@ pub struct RepoData {
     pub limit: usize,
     /// A merge, rebase, cherry-pick or revert waiting to be continued or aborted.
     pub operation: Option<git::Operation>,
+    /// What Undo would take back.
+    pub undo: Option<git::UndoEntry>,
 }
 
 fn load_repo(path: &Path, limit: usize, hidden: Vec<String>) -> Result<RepoData, String> {
@@ -83,7 +85,8 @@ fn load_repo(path: &Path, limit: usize, hidden: Vec<String>) -> Result<RepoData,
         let remote_tips: Vec<&str> =
             commits.iter().filter(|c| c.refs.iter().any(|r| r.kind == git::RefKind::Remote)).map(|c| c.hash.as_str()).collect();
         let pushed = reachable(&commits, remote_tips.into_iter());
-        Ok(RepoData { status, commits, graph, branches, tags, stashes, remotes, worktrees, remote_urls, submodules, on_branch, pushed, hidden: hidden.clone(), limit, operation })
+        let undo = crate::oplog::latest(path);
+        Ok(RepoData { status, commits, graph, branches, tags, stashes, remotes, worktrees, remote_urls, submodules, on_branch, pushed, hidden: hidden.clone(), limit, operation, undo })
     })
 }
 
@@ -114,6 +117,8 @@ pub struct Summary {
     pub worktrees: Vec<WorktreeInfo>,
     /// Number of submodules, and how many aren't set up yet.
     pub submodules: (usize, usize),
+    /// What Undo would take back: (entry id, what was done).
+    pub undo: Option<(u64, String)>,
 }
 
 /// A worktree shown inside its main repository's card.
@@ -181,7 +186,8 @@ fn load_summary(path: &Path) -> Result<Summary, String> {
     };
     let subs = git::submodules(path).unwrap_or_default();
     let submodules = (subs.len(), subs.iter().filter(|s| s.state == git::SubState::NotSetUp).count());
-    Ok(Summary { status, last, has_remote, linked_worktree, canonical: canon(path), main_repo, worktrees, submodules })
+    let undo = crate::oplog::latest(path).map(|e| (e.id, e.what));
+    Ok(Summary { status, last, has_remote, linked_worktree, canonical: canon(path), main_repo, worktrees, submodules, undo })
 }
 
 // ---------------------------------------------------------------------------
@@ -342,6 +348,8 @@ impl DiffDoc {
 pub enum Selection {
     WorkingDir,
     Commit(String),
+    /// The reflog of `RepoView::reflog_ref`.
+    Reflog,
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -394,6 +402,10 @@ pub struct RepoView {
     /// The conflict resolver, when open (it replaces history and details).
     pub resolver: Option<Resolver>,
     conflict_gen: u64,
+    /// Whose reflog is shown: "HEAD" or a full branch name.
+    pub reflog_ref: String,
+    pub reflog: Option<Result<Vec<git::ReflogEntry>, String>>,
+    reflog_gen: u64,
 }
 
 impl RepoView {
@@ -423,6 +435,9 @@ impl RepoView {
             list_view: (0.0, 0.0),
             resolver: None,
             conflict_gen: 0,
+            reflog_ref: "HEAD".into(),
+            reflog: None,
+            reflog_gen: 0,
         }
     }
 
@@ -467,6 +482,7 @@ enum Msg {
     WorkDiff(PathBuf, u64, Result<DiffDoc, String>),
     /// Conflicted files read for the resolver.
     Conflicts(PathBuf, u64, Vec<(String, Result<git::ConflictFile, String>)>),
+    Reflog(PathBuf, u64, Result<Vec<git::ReflogEntry>, String>),
     SamplesReady,
     /// A folder was chosen to add; carries the repositories found in it.
     Picked(PathBuf, Vec<PathBuf>),
@@ -476,7 +492,8 @@ enum Msg {
     LastMessage(PathBuf, String),
     /// A commit's full message, read to open the "Edit commit message" dialog.
     EditMessage { repo: PathBuf, hash: String, message: Result<String, String> },
-    OpDone { id: u64, repo: PathBuf, label: String, result: Result<String, String>, kind: OpKind },
+    /// `undo`: the operation log entry the action left, if it can be undone.
+    OpDone { id: u64, repo: PathBuf, label: String, result: Result<String, String>, kind: OpKind, undo: Option<u64> },
     Cloned(u64, Result<PathBuf, String>),
 }
 
@@ -487,6 +504,15 @@ pub enum OpKind {
     Quiet,
     /// A commit message was edited; the output is the commit's new id, to select it.
     Reword,
+    /// An undo; the output says what was undone.
+    Undo,
+}
+
+/// Save what a git action changes, so it can be undone.
+pub struct Record {
+    pub undo: git::Undoable,
+    /// What the action does, to follow "Undo: " ("discard hunk in src/app.rs").
+    pub what: String,
 }
 
 pub enum Action {
@@ -501,11 +527,13 @@ pub enum Action {
     SelectCommit(String),
     SelectRef(String),
     SelectWorkingDir,
+    /// Show the reflog, of HEAD or a full branch name (None: the one shown last).
+    ShowReflog(Option<String>),
     SelectFile(FileSel),
     /// Open a conflicted file (by path) in the resolver.
     OpenConflict(String),
     CloseResolver,
-    Git { repo: PathBuf, label: String, op: GitFn, kind: OpKind },
+    Git { repo: PathBuf, label: String, op: GitFn, kind: OpKind, record: Option<Record> },
     /// A git action with something to do in the app once it succeeds.
     GitThen { repo: PathBuf, label: String, op: GitFn, then: FollowUp },
     /// Add a worktree folder to the workspace (if needed) and open it.
@@ -514,6 +542,8 @@ pub enum Action {
     ToggleHidden(String),
     /// Show every hidden branch of the open repository again.
     ShowAllBranches,
+    /// Undo the newest entry in a repository's operation log (only if it's still entry `id`).
+    Undo { repo: PathBuf, id: Option<u64> },
     /// Open the "Edit commit message" dialog for this commit of the open repository.
     EditMessage(String),
     LoadMore,
@@ -527,7 +557,16 @@ pub enum Action {
 
 impl Action {
     pub fn git(repo: &Path, label: impl Into<String>, op: impl FnOnce(&Path) -> GitResult<String> + Send + 'static) -> Self {
-        Action::Git { repo: repo.to_path_buf(), label: label.into(), op: Box::new(op), kind: OpKind::Normal }
+        Action::Git { repo: repo.to_path_buf(), label: label.into(), op: Box::new(op), kind: OpKind::Normal, record: None }
+    }
+
+    /// Save what this git action changes first, so it can be undone. `what` follows
+    /// "Undo: " in menus.
+    pub fn undoable(self, undo: git::Undoable, what: impl Into<String>) -> Self {
+        match self {
+            Action::Git { repo, label, op, kind, .. } => Action::Git { repo, label, op, kind, record: Some(Record { undo, what: what.into() }) },
+            other => other,
+        }
     }
 
     /// A git action that just runs these arguments.
@@ -588,6 +627,8 @@ struct Toast {
     text: String,
     error: bool,
     until: f64,
+    /// Offers Undo for this repository's operation log entry.
+    undo: Option<(PathBuf, u64)>,
 }
 
 struct Shot {
@@ -789,6 +830,15 @@ impl HeadwayApp {
         });
     }
 
+    /// Read the shown reflog in the background.
+    fn load_reflog(&mut self, path: &Path) {
+        let Some(rv) = self.tabs.get_mut(path) else { return };
+        rv.reflog_gen += 1;
+        let generation = rv.reflog_gen;
+        let (p, r) = (path.to_path_buf(), rv.reflog_ref.clone());
+        self.spawn(move || Msg::Reflog(p.clone(), generation, git::reflog(&p, &r, 1000)));
+    }
+
     /// Read conflicted files for the resolver in the background.
     fn load_conflicts(&mut self, path: &Path, files: Vec<(String, git::ConflictKind)>) {
         let Some(rv) = self.tabs.get_mut(path) else { return };
@@ -809,19 +859,35 @@ impl HeadwayApp {
 
     fn toast(&mut self, text: impl Into<String>, error: bool) {
         let now = self.ctx.input(|i| i.time);
-        self.toasts.push(Toast { text: text.into(), error, until: now + if error { 8.0 } else { 3.5 } });
+        self.toasts.push(Toast { text: text.into(), error, until: now + if error { 8.0 } else { 3.5 }, undo: None });
         if self.toasts.len() > 4 {
             self.toasts.remove(0);
         }
     }
 
-    fn run_git(&mut self, repo: PathBuf, label: String, op: GitFn, kind: OpKind) -> u64 {
+    /// A notification with an Undo button (shown a little longer, to give time to click it).
+    fn toast_undo(&mut self, text: impl Into<String>, repo: PathBuf, id: u64) {
+        self.toast(text, false);
+        if let Some(t) = self.toasts.last_mut() {
+            t.until += 3.0;
+            t.undo = Some((repo, id));
+        }
+    }
+
+    fn run_git(&mut self, repo: PathBuf, label: String, op: GitFn, kind: OpKind, record: Option<Record>) -> u64 {
         let id = self.next_id;
         self.next_id += 1;
         self.busy.push((id, repo.clone(), label.clone()));
         self.spawn(move || {
-            let result = op(&repo);
-            Msg::OpDone { id, repo, label, result, kind }
+            // An undoable action saves what it changes first, on this same worker.
+            let (result, undo) = match record {
+                None => (op(&repo), None),
+                Some(r) => match crate::oplog::run_recorded(&repo, &r.undo, &r.what, op) {
+                    Ok((out, entry)) => (Ok(out), entry.map(|e| e.id)),
+                    Err(e) => (Err(e), None),
+                },
+            };
+            Msg::OpDone { id, repo, label, result, kind, undo }
         });
         id
     }
@@ -895,7 +961,7 @@ impl HeadwayApp {
                                     }
                                     rv.wd_doc = Some(doc);
                                 }
-                                Err(e) => self.toasts.push(Toast { text: format!("Couldn't read the changes\n{e}"), error: true, until: self.ctx.input(|i| i.time) + 8.0 }),
+                                Err(e) => self.toasts.push(Toast { text: format!("Couldn't read the changes\n{e}"), error: true, until: self.ctx.input(|i| i.time) + 8.0, undo: None }),
                             }
                             rv.line_sel = LineSel::default();
                         }
@@ -906,6 +972,11 @@ impl HeadwayApp {
                         && let Some(res) = rv.resolver.as_mut().filter(|_| rv.conflict_gen == generation)
                     {
                         res.loaded(files);
+                    }
+                }
+                Msg::Reflog(path, generation, res) => {
+                    if let Some(rv) = self.tabs.get_mut(&path).filter(|rv| rv.reflog_gen == generation) {
+                        rv.reflog = Some(res);
                     }
                 }
                 Msg::SamplesReady => {
@@ -946,7 +1017,7 @@ impl HeadwayApp {
                         }
                     }
                 }
-                Msg::OpDone { id, repo, label, result, kind } => {
+                Msg::OpDone { id, repo, label, result, kind, undo } => {
                     self.busy.retain(|b| b.0 != id);
                     let follow = self.followups.remove(&id);
                     match result {
@@ -969,18 +1040,25 @@ impl HeadwayApp {
                                     rv.detail = None;
                                 }
                             }
-                            if kind != OpKind::Quiet {
+                            if kind != OpKind::Quiet || undo.is_some() {
                                 let extra = out.lines().rev().find(|l| !l.trim().is_empty()).unwrap_or("");
                                 let msg = if kind == OpKind::Reword {
                                     "Commit message updated".to_string()
-                                } else if extra.len() < 90 && !extra.is_empty() && kind != OpKind::Commit {
+                                } else if kind == OpKind::Undo {
+                                    out.trim().to_string()
+                                } else if extra.len() < 90 && !extra.is_empty() && kind != OpKind::Commit && kind != OpKind::Quiet {
                                     format!("{label}: done — {}", extra.trim())
                                 } else {
                                     format!("{label}: done")
                                 };
-                                self.toast(msg, false);
+                                match undo {
+                                    Some(entry) => self.toast_undo(msg, repo.clone(), entry),
+                                    None => self.toast(msg, false),
+                                }
                             }
                         }
+                        // Undo explains itself; git's hints would only confuse.
+                        Err(e) if kind == OpKind::Undo => self.toast(format!("Couldn't undo\n{e}"), true),
                         Err(e) => self.toast(format!("{label} failed\n{}", friendly_error(&e)), true),
                     }
                     if self.tabs.contains_key(&repo) {
@@ -1005,6 +1083,7 @@ impl HeadwayApp {
     fn on_repo_loaded(&mut self, path: PathBuf, res: Result<RepoData, String>) {
         let mut want_detail = None;
         let mut want_wd = false;
+        let mut want_reflog = false;
         let mut want_conflicts = Vec::new();
         {
             let Some(rv) = self.tabs.get_mut(&path) else { return };
@@ -1059,6 +1138,14 @@ impl HeadwayApp {
                             rv.file_sel = sel;
                             want_wd = true;
                         }
+                        Some(Selection::Reflog) => {
+                            // A deleted branch has no reflog left: go back to HEAD's.
+                            let gone = rv.reflog_ref != "HEAD" && !data.branches.iter().any(|b| !b.remote && format!("refs/heads/{}", b.name) == rv.reflog_ref);
+                            if gone {
+                                rv.reflog_ref = "HEAD".into();
+                            }
+                            want_reflog = true;
+                        }
                         None => {}
                     }
                     // Resolved files leave the resolver (keeping unsaved choices in the
@@ -1080,6 +1167,9 @@ impl HeadwayApp {
         }
         if want_wd {
             self.load_work_diff(&path);
+        }
+        if want_reflog {
+            self.load_reflog(&path);
         }
         if !want_conflicts.is_empty() {
             self.load_conflicts(&path, want_conflicts);
@@ -1215,6 +1305,18 @@ impl HeadwayApp {
                 }
                 self.load_work_diff(&p);
             }
+            Action::ShowReflog(name) => {
+                let Some(p) = active else { return };
+                let Some(rv) = self.tabs.get_mut(&p) else { return };
+                rv.selection = Some(Selection::Reflog);
+                if let Some(n) = name {
+                    if n != rv.reflog_ref {
+                        rv.reflog_ref = n;
+                        rv.reflog = None;
+                    }
+                }
+                self.load_reflog(&p);
+            }
             Action::SelectFile(sel) => {
                 // Highlight it in the list, unfold it and scroll the stacked view to it.
                 let Some(p) = active else { return };
@@ -1262,12 +1364,18 @@ impl HeadwayApp {
                     res.shown = false;
                 }
             }
-            Action::Git { repo, label, op, kind } => {
-                self.run_git(repo, label, op, kind);
+            Action::Git { repo, label, op, kind, record } => {
+                self.run_git(repo, label, op, kind, record);
             }
             Action::GitThen { repo, label, op, then } => {
-                let id = self.run_git(repo, label, op, OpKind::Normal);
+                let id = self.run_git(repo, label, op, OpKind::Normal, None);
                 self.followups.insert(id, then);
+            }
+            Action::Undo { repo, id } => {
+                // One at a time: a second press would race the first.
+                if !self.busy.iter().any(|b| b.1 == repo && b.2 == "Undo") {
+                    self.run_git(repo, "Undo".into(), Box::new(move |r| crate::oplog::undo(r, id)), OpKind::Undo, None);
+                }
             }
             Action::OpenWorktree(path) => self.add_repo(path, true),
             Action::ToggleHidden(full) => {
@@ -1335,7 +1443,7 @@ impl HeadwayApp {
                     if let Action::Git { repo, label, op, .. } = a {
                         let has_remote = matches!(self.summaries.get(&repo), Some(Ok(s)) if s.has_remote);
                         if has_remote {
-                            self.run_git(repo, label, op, OpKind::Quiet);
+                            self.run_git(repo, label, op, OpKind::Quiet, None);
                         }
                     }
                 }
@@ -1347,7 +1455,7 @@ impl HeadwayApp {
                     let ok = matches!(self.summaries.get(&r), Some(Ok(s)) if s.has_remote && s.status.head.upstream.is_some());
                     if ok {
                         let a = Action::args(&r, format!("Pull {}", git::repo_name(&r)), &["pull", "--ff-only"]);
-                        self.do_action(a);
+                        self.do_action(a.undoable(git::Undoable::Tree { save_work: false }, "pull"));
                     } else {
                         skipped += 1;
                     }
@@ -1371,6 +1479,7 @@ impl HeadwayApp {
                     label: format!("Create repository {}", git::repo_name(&dir)),
                     op: Box::new(|p| git::run(p, &["init"])),
                     kind: OpKind::Normal,
+                    record: None,
                 })),
             });
             // Added after init so it shows up straight away.
@@ -1484,7 +1593,7 @@ impl HeadwayApp {
         });
     }
 
-    fn toasts_ui(&mut self, ctx: &egui::Context) {
+    fn toasts_ui(&mut self, ctx: &egui::Context, actions: &mut Vec<Action>) {
         let now = ctx.input(|i| i.time);
         self.toasts.retain(|t| t.until > now);
         if self.toasts.is_empty() {
@@ -1511,9 +1620,16 @@ impl HeadwayApp {
                             ui.horizontal(|ui| {
                                 ui.label(RichText::new(icon).color(edge));
                                 ui.label(RichText::new(&t.text).color(TEXT));
+                                if let Some((repo, id)) = &t.undo {
+                                    if ui.button("Undo").clicked() {
+                                        actions.push(Action::Undo { repo: repo.clone(), id: Some(*id) });
+                                        dismiss = Some(i);
+                                    }
+                                }
                             });
                         });
-                    if r.response.interact(Sense::click()).clicked() {
+                    // Click to dismiss (not when there's a button: the click would go here instead).
+                    if t.undo.is_none() && r.response.interact(Sense::click()).clicked() {
                         dismiss = Some(i);
                     }
                     ui.add_space(6.0);
@@ -1793,6 +1909,7 @@ impl HeadwayApp {
                             label: "Edit commit message".into(),
                             op: Box::new(move |r| git::reword(r, &h, &m)),
                             kind: OpKind::Reword,
+                            record: Some(Record { undo: git::Undoable::Refs, what: format!("edit the message of {}", &hash[..hash.len().min(7)]) }),
                         });
                         keep = false;
                     }
@@ -1938,6 +2055,15 @@ impl eframe::App for HeadwayApp {
                 actions.push(Action::Refresh);
             }
         });
+        // Ctrl/Cmd+Z undoes the open repository's last action (text boxes keep their own undo).
+        if self.dialog.is_none() && !ctx.text_edit_focused() && ctx.input_mut(|i| i.consume_key(egui::Modifiers::COMMAND, egui::Key::Z)) {
+            if let Some(p) = self.active_path() {
+                match self.tabs.get(&p).and_then(|rv| rv.data.as_ref()).and_then(|d| d.undo.as_ref()) {
+                    Some(e) => actions.push(Action::Undo { repo: p, id: Some(e.id) }),
+                    None => self.toast("Nothing to undo", false),
+                }
+            }
+        }
 
         egui::Panel::top("workspace_bar")
             .exact_size(40.0)
@@ -1970,7 +2096,7 @@ impl eframe::App for HeadwayApp {
         });
 
         self.dialog_ui(&ctx, &mut actions);
-        self.toasts_ui(&ctx);
+        self.toasts_ui(&ctx, &mut actions);
 
         for a in actions {
             self.do_action(a);

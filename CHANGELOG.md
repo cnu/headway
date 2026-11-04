@@ -24,6 +24,20 @@ workflow uses that version's section as the GitHub release notes.
   choices. Take a whole side, or open your `merge.tool`. diff3 and zdiff3
   markers work.
   Development builds add a **price-rules** sample stopped in a conflicted merge.
+- **Undo**: commits, amends, message edits, resets, merges, rebases,
+  cherry-picks, reverts, pulls, checkouts, branch and tag deletes, stash drops
+  and discarded files, hunks or lines can be undone with Ctrl/Cmd+Z, the
+  repository's ⋯ menu ("Undo: discard hunk in src/app.rs") or the Undo button
+  on the notification. Discarded work is saved in git first, byte for byte,
+  new files included. Undo refuses, and says why, when it isn't safe: the
+  branch has moved or been pushed since, newer actions depend on it, or your
+  uncommitted changes would be overwritten. The last 100 actions per
+  repository are kept, across restarts.
+- **Reflog**: a sidebar item lists everywhere HEAD or a chosen branch has been,
+  with the action and when. Right-click an entry to create a branch there,
+  check it out, or move the current branch to it (the confirmation says what
+  moves from where). Development builds' **web-shop** sample has a commit only
+  the reflog can find.
 
 ## [0.1.0] - 2026-11-04
 

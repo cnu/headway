@@ -15,6 +15,7 @@ Headway is a desktop Git client for Linux, macOS and Windows. It groups the repo
 - **Staging** — every changed file stacked in one view; stage, unstage or discard whole files, hunks, or individual lines (click, shift-click or drag). Fold files, or collapse and expand them all.
 - **Merge conflicts** — a banner while a merge, rebase, cherry-pick or revert is in progress, with Continue, Abort and Skip. Walk through every conflict in the repository one at a time (Alt+↑/↓), taking either side (Alt+←/→), both, or your own edit, with the real branch names, line numbers, the common ancestor and a preview of the result; save every resolved file at once, or open your configured merge tool.
 - **Commits** — commit, amend, and edit the message of any earlier commit; later commits and every branch, tag and worktree pointing at them move along in one step.
+- **Undo** — Ctrl/Cmd+Z takes back commits, amends, resets, merges, rebases, checkouts, branch deletes, stash drops and discarded files, hunks or lines, and says why when it isn't safe. A **reflog** view finds lost commits and gets you back to them.
 - **Branches, tags, remotes, stashes, worktrees and submodules** — all in the sidebar, with the usual actions on a right-click.
 
 ## Install
@@ -58,7 +59,7 @@ cargo run -- --reset-sample web-shop
 
 Release builds leave the samples out entirely and start with an empty workspace.
 
-Settings and workspaces are saved to `workspaces.json` in your config folder (`~/.config/headway` on Linux).
+Settings and workspaces are saved to `workspaces.json` in your config folder (`~/.config/headway` on Linux). The undo log is kept per repository in `undo/` under your data folder (`~/.local/share/headway/undo` on Linux).
 
 ### Tests
 

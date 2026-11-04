@@ -7,6 +7,8 @@ use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 
+use serde::{Deserialize, Serialize};
+
 pub type GitResult<T> = Result<T, String>;
 
 fn base_cmd(repo: &Path) -> Command {
@@ -2011,6 +2013,463 @@ fn bases_from_index(repo: &Path, stages: &[IndexStage], marker_size: usize) -> G
     result
 }
 
+// ---------------------------------------------------------------------------
+// Undo: what an action changed, so it can be put back
+
+/// How an action's undo puts things back.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub enum UndoMode {
+    /// Only refs moved (commit, amend, reword, branch delete, stash drop): move them back.
+    /// The staging area is left alone, so an undone commit's changes are staged again.
+    Refs,
+    /// Refs and the staging area changed (reset --soft/--mixed): move the refs back and
+    /// restore the staging area. Files on disk are left alone.
+    Index,
+    /// Refs and files changed (reset --hard, checkout, merge, rebase, cherry-pick,
+    /// revert, pull): check the old files out the way `git checkout` would, then move
+    /// the refs back.
+    Tree,
+    /// Only files on disk changed (discards): write the saved copies back.
+    Files,
+}
+
+/// What to save before running an undoable action.
+#[derive(Clone, Debug, PartialEq)]
+pub enum Undoable {
+    Refs,
+    Index,
+    /// `save_work`: the action throws away uncommitted changes (reset --hard), so keep them.
+    Tree { save_work: bool },
+    /// These files (repository-relative) will change on disk.
+    Files(Vec<String>),
+}
+
+/// Where HEAD is: on a branch (full ref name) and/or at a commit.
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct HeadState {
+    pub branch: Option<String>,
+    pub oid: Option<String>,
+}
+
+/// Every local branch and tag, HEAD and the stashes, at one moment.
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct RefState {
+    pub head: HeadState,
+    pub refs: std::collections::BTreeMap<String, String>,
+    /// (commit, message), newest first.
+    pub stashes: Vec<(String, String)>,
+}
+
+pub fn ref_state(repo: &Path) -> GitResult<RefState> {
+    let refs = run(repo, &["for-each-ref", "--format=%(refname)%1f%(objectname)", "refs/heads", "refs/tags"])?
+        .lines()
+        .filter_map(|l| l.split_once('\x1f').map(|(n, o)| (n.to_string(), o.to_string())))
+        .collect();
+    let line = |s: String| Some(s.trim().to_string()).filter(|s| !s.is_empty());
+    let head = HeadState {
+        branch: run(repo, &["symbolic-ref", "-q", "HEAD"]).ok().and_then(line),
+        oid: run(repo, &["rev-parse", "-q", "--verify", "HEAD"]).ok().and_then(line),
+    };
+    let stashes = run(repo, &["stash", "list", "--format=%H%x1f%gs"])?
+        .lines()
+        .filter_map(|l| l.split_once('\x1f').map(|(h, m)| (h.to_string(), m.to_string())))
+        .collect();
+    Ok(RefState { head, refs, stashes })
+}
+
+/// A branch or tag an action moved, created (no `before`) or deleted (no `after`).
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct RefMove {
+    pub name: String,
+    pub before: Option<String>,
+    pub after: Option<String>,
+    /// A remote branch already had `after` when the action ran.
+    #[serde(default)]
+    pub after_on_remote: bool,
+}
+
+/// A file a discard changed, as saved blobs (`None`: the file didn't exist).
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct FileCopy {
+    pub path: String,
+    pub before: Option<String>,
+    pub after: Option<String>,
+    #[serde(default)]
+    pub executable: bool,
+}
+
+/// One undoable action in the operation log. Object ids are full SHAs.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct UndoEntry {
+    pub id: u64,
+    /// What was done, to follow "Undo: " ("discard hunk in src/app.rs").
+    pub what: String,
+    pub repo: PathBuf,
+    /// Unix seconds.
+    pub time: i64,
+    pub mode: UndoMode,
+    pub head_before: HeadState,
+    pub head_after: HeadState,
+    #[serde(default)]
+    pub refs: Vec<RefMove>,
+    /// Stashes the action removed: (commit, message).
+    #[serde(default)]
+    pub dropped_stashes: Vec<(String, String)>,
+    /// The staging area before the action, as a tree.
+    #[serde(default)]
+    pub index: Option<String>,
+    /// Uncommitted work thrown away by the action, as a stash commit.
+    #[serde(default)]
+    pub saved_work: Option<String>,
+    #[serde(default)]
+    pub files: Vec<FileCopy>,
+    /// Why this can't be undone (something couldn't be saved beforehand).
+    #[serde(default)]
+    pub not_undoable: Option<String>,
+    #[serde(default)]
+    pub undone: bool,
+}
+
+/// What was saved before an action ran; [`finish_undo`] turns it into an entry.
+pub struct UndoPrep {
+    mode: UndoMode,
+    before: RefState,
+    index: Option<String>,
+    saved_work: Option<String>,
+    /// (path, saved blob, executable)
+    files: Vec<(String, Option<String>, bool)>,
+    problem: Option<String>,
+}
+
+/// Save what an action is about to change. Runs before the action.
+pub fn prepare_undo(repo: &Path, what: &Undoable) -> GitResult<UndoPrep> {
+    let mode = match what {
+        Undoable::Refs => UndoMode::Refs,
+        Undoable::Index => UndoMode::Index,
+        Undoable::Tree { .. } => UndoMode::Tree,
+        Undoable::Files(_) => UndoMode::Files,
+    };
+    let mut prep = UndoPrep { mode, before: ref_state(repo)?, index: None, saved_work: None, files: Vec::new(), problem: None };
+    match what {
+        Undoable::Refs => {}
+        Undoable::Index => match run(repo, &["write-tree"]) {
+            Ok(t) => prep.index = Some(t.trim().to_string()),
+            Err(_) => prep.problem = Some("the staging area had unresolved conflicts, which can't be saved".into()),
+        },
+        Undoable::Tree { save_work } => {
+            if *save_work {
+                // A commit holding the staged and unstaged changes, without touching them.
+                match run(repo, &["stash", "create"]) {
+                    Ok(s) => prep.saved_work = Some(s.trim().to_string()).filter(|s| !s.is_empty()),
+                    Err(_) => prep.problem = Some("your uncommitted changes couldn't be saved first".into()),
+                }
+            }
+        }
+        Undoable::Files(paths) => {
+            for p in paths {
+                match save_file(repo, p, true) {
+                    Ok(Some((blob, exec))) => prep.files.push((p.clone(), blob, exec)),
+                    Ok(None) => {}
+                    Err(e) => prep.problem = Some(e),
+                }
+            }
+        }
+    }
+    Ok(prep)
+}
+
+/// A file's contents as a blob id, byte for byte (no line-ending or filter changes), and
+/// whether it's executable. `write` keeps the blob in the object database.
+/// `Ok(None)` for a folder (a submodule), which has no contents to save.
+#[allow(clippy::type_complexity)]
+fn save_file(repo: &Path, path: &str, write: bool) -> Result<Option<(Option<String>, bool)>, String> {
+    let full = repo.join(path);
+    let Ok(meta) = std::fs::symlink_metadata(&full) else { return Ok(Some((None, false))) };
+    if meta.is_dir() {
+        return Ok(None);
+    }
+    if meta.file_type().is_symlink() {
+        return Err(format!("{path} is a symbolic link, which can't be saved"));
+    }
+    let mut args = vec!["hash-object", "--no-filters"];
+    if write {
+        args.push("-w");
+    }
+    args.extend(["--", path]);
+    let blob = run(repo, &args).map_err(|e| format!("{path} couldn't be saved: {e}"))?;
+    Ok(Some((Some(blob.trim().to_string()), is_executable(&meta))))
+}
+
+#[cfg(unix)]
+fn is_executable(meta: &std::fs::Metadata) -> bool {
+    use std::os::unix::fs::PermissionsExt;
+    meta.permissions().mode() & 0o111 != 0
+}
+
+#[cfg(not(unix))]
+fn is_executable(_meta: &std::fs::Metadata) -> bool {
+    false
+}
+
+/// Compare with what [`prepare_undo`] saved, after the action ran. `None` when the
+/// action changed nothing.
+pub fn finish_undo(repo: &Path, prep: UndoPrep, what: &str) -> GitResult<Option<UndoEntry>> {
+    let after = ref_state(repo)?;
+    let before = &prep.before;
+    let mut names: Vec<&String> = before.refs.keys().chain(after.refs.keys()).collect();
+    names.sort();
+    names.dedup();
+    let mut refs = Vec::new();
+    for n in names {
+        let (b, a) = (before.refs.get(n), after.refs.get(n));
+        if b != a {
+            let after_on_remote = match a {
+                Some(a) => !run(repo, &["for-each-ref", "--contains", a, "--format=%(refname)", "refs/remotes"]).unwrap_or_default().trim().is_empty(),
+                None => false,
+            };
+            refs.push(RefMove { name: n.clone(), before: b.cloned(), after: a.cloned(), after_on_remote });
+        }
+    }
+    let dropped_stashes: Vec<_> = before.stashes.iter().filter(|s| !after.stashes.iter().any(|a| a.0 == s.0)).cloned().collect();
+    let mut files = Vec::new();
+    for (path, blob, executable) in prep.files {
+        let now = save_file(repo, &path, false)?.and_then(|(b, _)| b);
+        if now != blob {
+            files.push(FileCopy { path, before: blob, after: now, executable });
+        }
+    }
+    // A reset to where HEAD already is only changes the staging area or the files.
+    let index_changed = prep.mode == UndoMode::Index && prep.index.as_deref() != run(repo, &["write-tree"]).ok().as_deref().map(str::trim);
+    let changed = !refs.is_empty()
+        || !dropped_stashes.is_empty()
+        || !files.is_empty()
+        || before.head != after.head
+        || index_changed
+        || prep.saved_work.is_some();
+    if !changed {
+        return Ok(None);
+    }
+    let time = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_secs() as i64).unwrap_or(0);
+    Ok(Some(UndoEntry {
+        id: 0,
+        what: what.to_string(),
+        repo: repo.to_path_buf(),
+        time,
+        mode: prep.mode,
+        head_before: before.head.clone(),
+        head_after: after.head,
+        refs,
+        dropped_stashes,
+        index: prep.index,
+        saved_work: prep.saved_work,
+        files,
+        not_undoable: prep.problem,
+        undone: false,
+    }))
+}
+
+fn short_ref(name: &str) -> &str {
+    name.strip_prefix("refs/heads/").or_else(|| name.strip_prefix("refs/tags/")).unwrap_or(name)
+}
+
+fn short_oid(oid: &str) -> &str {
+    &oid[..oid.len().min(7)]
+}
+
+fn object_exists(repo: &Path, oid: &str) -> bool {
+    run(repo, &["cat-file", "-e", oid]).is_ok()
+}
+
+/// Put back what an entry's action changed. Checks everything first and changes
+/// nothing when it can't be done safely; the error says why.
+pub fn undo(repo: &Path, e: &UndoEntry) -> GitResult<String> {
+    if let Some(why) = &e.not_undoable {
+        return Err(format!("This can't be undone: {why}."));
+    }
+    if e.mode == UndoMode::Files {
+        restore_files(repo, &e.files)?;
+        return Ok(format!("Undid {}", e.what));
+    }
+    if operation(repo)?.is_some() {
+        return Err("A merge, rebase, cherry-pick or revert is in progress. Finish or abort it first.".into());
+    }
+
+    // Everything must still be where the action left it.
+    let now = ref_state(repo)?;
+    for m in &e.refs {
+        let cur = now.refs.get(&m.name);
+        if cur != m.after.as_ref() {
+            let name = short_ref(&m.name);
+            return Err(match (cur, &m.after) {
+                (Some(c), Some(_)) => format!("{name} has moved since (it's at {} now), so this can't be undone safely.", short_oid(c)),
+                (None, _) => format!("{name} has been deleted since, so this can't be undone safely."),
+                (Some(_), None) => format!("A new {name} has been created since, so this can't be undone safely."),
+            });
+        }
+    }
+    // Moving refs back only needs HEAD on the same branch; putting back the staging area
+    // or files needs it at the same commit too.
+    let same_commit_needed = e.mode != UndoMode::Refs || e.head_after.branch.is_none();
+    if now.head.branch != e.head_after.branch || (same_commit_needed && now.head.oid != e.head_after.oid) {
+        let at = match (&now.head.branch, &now.head.oid) {
+            (Some(b), _) if now.head.branch != e.head_after.branch => format!("you're on {} now", short_ref(b)),
+            (_, Some(o)) => format!("it's at {} now", short_oid(o)),
+            _ => "it has changed".into(),
+        };
+        return Err(format!("HEAD has moved since ({at}), so this can't be undone safely."));
+    }
+    // Taking back commits that have been pushed since would rewrite shared history.
+    for m in e.refs.iter().filter(|m| m.name.starts_with("refs/heads/") && !m.after_on_remote) {
+        let Some(after) = &m.after else { continue };
+        let kept = m.before.as_ref().is_some_and(|b| run(repo, &["merge-base", "--is-ancestor", after, b]).is_ok());
+        if kept {
+            continue;
+        }
+        let remotes = run(repo, &["for-each-ref", "--contains", after, "--format=%(refname:short)", "refs/remotes"])?;
+        if let Some(r) = remotes.lines().find(|l| !l.trim().is_empty()) {
+            return Err(format!(
+                "{} has been pushed to {r} since. Undoing would take back commits that are already shared, so it's left as it is.",
+                short_ref(&m.name)
+            ));
+        }
+    }
+    let mut needed: Vec<&String> = e.refs.iter().filter_map(|m| m.before.as_ref()).collect();
+    needed.extend(e.head_before.oid.as_ref());
+    needed.extend(e.index.as_ref());
+    needed.extend(e.saved_work.as_ref());
+    needed.extend(e.dropped_stashes.iter().map(|s| &s.0));
+    if let Some(gone) = needed.iter().find(|o| !object_exists(repo, o)) {
+        return Err(format!("Git has cleaned up {} since, so this can no longer be undone.", short_oid(gone)));
+    }
+
+    // Files first: if they can't be put back, nothing has changed yet.
+    if e.mode == UndoMode::Tree {
+        if let (Some(cur), Some(old)) = (&now.head.oid, &e.head_before.oid) {
+            if cur != old {
+                run(repo, &["read-tree", "-m", "-u", cur, old]).map_err(|err| {
+                    format!("Your uncommitted changes would be overwritten. Commit or stash them, then undo again.\n\n{err}")
+                })?;
+            }
+        }
+    }
+    let msg = format!("Headway: undo {}", e.what);
+    let mut tx = String::new();
+    for m in &e.refs {
+        match (&m.before, &m.after) {
+            (Some(b), Some(a)) => tx.push_str(&format!("update {} {b} {a}\n", m.name)),
+            (Some(b), None) => tx.push_str(&format!("create {} {b}\n", m.name)),
+            (None, Some(a)) => tx.push_str(&format!("delete {} {a}\n", m.name)),
+            (None, None) => {}
+        }
+    }
+    let detached = |h: &HeadState| h.branch.is_none();
+    if detached(&e.head_after) && detached(&e.head_before) && e.head_before.oid != e.head_after.oid {
+        if let (Some(b), Some(a)) = (&e.head_before.oid, &e.head_after.oid) {
+            tx.push_str(&format!("update HEAD {b} {a}\n"));
+        }
+    }
+    if !tx.is_empty() {
+        run_stdin(repo, &["update-ref", "--no-deref", "-m", &msg, "--stdin"], &tx)?;
+    }
+    if e.head_before.branch != e.head_after.branch {
+        match (&e.head_before.branch, &e.head_before.oid) {
+            (Some(b), _) => run(repo, &["symbolic-ref", "-m", &msg, "HEAD", b]).map(drop)?,
+            (None, Some(o)) => run(repo, &["update-ref", "--no-deref", "-m", &msg, "HEAD", o]).map(drop)?,
+            (None, None) => {}
+        }
+    }
+    if e.mode == UndoMode::Index {
+        if let Some(t) = &e.index {
+            run(repo, &["read-tree", t])?;
+        }
+    }
+    if let Some(w) = &e.saved_work {
+        run(repo, &["stash", "apply", "--index", w]).map_err(|err| format!("The branch is back, but your saved changes couldn't be reapplied ({}): {err}", short_oid(w)))?;
+    }
+    // Oldest first, so the newest dropped stash ends up on top.
+    for (oid, message) in e.dropped_stashes.iter().rev() {
+        run(repo, &["stash", "store", "-m", message, oid])?;
+    }
+    Ok(format!("Undid {}", e.what))
+}
+
+/// Write discarded files back, if each one is still exactly as the discard left it.
+fn restore_files(repo: &Path, files: &[FileCopy]) -> GitResult<()> {
+    for f in files {
+        let now = save_file(repo, &f.path, false)?.and_then(|(b, _)| b);
+        if now != f.after {
+            return Err(format!("{} has changed since, so it's left as it is.", f.path));
+        }
+        if let Some(b) = &f.before {
+            if !object_exists(repo, b) {
+                return Err(format!("Git has cleaned up the saved copy of {} since, so this can no longer be undone.", f.path));
+            }
+        }
+    }
+    for f in files {
+        let full = repo.join(&f.path);
+        match &f.before {
+            Some(b) => {
+                let bytes = run_bytes(repo, &["cat-file", "blob", b])?;
+                if let Some(parent) = full.parent() {
+                    std::fs::create_dir_all(parent).map_err(|e| e.to_string())?;
+                }
+                std::fs::write(&full, bytes).map_err(|e| format!("Couldn't write {}: {e}", f.path))?;
+                set_executable(&full, f.executable);
+            }
+            None => std::fs::remove_file(&full).map_err(|e| format!("Couldn't remove {}: {e}", f.path))?,
+        }
+    }
+    Ok(())
+}
+
+#[cfg(unix)]
+fn set_executable(path: &Path, exec: bool) {
+    use std::os::unix::fs::PermissionsExt;
+    if let Ok(meta) = std::fs::metadata(path) {
+        let mut p = meta.permissions();
+        let mode = p.mode();
+        p.set_mode(if exec { mode | ((mode & 0o444) >> 2) } else { mode & !0o111 });
+        let _ = std::fs::set_permissions(path, p);
+    }
+}
+
+#[cfg(not(unix))]
+fn set_executable(_path: &Path, _exec: bool) {}
+
+// ---------------------------------------------------------------------------
+// Reflog
+
+#[derive(Clone, Debug, PartialEq)]
+pub struct ReflogEntry {
+    pub hash: String,
+    /// "commit", "checkout", "reset", "rebase (finish)"…
+    pub action: String,
+    pub message: String,
+    /// Unix seconds when the ref moved.
+    pub time: i64,
+}
+
+/// Where `refname` (HEAD or a full branch name) has pointed, newest first.
+pub fn reflog(repo: &Path, refname: &str, limit: usize) -> GitResult<Vec<ReflogEntry>> {
+    let n = format!("-n{limit}");
+    let out = run(repo, &["reflog", "show", &n, "--date=unix", "--format=%H%x1f%gd%x1f%gs", refname, "--"])?;
+    Ok(out.lines().filter_map(parse_reflog_line).collect())
+}
+
+fn parse_reflog_line(line: &str) -> Option<ReflogEntry> {
+    let mut f = line.splitn(3, '\x1f');
+    let hash = f.next()?.to_string();
+    let selector = f.next()?;
+    let subject = f.next().unwrap_or("");
+    let time = selector.rsplit_once('{').and_then(|(_, t)| t.trim_end_matches('}').parse().ok()).unwrap_or(0);
+    let (action, message) = match subject.split_once(": ") {
+        Some((a, m)) => (a.to_string(), m.to_string()),
+        None => (subject.to_string(), String::new()),
+    };
+    Some(ReflogEntry { hash, action, message, time })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -3482,6 +3941,309 @@ index 4444444..0000000
         assert_eq!(scan_for_repos(&parent.join("a-repo")), [parent.join("a-repo")]);
         assert_eq!(repo_name(&parent.join("a-repo")), "a-repo");
         let _ = std::fs::remove_dir_all(&parent);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    // ---- Undo
+
+    /// Run `op` the way the app runs an undoable action, and return its log entry.
+    fn recorded(dir: &Path, what: Undoable, op: impl FnOnce()) -> UndoEntry {
+        let prep = prepare_undo(dir, &what).unwrap();
+        op();
+        finish_undo(dir, prep, "test action").unwrap().expect("the action changed something")
+    }
+
+    fn head(dir: &Path) -> String {
+        run(dir, &["rev-parse", "HEAD"]).unwrap().trim().to_string()
+    }
+
+    #[test]
+    fn undo_a_commit_keeps_its_changes_staged() {
+        let dir = temp_repo("undo-commit");
+        commit_file(&dir, "a.txt", "1\n");
+        let before = head(&dir);
+        std::fs::write(dir.join("a.txt"), "2\n").unwrap();
+        stage(&dir, &["a.txt".into()]).unwrap();
+        let e = recorded(&dir, Undoable::Refs, || {
+            commit(&dir, "second", false).unwrap();
+        });
+        assert_eq!(e.refs.len(), 1);
+        assert_eq!(e.refs[0].name, "refs/heads/main");
+        assert_eq!(e.refs[0].before.as_deref(), Some(before.as_str()));
+        assert_eq!(e.refs[0].after.as_deref(), Some(head(&dir).as_str()));
+        assert_eq!(e.refs[0].after.as_ref().unwrap().len(), 40, "full ids are kept");
+
+        assert_eq!(undo(&dir, &e).unwrap(), "Undid test action");
+        assert_eq!(head(&dir), before);
+        assert_eq!(index_text(&dir, "a.txt"), "2\n", "the commit's changes are staged again");
+        assert_eq!(status(&dir).unwrap().staged.len(), 1);
+        assert!(run(&dir, &["reflog", "-1", "--format=%gs", "main"]).unwrap().contains("Headway: undo test action"));
+
+        // The very first commit: undoing it leaves an empty branch with the files staged.
+        let dir2 = temp_repo("undo-first-commit");
+        std::fs::write(dir2.join("f.txt"), "x\n").unwrap();
+        stage(&dir2, &["f.txt".into()]).unwrap();
+        let e = recorded(&dir2, Undoable::Refs, || {
+            commit(&dir2, "first", false).unwrap();
+        });
+        undo(&dir2, &e).unwrap();
+        assert!(run(&dir2, &["rev-parse", "-q", "--verify", "HEAD"]).is_err());
+        assert_eq!(index_text(&dir2, "f.txt"), "x\n");
+        let _ = std::fs::remove_dir_all(&dir);
+        let _ = std::fs::remove_dir_all(&dir2);
+    }
+
+    #[test]
+    fn undo_an_amend_brings_back_the_original_commit() {
+        let dir = temp_repo("undo-amend");
+        commit_file(&dir, "a.txt", "1\n");
+        let original = head(&dir);
+        std::fs::write(dir.join("b.txt"), "forgotten\n").unwrap();
+        stage(&dir, &["b.txt".into()]).unwrap();
+        let e = recorded(&dir, Undoable::Refs, || {
+            commit(&dir, "write a.txt, and b", true).unwrap();
+        });
+        assert_ne!(head(&dir), original);
+        undo(&dir, &e).unwrap();
+        assert_eq!(head(&dir), original);
+        assert_eq!(message_of(&dir, "HEAD"), "write a.txt");
+        let st = status(&dir).unwrap();
+        assert_eq!(st.staged.iter().map(|f| f.path.as_str()).collect::<Vec<_>>(), ["b.txt"]);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn undo_a_hard_reset_restores_commits_and_uncommitted_work() {
+        let dir = temp_repo("undo-reset-hard");
+        commit_file(&dir, "a.txt", "1\n");
+        let older = head(&dir);
+        commit_file(&dir, "a.txt", "2\n");
+        let newer = head(&dir);
+        std::fs::write(dir.join("b.txt"), "staged\n").unwrap();
+        stage(&dir, &["b.txt".into()]).unwrap();
+        std::fs::write(dir.join("a.txt"), "2 and unstaged\n").unwrap();
+        let e = recorded(&dir, Undoable::Tree { save_work: true }, || {
+            run(&dir, &["reset", "--hard", &older]).unwrap();
+        });
+        assert!(e.saved_work.is_some());
+        assert_eq!(std::fs::read_to_string(dir.join("a.txt")).unwrap(), "1\n");
+
+        // Changing a file the undo has to rewrite: refused, and nothing moves.
+        std::fs::write(dir.join("a.txt"), "edited after the reset\n").unwrap();
+        let err = undo(&dir, &e).unwrap_err();
+        assert!(err.contains("would be overwritten"), "{err}");
+        assert_eq!(head(&dir), older);
+        assert_eq!(std::fs::read_to_string(dir.join("a.txt")).unwrap(), "edited after the reset\n");
+
+        run(&dir, &["checkout", "--", "a.txt"]).unwrap();
+        undo(&dir, &e).unwrap();
+        assert_eq!(head(&dir), newer);
+        assert_eq!(std::fs::read_to_string(dir.join("a.txt")).unwrap(), "2 and unstaged\n");
+        assert_eq!(index_text(&dir, "b.txt"), "staged\n", "staged work is staged again");
+        assert_eq!(index_text(&dir, "a.txt"), "2\n", "unstaged work stays unstaged");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn undo_a_mixed_reset_restores_the_staging_area_only() {
+        let dir = temp_repo("undo-reset-mixed");
+        commit_file(&dir, "a.txt", "1\n");
+        let older = head(&dir);
+        commit_file(&dir, "a.txt", "2\n");
+        let newer = head(&dir);
+        std::fs::write(dir.join("c.txt"), "staged\n").unwrap();
+        stage(&dir, &["c.txt".into()]).unwrap();
+        let e = recorded(&dir, Undoable::Index, || {
+            run(&dir, &["reset", "--mixed", &older]).unwrap();
+        });
+        undo(&dir, &e).unwrap();
+        assert_eq!(head(&dir), newer);
+        let st = status(&dir).unwrap();
+        assert_eq!(st.staged.iter().map(|f| f.path.as_str()).collect::<Vec<_>>(), ["c.txt"]);
+        assert!(st.unstaged.is_empty(), "{:?}", st.unstaged);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn undo_a_branch_delete_and_a_stash_drop() {
+        let dir = temp_repo("undo-branch-delete");
+        commit_file(&dir, "a.txt", "1\n");
+        run(&dir, &["checkout", "-q", "-b", "feature"]).unwrap();
+        commit_file(&dir, "f.txt", "only here\n");
+        let tip = head(&dir);
+        run(&dir, &["checkout", "-q", "main"]).unwrap();
+        let e = recorded(&dir, Undoable::Refs, || {
+            run(&dir, &["branch", "-D", "feature"]).unwrap();
+        });
+        assert_eq!(e.refs, [RefMove { name: "refs/heads/feature".into(), before: Some(tip.clone()), after: None, after_on_remote: false }]);
+        undo(&dir, &e).unwrap();
+        assert_eq!(run(&dir, &["rev-parse", "feature"]).unwrap().trim(), tip);
+
+        // Undoing it twice: the branch exists again, so the second undo refuses.
+        let err = undo(&dir, &e).unwrap_err();
+        assert!(err.contains("A new feature has been created since"), "{err}");
+
+        std::fs::write(dir.join("a.txt"), "half done\n").unwrap();
+        run(&dir, &["stash", "push", "-m", "half done"]).unwrap();
+        let e = recorded(&dir, Undoable::Refs, || {
+            run(&dir, &["stash", "drop"]).unwrap();
+        });
+        assert_eq!(e.dropped_stashes.len(), 1);
+        undo(&dir, &e).unwrap();
+        let s = stashes(&dir).unwrap();
+        assert_eq!(s.len(), 1);
+        assert!(s[0].message.contains("half done"), "{}", s[0].message);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn undo_a_line_discard_restores_the_exact_bytes() {
+        let dir = temp_repo("undo-lines");
+        let original = "line 1\nline 2\nline 3";
+        std::fs::write(dir.join("f.txt"), original).unwrap();
+        stage(&dir, &["f.txt".into()]).unwrap();
+        commit(&dir, "first", false).unwrap();
+        let edited = "line 1\nnew a\nnew b\nline 2\nline 3";
+        std::fs::write(dir.join("f.txt"), edited).unwrap();
+        let d = file_diff(&dir, "f.txt", false, false).unwrap().unwrap();
+        let sel = changed_lines(&d, |l| l.text.starts_with("new b"));
+        let e = recorded(&dir, Undoable::Files(vec!["f.txt".into()]), || {
+            discard_lines(&dir, &d, &sel).unwrap();
+        });
+        assert_eq!(e.mode, UndoMode::Files);
+        assert!(!std::fs::read_to_string(dir.join("f.txt")).unwrap().contains("new b"));
+        undo(&dir, &e).unwrap();
+        assert_eq!(std::fs::read(dir.join("f.txt")).unwrap(), edited.as_bytes());
+
+        // Edited again after the discard: refused, file untouched.
+        let e = recorded(&dir, Undoable::Files(vec!["f.txt".into()]), || {
+            discard_lines(&dir, &d, &sel).unwrap();
+        });
+        std::fs::write(dir.join("f.txt"), "something else").unwrap();
+        let err = undo(&dir, &e).unwrap_err();
+        assert!(err.contains("f.txt has changed since"), "{err}");
+        assert_eq!(std::fs::read_to_string(dir.join("f.txt")).unwrap(), "something else");
+
+        // A discarded untracked file comes back byte for byte, CRLF endings and all.
+        std::fs::create_dir_all(dir.join("notes")).unwrap();
+        std::fs::write(dir.join("notes/todo.md"), "remember\r\nthis\r\n").unwrap();
+        let fc = status(&dir).unwrap().unstaged.into_iter().find(|f| f.path == "notes/todo.md").unwrap();
+        let e = recorded(&dir, Undoable::Files(vec![fc.path.clone()]), || {
+            discard(&dir, &fc).unwrap();
+        });
+        assert!(!dir.join("notes/todo.md").exists());
+        undo(&dir, &e).unwrap();
+        assert_eq!(std::fs::read(dir.join("notes/todo.md")).unwrap(), b"remember\r\nthis\r\n");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn undo_a_discard_keeps_the_executable_bit() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = temp_repo("undo-exec");
+        std::fs::write(dir.join("run.sh"), "echo hi\n").unwrap();
+        std::fs::set_permissions(dir.join("run.sh"), std::fs::Permissions::from_mode(0o755)).unwrap();
+        let fc = status(&dir).unwrap().unstaged.into_iter().find(|f| f.path == "run.sh").unwrap();
+        let e = recorded(&dir, Undoable::Files(vec!["run.sh".into()]), || {
+            discard(&dir, &fc).unwrap();
+        });
+        undo(&dir, &e).unwrap();
+        assert_ne!(std::fs::metadata(dir.join("run.sh")).unwrap().permissions().mode() & 0o111, 0);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn undo_refuses_when_things_moved_or_were_pushed() {
+        let up = std::env::temp_dir().join(format!("headway-test-undo-up-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&up);
+        std::fs::create_dir_all(&up).unwrap();
+        run(&up, &["init", "-q", "--bare", "-b", "main"]).unwrap();
+        let dir = temp_repo("undo-refuse");
+        commit_file(&dir, "a.txt", "1\n");
+        run(&dir, &["remote", "add", "origin", &up.display().to_string()]).unwrap();
+        run(&dir, &["push", "-q", "-u", "origin", "main"]).unwrap();
+
+        // Something else moved the branch afterwards.
+        std::fs::write(dir.join("a.txt"), "2\n").unwrap();
+        stage(&dir, &["a.txt".into()]).unwrap();
+        let e = recorded(&dir, Undoable::Refs, || {
+            commit(&dir, "second", false).unwrap();
+        });
+        commit_file(&dir, "b.txt", "later\n");
+        let moved = head(&dir);
+        let err = undo(&dir, &e).unwrap_err();
+        assert!(err.contains("main has moved since"), "{err}");
+        assert_eq!(head(&dir), moved);
+
+        // Pushed since: taking the commit back would rewrite shared history.
+        std::fs::write(dir.join("a.txt"), "3\n").unwrap();
+        stage(&dir, &["a.txt".into()]).unwrap();
+        let e = recorded(&dir, Undoable::Refs, || {
+            commit(&dir, "third", false).unwrap();
+        });
+        run(&dir, &["push", "-q"]).unwrap();
+        let err = undo(&dir, &e).unwrap_err();
+        assert!(err.contains("pushed to origin/main since"), "{err}");
+
+        // A conflicted merge in progress.
+        let e = recorded(&dir, Undoable::Refs, || {
+            run(&dir, &["branch", "side"]).unwrap();
+        });
+        std::fs::write(dir.join(run(&dir, &["rev-parse", "--git-path", "MERGE_HEAD"]).unwrap().trim()), format!("{}\n", head(&dir))).unwrap();
+        let err = undo(&dir, &e).unwrap_err();
+        assert!(err.contains("in progress"), "{err}");
+        let _ = std::fs::remove_dir_all(&dir);
+        let _ = std::fs::remove_dir_all(&up);
+    }
+
+    #[test]
+    fn undo_a_checkout_switches_back() {
+        let dir = temp_repo("undo-checkout");
+        commit_file(&dir, "a.txt", "1\n");
+        run(&dir, &["checkout", "-q", "-b", "other"]).unwrap();
+        commit_file(&dir, "a.txt", "other\n");
+        run(&dir, &["checkout", "-q", "main"]).unwrap();
+        std::fs::write(dir.join("notes.txt"), "untouched\n").unwrap();
+        let e = recorded(&dir, Undoable::Tree { save_work: false }, || {
+            run(&dir, &["checkout", "other"]).unwrap();
+        });
+        assert_eq!(e.head_before.branch.as_deref(), Some("refs/heads/main"));
+        assert_eq!(e.head_after.branch.as_deref(), Some("refs/heads/other"));
+        undo(&dir, &e).unwrap();
+        assert_eq!(run(&dir, &["symbolic-ref", "HEAD"]).unwrap().trim(), "refs/heads/main");
+        assert_eq!(std::fs::read_to_string(dir.join("a.txt")).unwrap(), "1\n");
+        assert_eq!(std::fs::read_to_string(dir.join("notes.txt")).unwrap(), "untouched\n");
+        assert!(status(&dir).unwrap().staged.is_empty());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn nothing_changed_means_nothing_to_undo() {
+        let dir = temp_repo("undo-nothing");
+        commit_file(&dir, "a.txt", "1\n");
+        let prep = prepare_undo(&dir, &Undoable::Tree { save_work: true }).unwrap();
+        run(&dir, &["reset", "--hard", "HEAD"]).unwrap();
+        assert_eq!(finish_undo(&dir, prep, "reset").unwrap(), None);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn reflog_lists_where_head_and_branches_have_been() {
+        let dir = temp_repo("reflog");
+        commit_file(&dir, "a.txt", "1\n");
+        commit_file(&dir, "a.txt", "2\n");
+        run(&dir, &["reset", "-q", "--hard", "HEAD~1"]).unwrap();
+        let log = reflog(&dir, "HEAD", 50).unwrap();
+        assert_eq!(log.len(), 3);
+        assert_eq!(log[0].action, "reset");
+        assert!(log[0].message.starts_with("moving to HEAD~1"), "{}", log[0].message);
+        assert_eq!(log[1].action, "commit");
+        assert_eq!(log[1].message, "write a.txt");
+        assert!(log[1].time > 1_600_000_000);
+        assert_eq!(log[2].action, "commit (initial)");
+        assert_eq!(reflog(&dir, "refs/heads/main", 1).unwrap().len(), 1);
+        assert!(reflog(&dir, "refs/heads/nope", 5).is_err());
         let _ = std::fs::remove_dir_all(&dir);
     }
 }

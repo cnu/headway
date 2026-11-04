@@ -156,6 +156,11 @@ mod imp {
         b.commit(SAM, "Document how to run the shop", 30);
         b.write("src/cart.js", "export function total(items) {\n  return items.reduce((s, i) => s + i.price * (i.qty ?? 1), 0);\n}\n\nexport function count(items) {\n  return items.length;\n}\n");
         b.commit(JO, "Count quantities in cart total", 20);
+        // A commit thrown away with a hard reset: only the reflog still finds it.
+        b.write("src/banner.js", "export const banner = 'Free shipping on orders over $50';\n");
+        b.commit(ALEX, "Try a free shipping banner", 3);
+        b.clock += 3600;
+        b.git(&["reset", "-q", "--hard", "HEAD~1"]);
         // Uncommitted work so the "changes" view has content.
         b.write("src/cart.js", "export function total(items) {\n  return items.reduce((s, i) => s + i.price * (i.qty ?? 1), 0);\n}\n\nexport function count(items) {\n  return items.reduce((n, i) => n + (i.qty ?? 1), 0);\n}\n\nexport function isEmpty(items) {\n  return items.length === 0;\n}\n");
         b.write("src/wishlist.js", "export const wishlist = [];\n");
@@ -246,6 +251,20 @@ mod imp {
             assert_eq!(ws.repos.len(), SAMPLES.len());
             assert_eq!(ws.open_tabs, [ws.repos[0].clone()]);
             assert_eq!(ws.active_tab, Some(0));
+        }
+
+        #[test]
+        fn web_shop_has_a_commit_only_the_reflog_finds() {
+            use crate::git;
+            let dir = std::env::temp_dir().join(format!("headway-sample-web-shop-{}", std::process::id()));
+            let _ = std::fs::remove_dir_all(&dir);
+            build_one(&dir, build_web_shop);
+            let log = git::reflog(&dir, "HEAD", 50).unwrap();
+            assert_eq!(log[0].action, "reset");
+            assert_eq!((log[1].action.as_str(), log[1].message.as_str()), ("commit", "Try a free shipping banner"));
+            let on_branches = git::run(&dir, &["branch", "--contains", &log[1].hash]).unwrap();
+            assert!(on_branches.trim().is_empty(), "{on_branches}");
+            let _ = std::fs::remove_dir_all(&dir);
         }
 
         #[test]
