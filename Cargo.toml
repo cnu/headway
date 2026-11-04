@@ -21,6 +21,9 @@ resvg = "0.49.0"
 rfd = "0.17.2"
 serde = { version = "1.0.229", features = ["derive"] }
 serde_json = "1.0.154"
+similar = "3.2.1"
+syntect = { version = "5.3.0", default-features = false, features = ["parsing", "regex-fancy"] }
+two-face = { version = "0.5.2", default-features = false, features = ["syntect-fancy"] }
 
 # Keep the default (debug) build snappy: optimise our code a little and libraries fully.
 [profile.dev]

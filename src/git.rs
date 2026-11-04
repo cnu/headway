@@ -759,7 +759,7 @@ pub fn commit_detail(repo: &Path, hash: &str) -> GitResult<CommitDetail> {
     }
     let patch = run(
         repo,
-        &["show", "--no-ext-diff", "--format=", "--patch", "-M", "--diff-merges=first-parent", hash],
+        &["show", "--no-ext-diff", "--full-index", "--format=", "--patch", "-M", "--diff-merges=first-parent", hash],
     )?;
     Ok(CommitDetail {
         hash: f[0].to_string(),
@@ -811,6 +811,10 @@ pub struct DiffFile {
     pub removed: u32,
     /// Shown instead of the contents (e.g. "too large to show").
     pub note: Option<String>,
+    /// Blob ids of the two sides, from the `index` line (`None`: no such side,
+    /// or not known). The working copy's id is the one git would give it.
+    pub old_id: Option<String>,
+    pub new_id: Option<String>,
 }
 
 impl DiffFile {
@@ -826,6 +830,8 @@ impl DiffFile {
             added: 0,
             removed: 0,
             note: Some(note.to_string()),
+            old_id: None,
+            new_id: None,
         }
     }
 
@@ -877,6 +883,8 @@ pub fn parse_patch(patch: &str) -> Vec<DiffFile> {
                 added: 0,
                 removed: 0,
                 note: None,
+                old_id: None,
+                new_id: None,
             });
             in_header = true;
             continue;
@@ -901,6 +909,11 @@ pub fn parse_patch(patch: &str) -> Vec<DiffFile> {
                     file.path = unquote_path(p);
                 } else if line.starts_with("Binary files") || line.starts_with("GIT binary patch") {
                     file.binary = true;
+                } else if let Some((a, b)) = line.strip_prefix("index ").and_then(|r| r.split(' ').next()).and_then(|r| r.split_once("..")) {
+                    // Combined diffs (merges) list several old ids: no single old side.
+                    let id = |s: &str| (!s.contains(',') && !s.bytes().all(|c| c == b'0')).then(|| s.to_string());
+                    file.old_id = id(a);
+                    file.new_id = id(b);
                 }
                 continue;
             }
@@ -950,11 +963,11 @@ pub fn parse_patch(patch: &str) -> Vec<DiffFile> {
 /// Diff of one working-tree file. `staged` picks the index side.
 pub fn file_diff(repo: &Path, path: &str, staged: bool, untracked: bool) -> GitResult<Option<DiffFile>> {
     let out = if untracked {
-        run_any(repo, &["diff", "--no-ext-diff", "--no-index", "--", "/dev/null", path])?
+        run_any(repo, &["diff", "--no-ext-diff", "--full-index", "--no-index", "--", "/dev/null", path])?
     } else if staged {
-        run(repo, &["diff", "--no-ext-diff", "--cached", "-M", "--", path])?
+        run(repo, &["diff", "--no-ext-diff", "--full-index", "--cached", "-M", "--", path])?
     } else {
-        run(repo, &["diff", "--no-ext-diff", "--", path])?
+        run(repo, &["diff", "--no-ext-diff", "--full-index", "--", path])?
     };
     let mut files = parse_patch(&out);
     if untracked {
@@ -975,8 +988,8 @@ pub const MAX_NEW_FILE_BYTES: u64 = 2 * 1024 * 1024;
 /// (unstaged, including new files) and (staged).
 pub fn worktree_diffs(repo: &Path, st: &Status) -> GitResult<(Vec<DiffFile>, Vec<DiffFile>)> {
     let take = |out: String| -> HashMap<String, DiffFile> { parse_patch(&out).into_iter().map(|f| (f.path.clone(), f)).collect() };
-    let mut unstaged_map = take(run(repo, &["diff", "--no-ext-diff"])?);
-    let mut staged_map = take(run(repo, &["diff", "--no-ext-diff", "--cached", "-M"])?);
+    let mut unstaged_map = take(run(repo, &["diff", "--no-ext-diff", "--full-index"])?);
+    let mut staged_map = take(run(repo, &["diff", "--no-ext-diff", "--full-index", "--cached", "-M"])?);
     let mut new_shown = 0;
     let unstaged = st
         .unstaged
@@ -1393,6 +1406,33 @@ fn read_objects(repo: &Path, ids: &[String]) -> GitResult<HashMap<String, String
         i = end + 1;
     }
     Ok(map)
+}
+
+/// Sizes of blobs in bytes, with one `git cat-file --batch-check`. Ids git
+/// doesn't have are left out.
+pub fn blob_sizes(repo: &Path, ids: &[String]) -> GitResult<HashMap<String, u64>> {
+    if ids.is_empty() {
+        return Ok(HashMap::new());
+    }
+    let input: String = ids.iter().map(|i| format!("{i}\n")).collect();
+    let out = run_stdin(repo, &["cat-file", "--batch-check=%(objectname) %(objecttype) %(objectsize)"], &input)?;
+    Ok(out
+        .lines()
+        .filter_map(|l| {
+            let f: Vec<&str> = l.split(' ').collect();
+            (f.len() == 3 && f[1] == "blob").then(|| Some((f[0].to_string(), f[2].parse().ok()?))).flatten()
+        })
+        .collect())
+}
+
+/// The text of blobs no bigger than `max` bytes (others, and ids git doesn't
+/// have, are left out), with one `cat-file --batch-check` and one `--batch`.
+pub fn small_blobs(repo: &Path, ids: &[String], max: u64) -> GitResult<HashMap<String, String>> {
+    let wanted: Vec<String> = blob_sizes(repo, ids)?.into_iter().filter(|(_, n)| *n <= max).map(|(id, _)| id).collect();
+    if wanted.is_empty() {
+        return Ok(HashMap::new());
+    }
+    read_objects(repo, &wanted)
 }
 
 pub fn last_message(repo: &Path) -> String {
@@ -2691,6 +2731,15 @@ pub fn blame_args(rev: Option<&str>, path: &str, opts: &BlameOptions, ignore: Op
 
 /// The text blame numbers its lines against: the file at `rev`, or the working copy.
 /// `Err` for binary files.
+/// The blob id of `path` at `rev`, or of the file in the working folder when `rev` is `None`.
+pub fn blob_id(repo: &Path, rev: Option<&str>, path: &str) -> GitResult<String> {
+    let out = match rev {
+        Some(r) => run(repo, &["rev-parse", "--verify", "--quiet", &format!("{r}:{path}")])?,
+        None => run(repo, &["hash-object", "--", path])?,
+    };
+    Ok(out.trim().to_string())
+}
+
 pub fn blame_text(repo: &Path, rev: Option<&str>, path: &str) -> GitResult<Vec<String>> {
     let bytes = match rev {
         Some(r) => {
@@ -2821,7 +2870,7 @@ pub fn parse_file_log(out: &str, path: &str, folder: bool) -> Vec<FileCommit> {
 
 /// What one commit changed in `paths` (a file under its old and new names, or a folder).
 pub fn commit_files(repo: &Path, hash: &str, paths: &[String]) -> GitResult<Vec<DiffFile>> {
-    let mut args = vec!["show", "--no-ext-diff", "--format=", "--patch", "-M", "--diff-merges=first-parent", hash, "--"];
+    let mut args = vec!["show", "--no-ext-diff", "--full-index", "--format=", "--patch", "-M", "--diff-merges=first-parent", hash, "--"];
     args.extend(paths.iter().map(String::as_str));
     Ok(parse_patch(&run(repo, &args)?))
 }
@@ -2918,6 +2967,53 @@ mod tests {
         run(&dir, &["config", "user.email", "t@example.com"]).unwrap();
         run(&dir, &["config", "commit.gpgsign", "false"]).unwrap();
         dir
+    }
+
+    #[test]
+    fn diffs_name_both_blobs_and_they_can_be_read_and_highlighted() {
+        use crate::highlight::{self, Job, JobFile, Tok};
+        let dir = temp_repo("blob-ids");
+        let before = "fn a() {\n    let s = \"one\n two\";\n}\n";
+        std::fs::write(dir.join("a.rs"), before).unwrap();
+        std::fs::write(dir.join("big.bin"), vec![0u8; 5000]).unwrap();
+        stage(&dir, &["a.rs".into(), "big.bin".into()]).unwrap();
+        commit(&dir, "first", false).unwrap();
+        let after = before.replace(" two", " three");
+        std::fs::write(dir.join("a.rs"), &after).unwrap();
+
+        let head_id = run(&dir, &["rev-parse", "HEAD:a.rs"]).unwrap().trim().to_string();
+        let disk_id = run(&dir, &["hash-object", "a.rs"]).unwrap().trim().to_string();
+        let d = file_diff(&dir, "a.rs", false, false).unwrap().unwrap();
+        assert_eq!(d.old_id.as_deref(), Some(head_id.as_str()), "full ids, not abbreviated");
+        assert_eq!(d.new_id.as_deref(), Some(disk_id.as_str()), "git names the working copy too");
+        assert_eq!(blob_id(&dir, Some("HEAD"), "a.rs").unwrap(), head_id);
+        assert_eq!(blob_id(&dir, None, "a.rs").unwrap(), disk_id);
+
+        // A new file has no old side.
+        std::fs::write(dir.join("n.rs"), "fn n() {}\n").unwrap();
+        let n = file_diff(&dir, "n.rs", false, true).unwrap().unwrap();
+        assert_eq!((n.old_id, n.new_id.is_some()), (None, true));
+
+        // Sizes and contents, skipping what's too big and what git doesn't have.
+        let big = run(&dir, &["rev-parse", "HEAD:big.bin"]).unwrap().trim().to_string();
+        let missing = "1".repeat(40);
+        let sizes = blob_sizes(&dir, &[head_id.clone(), big.clone(), missing.clone()]).unwrap();
+        assert_eq!(sizes.get(&big), Some(&5000));
+        assert!(!sizes.contains_key(&missing));
+        let texts = small_blobs(&dir, &[head_id.clone(), big.clone()], 1000).unwrap();
+        assert_eq!(texts.get(&head_id).map(String::as_str), Some(before));
+        assert!(!texts.contains_key(&big));
+
+        // Highlighting both sides: the old one from git, the new one from disk.
+        let slots = std::sync::Arc::new(vec![std::sync::OnceLock::new()]);
+        let file = JobFile { path: "a.rs".into(), old_path: "a.rs".into(), old_id: d.old_id.clone(), new_id: d.new_id.clone(), new_on_disk: true };
+        Job { repo: dir.clone(), slots: slots.clone(), files: vec![(0, file)] }.run(&|| {});
+        let sides = slots[0].get().unwrap();
+        let line = |h: &highlight::Highlighted, n: u32, text: &str| h.line(n, text).unwrap().iter().map(|s| s.tok).collect::<Vec<_>>();
+        assert_eq!(line(sides.old.as_ref().unwrap(), 3, " two\";"), vec![Tok::String], "the second line of a string is coloured as string");
+        assert_eq!(line(sides.new.as_ref().unwrap(), 3, " three\";"), vec![Tok::String]);
+        assert!(highlight::is_cached(&head_id, "a.rs") && highlight::is_cached(&disk_id, "a.rs"));
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]

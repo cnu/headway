@@ -3,7 +3,7 @@
 use crate::app::{Action, DiffDoc, Dialog, FileOpen, FileSel, FlatRow, FollowUp, LineSel, OpKind, Record, RepoData, RepoView, Selection, Summary};
 use crate::git::{self, Change, FileChange, LineKind, RefKind};
 use crate::graph::Target;
-use crate::preview;
+use crate::{highlight, preview};
 use crate::theme::{self, *};
 use crate::workspace::{ViewPrefs, Workspace};
 use egui::text::{LayoutJob, TextFormat, TextWrapping};
@@ -2104,6 +2104,48 @@ pub fn display_line(text: &str) -> String {
     out
 }
 
+/// A line of code laid out like [`display_line`] (tabs widened, very long lines
+/// shortened), coloured by its syntax `spans`; the parts they don't cover are `plain`.
+pub fn code_job(text: &str, spans: &[highlight::Span], plain: Color32, dark: bool) -> LayoutJob {
+    let font = theme::mono(12.5);
+    let mut job = LayoutJob::default();
+    let mut buf = String::new();
+    let mut cur = plain;
+    let flush = |job: &mut LayoutJob, buf: &mut String, color: Color32| {
+        if !buf.is_empty() {
+            job.append(buf, 0.0, TextFormat::simple(font.clone(), color));
+            buf.clear();
+        }
+    };
+    let mut si = 0;
+    for (n, (i, c)) in text.char_indices().enumerate() {
+        if n == MAX_LINE_CHARS {
+            flush(&mut job, &mut buf, cur);
+            buf.push_str("  … (line shortened)");
+            cur = plain;
+            break;
+        }
+        while spans.get(si).is_some_and(|s| s.end as usize <= i) {
+            si += 1;
+        }
+        let color = match spans.get(si) {
+            Some(s) if s.start as usize <= i => theme::syntax(s.tok, dark),
+            _ => plain,
+        };
+        if color != cur {
+            flush(&mut job, &mut buf, cur);
+            cur = color;
+        }
+        if c == '\t' {
+            buf.push_str("    ");
+        } else {
+            buf.push(c);
+        }
+    }
+    flush(&mut job, &mut buf, cur);
+    job
+}
+
 /// A small button drawn to exactly fill `rect`, so it lines up with the row it sits in
 /// (regular buttons have a minimum height taller than a diff row).
 fn row_button(ui: &mut Ui, rect: Rect, text: &str, danger: bool, fill: Color32, id: impl std::hash::Hash + std::fmt::Debug) -> egui::Response {
@@ -2588,7 +2630,7 @@ pub fn diff_view(
                         let (bg, fg, mark) = match l.kind {
                             LineKind::Add => (ADD_BG, ADD_FG, "+"),
                             LineKind::Del => (DEL_BG, DEL_FG, "−"),
-                            LineKind::Context => (Color32::TRANSPARENT, Color32::from_rgb(196, 202, 210), ""),
+                            LineKind::Context => (Color32::TRANSPARENT, CODE, ""),
                             LineKind::NoNewline => (Color32::TRANSPARENT, FAINT, ""),
                         };
                         if bg != Color32::TRANSPARENT {
@@ -2611,8 +2653,16 @@ pub fn diff_view(
                             p.rect_filled(Rect::from_min_size(rect.min, vec2(4.0, DIFF_ROW)), 0.0, BLUE.gamma_multiply(0.4));
                         }
                         p.text(pos2(rect.left() + gutter + 8.0, y), Align2::LEFT_CENTER, mark, theme::mono(12.5), fg);
-                        let text = display_line(&l.text);
-                        p.text(pos2(tx, y), Align2::LEFT_CENTER, text, theme::mono(12.5), fg);
+                        match doc.spans(fi, l) {
+                            Some(spans) => {
+                                let dark = ui.visuals().dark_mode;
+                                let g = p.layout_job(code_job(&l.text, spans, theme::syntax(highlight::Tok::Plain, dark), dark));
+                                p.galley(pos2(tx, y - g.size().y / 2.0), g, fg);
+                            }
+                            None => {
+                                p.text(pos2(tx, y), Align2::LEFT_CENTER, display_line(&l.text), theme::mono(12.5), fg);
+                            }
+                        }
                     }
                 }
             }

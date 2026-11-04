@@ -4,6 +4,7 @@
 
 use crate::app::{Action, DiffDoc, FileOpen, RepoView};
 use crate::git::{self, BlameCommit, Change, FileCommit};
+use crate::highlight;
 use crate::theme::{self, *};
 use crate::views::{self, DIFF_ROW, DiffMode, NavKey, name_it, paint_row_bg, trunc};
 use crate::workspace::ViewPrefs;
@@ -59,6 +60,8 @@ pub struct Blame {
     /// The commit whose gutter the pointer is over (its lines are highlighted).
     hover: Option<u32>,
     max_cols: usize,
+    /// Syntax colours of the file, once they're ready.
+    pub syntax: Option<std::sync::Arc<highlight::Highlighted>>,
 }
 
 impl Blame {
@@ -83,6 +86,7 @@ impl Blame {
             view: (0.0, 0.0),
             hover: None,
             max_cols: 40,
+            syntax: None,
         }
     }
 
@@ -549,8 +553,17 @@ fn blame_panel(ui: &mut Ui, b: &mut Blame, keys: bool, actions: &mut Vec<Action>
                 } else if same_commit {
                     p.rect_filled(rect, 0.0, Color32::from_white_alpha(8));
                 }
-                let text = views::display_line(&lines[ri]);
-                p.text(pos2(rect.left() + GUTTER_W + NUM_W + 12.0, y), Align2::LEFT_CENTER, text, theme::mono(12.5), Color32::from_rgb(196, 202, 210));
+                let tx = rect.left() + GUTTER_W + NUM_W + 12.0;
+                match b.syntax.as_ref().and_then(|h| h.line(ri as u32 + 1, &lines[ri])) {
+                    Some(spans) => {
+                        let dark = ui.visuals().dark_mode;
+                        let g = p.layout_job(views::code_job(&lines[ri], spans, theme::syntax(highlight::Tok::Plain, dark), dark));
+                        p.galley(pos2(tx, y - g.size().y / 2.0), g, CODE);
+                    }
+                    None => {
+                        p.text(pos2(tx, y), Align2::LEFT_CENTER, views::display_line(&lines[ri]), theme::mono(12.5), CODE);
+                    }
+                }
 
                 // Gutter, drawn last so scrolled code slides under it.
                 let g = Rect::from_min_size(pos2(clip.left(), rect.top()), vec2(GUTTER_W, DIFF_ROW));

@@ -7,6 +7,7 @@ mod app;
 mod fileview;
 mod git;
 mod graph;
+mod highlight;
 mod oplog;
 mod overview;
 mod preview;

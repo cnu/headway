@@ -7,7 +7,7 @@ use crate::theme::{self, *};
 use crate::workspace::{Config, Workspace};
 use crate::fileview::{self, FileView, Mode};
 use crate::resolver::Resolver;
-use crate::{overview, preview, views};
+use crate::{highlight, overview, preview, views};
 use egui::{Align, Color32, CornerRadius, Id, Layout, Margin, RichText, Sense, Stroke, Ui};
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
@@ -227,6 +227,8 @@ pub struct DiffDoc {
     pub previews: Vec<Option<preview::ImagePreview>>,
     /// The commit these are the changes of (`None`: uncommitted changes).
     pub commit: Option<String>,
+    /// Syntax colours of each file, filled in the background after the diff is shown.
+    pub syntax: Arc<Vec<std::sync::OnceLock<highlight::Sides>>>,
 }
 
 /// Files with more changed lines than this start folded in the uncommitted view.
@@ -253,6 +255,7 @@ impl DiffDoc {
             sections: Vec::new(),
             previews: Vec::new(),
             commit: None,
+            syntax: Arc::new((0..n).map(|_| Default::default()).collect()),
         };
         doc.rebuild();
         doc
@@ -264,6 +267,35 @@ impl DiffDoc {
         self.previews = preview::load_all(repo, &self.files, &self.modes, commit);
         self.commit = commit.map(String::from);
         self.rebuild();
+    }
+
+    /// The work of colouring this diff's code, to run after it's on screen.
+    pub fn highlighter(&self, repo: &Path) -> highlight::Job {
+        let files = self
+            .files
+            .iter()
+            .enumerate()
+            .filter(|(fi, f)| !f.binary && !f.hunks.is_empty() && self.preview(*fi).is_none() && highlight::knows(&f.path))
+            .map(|(fi, f)| {
+                let new_on_disk = matches!(self.modes.get(fi), Some(views::DiffMode::Unstaged | views::DiffMode::Untracked));
+                let old_path = f.old_path.clone().unwrap_or_else(|| f.path.clone());
+                (fi, highlight::JobFile { path: f.path.clone(), old_path, old_id: f.old_id.clone(), new_id: f.new_id.clone(), new_on_disk })
+            })
+            .collect();
+        highlight::Job { repo: repo.to_path_buf(), slots: self.syntax.clone(), files }
+    }
+
+    /// Syntax colours of one line of file `fi`, once they're ready.
+    pub fn spans(&self, fi: usize, l: &git::DiffLine) -> Option<&[highlight::Span]> {
+        let s = self.syntax.get(fi)?.get()?;
+        let old = || s.old.as_ref()?.line(l.old_no?, &l.text);
+        let new = || s.new.as_ref()?.line(l.new_no?, &l.text);
+        match l.kind {
+            git::LineKind::Del => old(),
+            git::LineKind::Add => new(),
+            git::LineKind::Context => new().or_else(old),
+            git::LineKind::NoNewline => None,
+        }
     }
 
     pub fn preview(&self, fi: usize) -> Option<&preview::ImagePreview> {
@@ -510,6 +542,8 @@ impl RepoView {
 // Messages from worker threads and actions from the UI
 
 enum Msg {
+    /// More of a diff's syntax colours are ready (they're in the diff already).
+    Highlighted,
     Repo(PathBuf, Result<RepoData, String>),
     Summary(PathBuf, Result<Summary, String>),
     Detail(PathBuf, String, Result<Detail, String>),
@@ -519,6 +553,8 @@ enum Msg {
     Reflog(PathBuf, u64, Result<Vec<git::ReflogEntry>, String>),
     /// The text of a file being blamed, and the repository's list of commits to skip.
     BlameText(PathBuf, u64, Result<Vec<String>, String>, Option<git::IgnoreRevs>),
+    /// Syntax colours of the blamed file.
+    BlameSyntax(PathBuf, u64, Option<Arc<highlight::Highlighted>>),
     /// More blame results: commits seen for the first time, and the lines they changed.
     BlameChunk(PathBuf, u64, Vec<git::BlameCommit>, Vec<git::BlameRange>),
     BlameDone(PathBuf, u64, Result<(), String>),
@@ -879,7 +915,7 @@ impl HeadwayApp {
             rv.detail_loading = true;
         }
         let p = path.to_path_buf();
-        self.spawn(move || {
+        self.spawn_stream(move |send| {
             // Parsing and flattening a big diff can take a while: do it here, not in the UI.
             let d = git::commit_detail(&p, &hash).map(|mut info| {
                 let files = std::mem::take(&mut info.files);
@@ -887,7 +923,12 @@ impl HeadwayApp {
                 doc.load_previews(&p, Some(&info.hash));
                 Detail { info, doc }
             });
-            Msg::Detail(p, hash, d)
+            let job = d.as_ref().ok().map(|d| d.doc.highlighter(&p));
+            send(Msg::Detail(p, hash, d));
+            if let Some(job) = job {
+                job.run(&|| send(Msg::Highlighted));
+            }
+            Msg::Highlighted
         });
     }
 
@@ -898,7 +939,7 @@ impl HeadwayApp {
         rv.wd_gen += 1;
         let generation = rv.wd_gen;
         let p = path.to_path_buf();
-        self.spawn(move || {
+        self.spawn_stream(move |send| {
             let doc = git::worktree_diffs(&p, &st).map(|(unstaged, staged)| {
                 let with_sub = |files: Vec<DiffFile>, list: &[git::FileChange]| {
                     files
@@ -916,7 +957,12 @@ impl HeadwayApp {
                 doc.load_previews(&p, None);
                 doc
             });
-            Msg::WorkDiff(p, generation, doc)
+            let job = doc.as_ref().ok().map(|d| d.highlighter(&p));
+            send(Msg::WorkDiff(p, generation, doc));
+            if let Some(job) = job {
+                job.run(&|| send(Msg::Highlighted));
+            }
+            Msg::Highlighted
         });
     }
 
@@ -976,6 +1022,22 @@ impl HeadwayApp {
         let Some(b) = rv.file_view.as_mut().and_then(|f| f.blame.as_mut()) else { return };
         b.generation = generation;
         let (p, rev, file) = (path.to_path_buf(), b.rev.clone(), b.path.clone());
+        if highlight::knows(&file) {
+            let (p, rev, file) = (p.clone(), rev.clone(), file.clone());
+            self.spawn(move || {
+                let syntax = git::blob_id(&p, rev.as_deref(), &file).ok().and_then(|id| {
+                    highlight::cached(&id, &file, || match rev {
+                        Some(_) => git::small_blobs(&p, std::slice::from_ref(&id), highlight::MAX_BYTES as u64).ok()?.remove(&id),
+                        None => {
+                            let full = p.join(&file);
+                            let small = std::fs::metadata(&full).is_ok_and(|m| m.len() <= highlight::MAX_BYTES as u64);
+                            small.then(|| std::fs::read(&full).ok()).flatten().map(|b| String::from_utf8_lossy(&b).into_owned())
+                        }
+                    })
+                });
+                Msg::BlameSyntax(p, generation, syntax)
+            });
+        }
         self.spawn_stream(move |send| {
             let ignore = git::ignore_revs(&p);
             let text = git::blame_text(&p, rev.as_deref(), &file);
@@ -1051,13 +1113,18 @@ impl HeadwayApp {
             _ => std::iter::once(c.path.clone()).chain(c.old_path.clone()).collect(),
         };
         let p = path.to_path_buf();
-        self.spawn(move || {
+        self.spawn_stream(move |send| {
             let doc = git::commit_files(&p, &c.hash, &paths).map(|files| {
                 let mut doc = DiffDoc::new(files, true);
                 doc.load_previews(&p, Some(&c.hash));
                 doc
             });
-            Msg::FileDiff(p, generation, doc)
+            let job = doc.as_ref().ok().map(|d| d.highlighter(&p));
+            send(Msg::FileDiff(p, generation, doc));
+            if let Some(job) = job {
+                job.run(&|| send(Msg::Highlighted));
+            }
+            Msg::Highlighted
         });
     }
 
@@ -1227,6 +1294,7 @@ impl HeadwayApp {
         while let Ok(msg) = self.rx.try_recv() {
             self.pending.fetch_sub(1, Ordering::SeqCst);
             match msg {
+                Msg::Highlighted => {}
                 Msg::Repo(path, res) => self.on_repo_loaded(path, res),
                 Msg::Summary(path, res) => {
                     self.summaries.insert(path, res);
@@ -1283,6 +1351,11 @@ impl HeadwayApp {
                 Msg::BlameText(path, generation, text, ignore) => {
                     if let Some(b) = self.blame_mut(&path, generation) {
                         b.text_loaded(text, ignore);
+                    }
+                }
+                Msg::BlameSyntax(path, generation, syntax) => {
+                    if let Some(b) = self.blame_mut(&path, generation) {
+                        b.syntax = syntax;
                     }
                 }
                 Msg::BlameChunk(path, generation, commits, ranges) => {

@@ -24,6 +24,31 @@ pub const ADD_FG: Color32 = Color32::from_rgb(140, 220, 170);
 pub const DEL_BG: Color32 = Color32::from_rgb(66, 34, 38);
 pub const DEL_FG: Color32 = Color32::from_rgb(240, 150, 150);
 pub const HUNK_BG: Color32 = Color32::from_rgb(36, 44, 58);
+/// Code that isn't a changed line (and uncoloured parts of highlighted lines).
+pub const CODE: Color32 = Color32::from_rgb(196, 202, 210);
+pub const CODE_LIGHT: Color32 = Color32::from_rgb(36, 41, 47);
+
+/// The colour of a kind of token in code, for a dark or a light background.
+pub fn syntax(tok: crate::highlight::Tok, dark: bool) -> Color32 {
+    use crate::highlight::Tok::*;
+    let rgb = |d: (u8, u8, u8), l: (u8, u8, u8)| {
+        let (r, g, b) = if dark { d } else { l };
+        Color32::from_rgb(r, g, b)
+    };
+    match tok {
+        Plain => if dark { CODE } else { CODE_LIGHT },
+        Comment => rgb((112, 121, 135), (106, 115, 125)),
+        String => rgb((158, 206, 128), (10, 110, 50)),
+        Escape => rgb((86, 196, 204), (0, 115, 125)),
+        Number | Constant => rgb((229, 170, 103), (170, 85, 0)),
+        Keyword => rgb((198, 146, 234), (135, 60, 180)),
+        Type => rgb((229, 200, 110), (140, 95, 0)),
+        Function => rgb((110, 170, 240), (25, 90, 190)),
+        Tag => rgb((232, 107, 140), (185, 30, 80)),
+        Attribute => rgb((229, 170, 103), (160, 85, 10)),
+        Macro => rgb((86, 196, 204), (0, 115, 125)),
+    }
+}
 
 pub const LANES: [Color32; 8] = [
     Color32::from_rgb(78, 196, 141),

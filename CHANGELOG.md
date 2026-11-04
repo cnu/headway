@@ -11,6 +11,10 @@ workflow uses that version's section as the GitHub release notes.
 
 ### Added
 
+- **Syntax highlighting** in diffs and blame, for about 200 languages. Each
+  side of a change is coloured as a whole file, so strings and comments that
+  span lines come out right; it happens in the background once the diff is on
+  screen, and each version of a file is only coloured once.
 - **Blame and file history**: right-click a file in a commit's details, the
   changes list or a diff, or find any file or folder with Ctrl/Cmd+P. Blame
   shows who last changed each line, grouped by commit, with an age colour
