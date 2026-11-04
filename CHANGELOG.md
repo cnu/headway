@@ -24,6 +24,9 @@ workflow uses that version's section as the GitHub release notes.
   commit's diff for **History of these lines** (L). B and H switch views, Esc
   closes. Development builds' **api-server** sample has a moved file and a
   reformat that blame skips.
+- **Narrow history**: when the history pane is narrower than its columns
+  need, each commit takes two lines: the subject (with its branch and tag
+  labels), then the author, time and commit id.
 - **Image previews**: changed pictures (PNG, JPEG, GIF, WebP, BMP, ICO and
   SVG) show in the diff instead of "Binary file", before and after side by
   side, with a checkerboard behind transparent parts. SVGs also keep their

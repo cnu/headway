@@ -954,6 +954,15 @@ fn checkout_remote(path: &Path, full: &str, local: &str, exists: bool) -> Action
 // Commit list with graph
 
 const ROW_H: f32 = 26.0;
+/// History rows on a narrow list: subject above, author, time and commit id below.
+const TALL_ROW_H: f32 = 44.0;
+/// Below this width the history list uses two-line rows instead of columns.
+const TWO_LINE_W: f32 = 520.0;
+
+/// Height of a history row for a list this wide.
+pub fn history_row_height(list_w: f32) -> f32 {
+    if list_w < TWO_LINE_W { TALL_ROW_H } else { ROW_H }
+}
 const LANE_W: f32 = 14.0;
 
 fn commit_list(ui: &mut Ui, rv: &mut RepoView, actions: &mut Vec<Action>) {
@@ -966,12 +975,14 @@ fn commit_list(ui: &mut Ui, rv: &mut RepoView, actions: &mut Vec<Action>) {
     let graph_lanes = if searching { 1 } else { data.graph.width.clamp(1, 14) };
     let graph_w = graph_lanes as f32 * LANE_W + 10.0;
     let changes = data.status.change_count();
-    // Columns shrink on narrow windows so the commit messages keep their room.
+    // Columns shrink on narrower lists; below TWO_LINE_W each row gets a second
+    // line for the author, time and commit id instead.
     let list_w = ui.available_width();
-    let author_w: f32 = if list_w < 520.0 { 0.0 } else if list_w < 700.0 { 110.0 } else { 150.0 };
-    let date_w: f32 = if list_w < 420.0 { 0.0 } else { 100.0 };
-    // The commit id is the last column to disappear on narrow windows.
-    let hash_w: f32 = if list_w < 280.0 { 0.0 } else { 74.0 };
+    let row_h = history_row_height(list_w);
+    let two_line = row_h > ROW_H;
+    let author_w: f32 = if two_line { 0.0 } else if list_w < 700.0 { 110.0 } else { 150.0 };
+    let date_w: f32 = if two_line { 0.0 } else { 100.0 };
+    let hash_w: f32 = if two_line { 0.0 } else { 74.0 };
     // Space taken by the right-hand columns (author, commit id, date).
     let cols_w = author_w + hash_w + date_w;
 
@@ -985,7 +996,7 @@ fn commit_list(ui: &mut Ui, rv: &mut RepoView, actions: &mut Vec<Action>) {
     // Not while a dialog is open: its keys are its own.
     if !rv.modal && !ui.ctx().text_edit_focused() && !ui.ctx().any_popup_open() {
         let (offset, view_h) = rv.list_view;
-        let page = ((view_h / ROW_H).floor() as usize).saturating_sub(1).max(1);
+        let page = ((view_h / row_h).floor() as usize).saturating_sub(1).max(1);
         let key = ui.input(|i| {
             [
                 (egui::Key::ArrowUp, NavKey::Up),
@@ -1009,7 +1020,7 @@ fn commit_list(ui: &mut Ui, rv: &mut RepoView, actions: &mut Vec<Action>) {
                 }
                 // Keep the newly selected row on screen; End shows the very bottom
                 // (including "Load more history").
-                scroll_offset = if key == NavKey::End { Some(f32::MAX) } else { keep_visible(t, offset, view_h, ROW_H) };
+                scroll_offset = if key == NavKey::End { Some(f32::MAX) } else { keep_visible(t, offset, view_h, row_h) };
             }
         }
     }
@@ -1038,9 +1049,9 @@ fn commit_list(ui: &mut Ui, rv: &mut RepoView, actions: &mut Vec<Action>) {
     let mut sa = egui::ScrollArea::vertical().auto_shrink(false).id_salt(("commits", &path));
     if let Some(i) = rv.list_scroll_to.take() {
         let pos = rv.filtered.iter().position(|&x| x == i).unwrap_or(0) + 1;
-        sa = sa.vertical_scroll_offset(((pos as f32 - 4.0) * ROW_H).clamp(0.0, furthest_list_offset(ui, n_rows)));
+        sa = sa.vertical_scroll_offset(((pos as f32 - 4.0) * row_h).clamp(0.0, furthest_list_offset(ui, n_rows, row_h)));
     } else if let Some(off) = scroll_offset {
-        sa = sa.vertical_scroll_offset(off.min(furthest_list_offset(ui, n_rows)));
+        sa = sa.vertical_scroll_offset(off.min(furthest_list_offset(ui, n_rows, row_h)));
     }
     let selected_hash = match &rv.selection {
         Some(Selection::Commit(h)) => Some(h.clone()),
@@ -1052,9 +1063,9 @@ fn commit_list(ui: &mut Ui, rv: &mut RepoView, actions: &mut Vec<Action>) {
     let mut rv_list_view = rv.list_view;
     ui.scope(|ui| {
         ui.spacing_mut().item_spacing.y = 0.0;
-        let out = sa.show_rows(ui, ROW_H, n_rows, |ui, range| {
+        let out = sa.show_rows(ui, row_h, n_rows, |ui, range| {
             for r in range {
-                let (rect, resp) = ui.allocate_exact_size(vec2(ui.available_width(), ROW_H), Sense::click());
+                let (rect, resp) = ui.allocate_exact_size(vec2(ui.available_width(), row_h), Sense::click());
                 let p = ui.painter_at(rect);
                 let selected = if r == 0 { selected_hash.is_none() } else { false };
                 if r == 0 {
@@ -1081,7 +1092,7 @@ fn commit_list(ui: &mut Ui, rv: &mut RepoView, actions: &mut Vec<Action>) {
                     continue;
                 }
                 if r == rv.filtered.len() + 1 {
-                    let b = ui.put(rect.shrink2(vec2(rect.width() / 2.0 - 110.0, 2.0)), egui::Button::new("Load more history"));
+                    let b = ui.put(rect.shrink2(vec2((rect.width() / 2.0 - 110.0).max(4.0), (row_h - 22.0) / 2.0)), egui::Button::new("Load more history"));
                     if b.clicked() {
                         actions.push(Action::LoadMore);
                     }
@@ -1125,7 +1136,8 @@ fn commit_list(ui: &mut Ui, rv: &mut RepoView, actions: &mut Vec<Action>) {
                     gp.circle_filled(center, 4.5, dc);
                 }
 
-                // Labels and summary
+                // Labels and summary (on the first line of a two-line row).
+                let mid = if two_line { rect.top() + 14.0 } else { mid };
                 let mut tx = rect.left() + graph_w + 6.0;
                 for rl in &c.refs {
                     let (fill, fg, icon) = match rl.kind {
@@ -1159,6 +1171,25 @@ fn commit_list(ui: &mut Ui, rv: &mut RepoView, actions: &mut Vec<Action>) {
                     let gd = trunc(&p, &theme::relative(c.time), theme::prop(12.5), DIM, date_w - 8.0);
                     p.galley(pos2(rect.right() - date_w, mid - gd.size().y / 2.0), gd, DIM);
                 }
+                if two_line {
+                    // Author and time, then the commit id when it fits.
+                    let y2 = rect.top() + 31.0;
+                    let x2 = rect.left() + graph_w + 6.0;
+                    let room = rect.right() - 10.0 - x2;
+                    let id = p.layout_no_wrap(c.short().to_string(), theme::mono(11.5), if selected { TEXT } else { FAINT });
+                    let id_w = id.size().x;
+                    let show_id = room > id_w + 80.0;
+                    let meta = format!("{}  ·  {}", c.author, theme::relative(c.time));
+                    let gm = trunc(&p, &meta, theme::prop(12.0), DIM, if show_id { room - id_w - 16.0 } else { room }.max(20.0));
+                    let meta_w = gm.size().x;
+                    p.galley(pos2(x2, y2 - gm.size().y / 2.0), gm, DIM);
+                    if show_id {
+                        let dot = p.layout_no_wrap("  ·  ".to_string(), theme::prop(12.0), DIM);
+                        let dot_w = dot.size().x;
+                        p.galley(pos2(x2 + meta_w, y2 - dot.size().y / 2.0), dot, DIM);
+                        p.galley(pos2(x2 + meta_w + dot_w, y2 - id.size().y / 2.0), id, FAINT);
+                    }
+                }
 
                 if resp.clicked() {
                     actions.push(Action::SelectCommit(c.hash.clone()));
@@ -1174,8 +1205,8 @@ fn commit_list(ui: &mut Ui, rv: &mut RepoView, actions: &mut Vec<Action>) {
 }
 
 /// How far the history list can scroll (so a jump never overshoots and slides back).
-fn furthest_list_offset(ui: &Ui, rows: usize) -> f32 {
-    (rows as f32 * ROW_H - ui.available_height()).max(0.0)
+fn furthest_list_offset(ui: &Ui, rows: usize, row_h: f32) -> f32 {
+    (rows as f32 * row_h - ui.available_height()).max(0.0)
 }
 
 /// A key that moves the selection in the history list.
@@ -2764,6 +2795,14 @@ mod tests {
         assert_eq!(keep_visible(0, 50.0, 100.0, 10.0), Some(0.0));
         // Before the list has been measured, only scroll up.
         assert_eq!(keep_visible(30, 0.0, 0.0, 10.0), None);
+    }
+
+    #[test]
+    fn narrow_history_lists_get_two_line_rows() {
+        assert_eq!(history_row_height(800.0), ROW_H);
+        assert_eq!(history_row_height(TWO_LINE_W), ROW_H);
+        assert_eq!(history_row_height(TWO_LINE_W - 1.0), TALL_ROW_H);
+        assert_eq!(history_row_height(200.0), TALL_ROW_H);
     }
 
     #[test]

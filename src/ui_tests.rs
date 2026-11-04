@@ -1975,3 +1975,27 @@ fn arrow_keys_in_find_file_leave_the_history_alone() {
     let Some(super::Dialog::FindFile { hits, .. }) = &h.state().dialog else { panic!() };
     assert_eq!(hits[0].0, "g.txt");
 }
+
+#[test]
+fn a_narrow_history_shows_two_lines_per_commit() {
+    let s = scratch("two-line-history");
+    let r = new_repo(&s.root, "shop");
+    commit(&r, "a.txt", "one\n", "Start shop");
+    commit(&r, "b.txt", "two\n", "Add cart page");
+    let row_height = |h: &Harness<'static, HeadwayApp>| {
+        h.get_all_by_label("Start shop").find(|n| n.accesskit_node().role() == egui::Role::Row).expect("a history row").rect().height()
+    };
+
+    // A wide list: one line per commit, in columns.
+    let h = app(&s, &[&r], true);
+    assert_eq!(row_height(&h), 26.0);
+
+    // A narrow one: the subject, then author, time and commit id below it.
+    let mut h = app_sized(&s, &[&r], true, egui::vec2(1000.0, 800.0));
+    assert_eq!(row_height(&h), 44.0);
+    // Still a normal list: clicking and arrow keys pick commits.
+    click(&mut h, "Start shop");
+    assert!(shows(&h, "✎ Edit message"));
+    key(&mut h, egui::Key::ArrowUp);
+    assert!(h.state().tabs[&r].selection == Some(super::Selection::Commit(rev_of(&r, "HEAD"))));
+}
