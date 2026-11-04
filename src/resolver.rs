@@ -4,6 +4,7 @@
 
 use crate::app::{Action, OpKind, RepoData, RepoView};
 use crate::git::{self, ConflictFile, ConflictKind, FileChange, LineKind, OpType, Operation, Region, Resolution, Segment, Side};
+use crate::preview::{self, ConflictPictures};
 use crate::theme::{self, *};
 use crate::views::display_line;
 use egui::{Align, Color32, Key, Layout, Margin, Modifiers, RichText, Stroke, Ui};
@@ -43,11 +44,13 @@ pub struct FileState {
     pub editing: Option<(usize, String)>,
     /// Unchanged stretches unfolded by hand.
     pub unfolded: HashSet<usize>,
+    /// Each side's picture, for image files.
+    pub pictures: Option<ConflictPictures>,
 }
 
 impl FileState {
     fn new(path: String, kind: ConflictKind) -> Self {
-        Self { path, kind, file: None, picks: vec![], whole: None, editing: None, unfolded: HashSet::new() }
+        Self { path, kind, file: None, picks: vec![], whole: None, editing: None, unfolded: HashSet::new(), pictures: None }
     }
 
     fn set_file(&mut self, file: Result<ConflictFile, String>) {
@@ -182,10 +185,11 @@ impl Resolver {
     }
 
     /// Files read in the background arrived. Ones with choices made meanwhile are left alone.
-    pub fn loaded(&mut self, results: Vec<(String, Result<ConflictFile, String>)>) {
-        for (path, file) in results {
+    pub fn loaded(&mut self, results: Vec<(String, Result<ConflictFile, String>, Option<ConflictPictures>)>) {
+        for (path, file, pictures) in results {
             if let Some(f) = self.files.iter_mut().find(|f| f.path == path && !f.dirty()) {
                 f.set_file(file);
+                f.pictures = pictures;
             }
         }
         if self.files.get(self.current).is_some_and(|f| f.open() > 0 && f.stop_done(self.focus)) || self.focus >= self.file().stops() {
@@ -502,7 +506,15 @@ pub fn show(ui: &mut Ui, rv: &mut RepoView, actions: &mut Vec<Action>) {
         let (show_base, preview, focus) = (res.show_base, res.preview, res.focus);
         let scroll = std::mem::take(&mut res.scroll);
         let fs = &mut res.files[cur];
-        egui::ScrollArea::both().auto_shrink(false).id_salt(("resolver", &fs.path)).show(ui, |ui| match &file {
+        egui::ScrollArea::both().auto_shrink(false).id_salt(("resolver", &fs.path)).show(ui, |ui| {
+            // A picture stored as text (SVG): the pictures above its text conflicts.
+            if let (Some(p), Ok(f)) = (&fs.pictures, &file)
+                && !f.binary
+                && !preview
+            {
+                pictures(ui, &fs.path, p, &ours, &theirs);
+            }
+            match &file {
             Err(e) => {
                 ui.label(RichText::new(format!("Couldn't read {}\n{e}", fs.path)).color(DANGER));
             }
@@ -518,10 +530,14 @@ pub fn show(ui: &mut Ui, rv: &mut RepoView, actions: &mut Vec<Action>) {
                     size_text(f.sizes[0])
                 );
                 after = whole_card(ui, fs, &what, &[(o.as_str(), Whole::Ours), (t.as_str(), Whole::Theirs)]);
+                if let Some(p) = &fs.pictures {
+                    pictures(ui, &fs.path, p, &ours, &theirs);
+                }
             }
             Ok(f) if !fs.kind.has_regions() => after = one_sided(ui, fs, f, &ours, &theirs, wide),
             Ok(f) if preview => preview_result(ui, fs, f),
             Ok(f) => after = regions(ui, fs, f, &ours, &theirs, show_base, wide, focus, scroll),
+            }
         });
     });
     res.files[cur].file = Some(file);
@@ -734,6 +750,38 @@ fn size_text(n: Option<u64>) -> String {
         Some(b) if b < 1024 * 1024 => format!("{:.1} KB", b as f64 / 1024.0),
         Some(b) => format!("{:.1} MB", b as f64 / (1024.0 * 1024.0)),
     }
+}
+
+/// Each side's version of a conflicted picture, side by side: ours, theirs and
+/// the common ancestor (when there is one). A side that deleted the file says so.
+fn pictures(ui: &mut Ui, path: &str, p: &ConflictPictures, ours: &str, theirs: &str) {
+    let mut cols: Vec<(String, Option<&preview::ImageSide>)> = vec![(short(ours), p.ours.as_ref()), (short(theirs), p.theirs.as_ref())];
+    if let Some(b) = &p.base {
+        cols.push(("Common ancestor".into(), Some(b)));
+    }
+    const GAP: f32 = 20.0;
+    let n = cols.len() as f32;
+    let w = ((ui.available_width().min(1400.0) - GAP * (n - 1.0)) / n).max(80.0);
+    ui.horizontal_top(|ui| {
+        ui.spacing_mut().item_spacing.x = GAP;
+        for (i, (name, side)) in cols.iter().enumerate() {
+            ui.vertical(|ui| {
+                ui.set_width(w);
+                let title = match side {
+                    Some(s) if s.error.is_none() => format!("{name}  ·  {} × {}", s.size[0], s.size[1]),
+                    _ => name.clone(),
+                };
+                ui.label(RichText::new(title).color(DIM).size(12.0));
+                match side {
+                    Some(s) => preview::show(ui, s, w, &format!("conflict-{path}-{i}")),
+                    None => {
+                        ui.label(RichText::new("Deleted here").italics().color(FAINT));
+                    }
+                }
+            });
+        }
+    });
+    ui.add_space(12.0);
 }
 
 /// A box with a description and whole-file choices (or the choice made, with Undo).
@@ -1188,7 +1236,7 @@ mod tests {
         bin.binary = true;
         let mut gone = file("x\n");
         gone.kind = ConflictKind::DeletedByThem;
-        res.loaded(vec![("a.txt".into(), Ok(file(TWO))), ("gone.txt".into(), Ok(gone)), ("pic.bin".into(), Ok(bin))]);
+        res.loaded(vec![("a.txt".into(), Ok(file(TWO)), None), ("gone.txt".into(), Ok(gone), None), ("pic.bin".into(), Ok(bin), None)]);
         res
     }
 

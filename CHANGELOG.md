@@ -11,6 +11,11 @@ workflow uses that version's section as the GitHub release notes.
 
 ### Added
 
+- **Image previews**: changed pictures (PNG, JPEG, GIF, WebP, BMP, ICO and
+  SVG) show in the diff instead of "Binary file", before and after side by
+  side, with a checkerboard behind transparent parts. SVGs also keep their
+  text diff. The conflict resolver shows a conflicted picture as each branch
+  has it, next to the common ancestor.
 - **Merge conflicts**: a banner shows the merge, rebase, cherry-pick or revert
   in progress (with Continue, Abort and, for sequences, Skip; Abort asks first
   and says what will be lost). The resolver walks through every conflict in

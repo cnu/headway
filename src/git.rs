@@ -1636,7 +1636,7 @@ fn run_env(repo: &Path, args: &[&str], env: &[(&str, &str)]) -> GitResult<String
     }
 }
 
-fn run_bytes(repo: &Path, args: &[&str]) -> GitResult<Vec<u8>> {
+pub(crate) fn run_bytes(repo: &Path, args: &[&str]) -> GitResult<Vec<u8>> {
     let out = base_cmd(repo).args(args).output().map_err(|e| format!("Could not start git: {e}"))?;
     if out.status.success() { Ok(out.stdout) } else { Err(String::from_utf8_lossy(&out.stderr).trim().to_string()) }
 }

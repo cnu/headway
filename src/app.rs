@@ -6,7 +6,7 @@ use crate::graph::{self, Graph};
 use crate::theme::{self, *};
 use crate::workspace::{Config, Workspace};
 use crate::resolver::Resolver;
-use crate::{overview, views};
+use crate::{overview, preview, views};
 use egui::{Align, Color32, CornerRadius, Id, Layout, Margin, RichText, Sense, Stroke, Ui};
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
@@ -201,6 +201,8 @@ pub enum FlatRow {
     Hunk(usize, usize),
     Line(usize, usize, usize),
     Note(usize),
+    /// One strip of a changed picture (file, strip): strip 0 holds the titles.
+    Image(usize, usize),
     Gap,
 }
 
@@ -220,6 +222,8 @@ pub struct DiffDoc {
     pub submodule: Vec<bool>,
     /// Group titles: (first file of the group, title).
     pub sections: Vec<(usize, String)>,
+    /// Pictures shown for image files (one entry per file).
+    pub previews: Vec<Option<preview::ImagePreview>>,
 }
 
 /// Files with more changed lines than this start folded in the uncommitted view.
@@ -244,9 +248,21 @@ impl DiffDoc {
             modes: vec![views::DiffMode::Commit; n],
             submodule: vec![false; n],
             sections: Vec::new(),
+            previews: Vec::new(),
         };
         doc.rebuild();
         doc
+    }
+
+    /// Read pictures of the image files (slow: call it in the background).
+    /// `commit` is the commit shown, when this is a commit's changes.
+    pub fn load_previews(&mut self, repo: &Path, commit: Option<&str>) {
+        self.previews = preview::load_all(repo, &self.files, &self.modes, commit);
+        self.rebuild();
+    }
+
+    pub fn preview(&self, fi: usize) -> Option<&preview::ImagePreview> {
+        self.previews.get(fi).and_then(|p| p.as_ref())
     }
 
     /// The stacked uncommitted view: groups of files, each with a title and a kind.
@@ -301,7 +317,9 @@ impl DiffDoc {
             }
             // Only files with a name bar can be folded (otherwise nothing would be left to click).
             if !(self.with_headers && self.collapsed.contains(&fi)) {
-                if f.binary || f.hunks.is_empty() {
+                if let Some(p) = self.previews.get(fi).and_then(|p| p.as_ref()) {
+                    self.rows.extend((0..p.rows()).map(|k| FlatRow::Image(fi, k)));
+                } else if f.binary || f.hunks.is_empty() {
                     self.rows.push(FlatRow::Note(fi));
                 }
                 for (hi, h) in f.hunks.iter().enumerate() {
@@ -481,7 +499,7 @@ enum Msg {
     Detail(PathBuf, String, Result<Detail, String>),
     WorkDiff(PathBuf, u64, Result<DiffDoc, String>),
     /// Conflicted files read for the resolver.
-    Conflicts(PathBuf, u64, Vec<(String, Result<git::ConflictFile, String>)>),
+    Conflicts(PathBuf, u64, Vec<(String, Result<git::ConflictFile, String>, Option<preview::ConflictPictures>)>),
     Reflog(PathBuf, u64, Result<Vec<git::ReflogEntry>, String>),
     SamplesReady,
     /// A folder was chosen to add; carries the repositories found in it.
@@ -797,7 +815,9 @@ impl HeadwayApp {
             // Parsing and flattening a big diff can take a while: do it here, not in the UI.
             let d = git::commit_detail(&p, &hash).map(|mut info| {
                 let files = std::mem::take(&mut info.files);
-                Detail { info, doc: DiffDoc::new(files, true) }
+                let mut doc = DiffDoc::new(files, true);
+                doc.load_previews(&p, Some(&info.hash));
+                Detail { info, doc }
             });
             Msg::Detail(p, hash, d)
         });
@@ -821,10 +841,12 @@ impl HeadwayApp {
                         })
                         .collect::<Vec<_>>()
                 };
-                DiffDoc::working(vec![
+                let mut doc = DiffDoc::working(vec![
                     ("UNSTAGED".to_string(), views::DiffMode::Unstaged, with_sub(unstaged, &st.unstaged)),
                     ("STAGED".to_string(), views::DiffMode::Staged, with_sub(staged, &st.staged)),
-                ])
+                ]);
+                doc.load_previews(&p, None);
+                doc
             });
             Msg::WorkDiff(p, generation, doc)
         });
@@ -851,7 +873,8 @@ impl HeadwayApp {
         self.spawn(move || {
             let read = files.into_iter().map(|(f, kind)| {
                 let r = git::conflict_file(&p, &f, kind);
-                (f, r)
+                let pictures = preview::load_conflict(&p, &f);
+                (f, r, pictures)
             });
             Msg::Conflicts(p.clone(), generation, read.collect())
         });
@@ -2294,6 +2317,25 @@ Binary files a/img and b/img differ
             ]
         ));
         assert_eq!(d.file_rows, [0, 5]);
+        // An image file with a preview shows its picture rows instead of the note.
+        let mut d = DiffDoc::new(git::parse_patch("diff --git a/i.png b/i.png\nnew file mode 100644\nBinary files /dev/null and b/i.png differ\n"), true);
+        let png = {
+            let mut out = std::io::Cursor::new(Vec::new());
+            image::RgbaImage::new(8, 8).write_to(&mut out, image::ImageFormat::Png).unwrap();
+            out.into_inner()
+        };
+        let dir = temp_repo("preview");
+        std::fs::write(dir.join("i.png"), &png).unwrap();
+        d.modes = vec![views::DiffMode::Untracked];
+        d.load_previews(&dir, None);
+        let n = d.preview(0).unwrap().rows();
+        assert!(n > 2);
+        assert!(matches!(d.rows[0], FlatRow::File(0)));
+        assert!(d.rows[1..=n].iter().enumerate().all(|(k, r)| matches!(r, FlatRow::Image(0, j) if *j == k)));
+        assert!(matches!(d.rows[n + 1], FlatRow::Gap));
+        d.toggle(0);
+        assert!(matches!(d.rows[..], [FlatRow::File(0), FlatRow::Gap]), "folding hides the picture");
+        let _ = std::fs::remove_dir_all(&dir);
         // Without file headers (single-file view) the hunk comes first.
         let d = DiffDoc::new(git::parse_patch("diff --git a/a b/a\n--- a/a\n+++ b/a\n@@ -1 +1 @@\n-x\n+y\n"), false);
         assert!(matches!(d.rows[0], FlatRow::Hunk(0, 0)));

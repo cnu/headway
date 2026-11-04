@@ -1740,3 +1740,67 @@ fn reflog_finds_a_lost_commit_and_resets_to_it() {
     click_last(&mut h, "topic");
     assert!(shows_containing(&h, "branch: Created from"));
 }
+
+fn png(w: u32, h: u32, rgb: [u8; 3]) -> Vec<u8> {
+    let img = image::RgbaImage::from_pixel(w, h, image::Rgba([rgb[0], rgb[1], rgb[2], 255]));
+    let mut out = std::io::Cursor::new(Vec::new());
+    img.write_to(&mut out, image::ImageFormat::Png).unwrap();
+    out.into_inner()
+}
+
+#[test]
+fn changed_pictures_show_before_and_after() {
+    let s = scratch("pictures");
+    let r = new_repo(&s.root, "art");
+    std::fs::write(r.join("logo.png"), png(40, 20, [200, 0, 0])).unwrap();
+    commit(&r, "readme.txt", "hi\n", "Add logo");
+    std::fs::write(r.join("logo.png"), png(64, 32, [0, 0, 200])).unwrap();
+    write(&r, "icon.svg", r#"<svg xmlns="http://www.w3.org/2000/svg" width="24" height="24"><circle cx="12" cy="12" r="10"/></svg>"#);
+    std::fs::write(r.join("broken.png"), b"not really a png").unwrap();
+    let mut h = app(&s, &[&r], true);
+
+    // Uncommitted: the edited picture side by side, the new ones on their own.
+    assert!(shows(&h, "Before  ·  40 × 20"), "old picture");
+    assert!(shows(&h, "After  ·  64 × 32"), "new picture");
+    assert!(shows(&h, "Added  ·  24 × 24"), "new drawing");
+    assert!(shows(&h, "Added"), "unreadable picture still gets a title");
+
+    // A commit's changes show the picture it added.
+    git_ok(&r, &["checkout", "--", "logo.png"]);
+    std::fs::remove_file(r.join("broken.png")).unwrap();
+    std::fs::remove_file(r.join("icon.svg")).unwrap();
+    ctrl(&mut h, egui::Key::R);
+    click(&mut h, "Add logo");
+    assert!(shows(&h, "Added  ·  40 × 20"));
+}
+
+#[test]
+fn conflicted_pictures_show_every_side() {
+    let s = scratch("picture-conflicts");
+    let r = new_repo(&s.root, "art");
+    std::fs::write(r.join("logo.png"), png(40, 20, [200, 0, 0])).unwrap();
+    std::fs::write(r.join("icon.png"), png(16, 16, [0, 200, 0])).unwrap();
+    commit(&r, "readme.txt", "hi\n", "Base");
+    git_ok(&r, &["checkout", "-q", "-b", "other"]);
+    std::fs::write(r.join("logo.png"), png(64, 32, [0, 0, 200])).unwrap();
+    std::fs::remove_file(r.join("icon.png")).unwrap();
+    commit(&r, "readme.txt", "hi\n", "Other side");
+    git_ok(&r, &["checkout", "-q", "main"]);
+    std::fs::write(r.join("logo.png"), png(30, 30, [0, 200, 200])).unwrap();
+    std::fs::write(r.join("icon.png"), png(24, 24, [200, 200, 0])).unwrap();
+    commit(&r, "readme.txt", "hi\n", "Main side");
+    assert!(git::run(&r, &["merge", "other"]).is_err());
+    let mut h = app(&s, &[&r], true);
+
+    // Changed on both sides: ours, theirs and the common ancestor, by name.
+    click(&mut h, "logo.png");
+    assert!(shows(&h, "main  ·  30 × 30"), "ours");
+    assert!(shows(&h, "other  ·  64 × 32"), "theirs");
+    assert!(shows(&h, "Common ancestor  ·  40 × 20"));
+    click(&mut h, "Use other's version");
+    // Deleted on one side: the side that deleted it says so.
+    click(&mut h, "icon.png");
+    assert!(shows(&h, "main  ·  24 × 24"));
+    assert!(shows(&h, "Deleted here"));
+    assert!(shows(&h, "Common ancestor  ·  16 × 16"));
+}

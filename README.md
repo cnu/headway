@@ -12,6 +12,7 @@ Headway is a desktop Git client for Linux, macOS and Windows. It groups the repo
 
 - **Workspaces** — named groups of repositories with an overview of each one's branch, changes and ahead/behind state; fetch or pull them all at once. Add one repository, every repository in a folder, or clone from a web address.
 - **History graph** — coloured branch lanes, search (Ctrl+F), and branches you can hide from the graph.
+- **Image previews** — changed pictures (PNG, JPEG, GIF, WebP, BMP, ICO, SVG) shown before and after, side by side.
 - **Staging** — every changed file stacked in one view; stage, unstage or discard whole files, hunks, or individual lines (click, shift-click or drag). Fold files, or collapse and expand them all.
 - **Merge conflicts** — a banner while a merge, rebase, cherry-pick or revert is in progress, with Continue, Abort and Skip. Walk through every conflict in the repository one at a time (Alt+↑/↓), taking either side (Alt+←/→), both, or your own edit, with the real branch names, line numbers, the common ancestor and a preview of the result; save every resolved file at once, or open your configured merge tool.
 - **Commits** — commit, amend, and edit the message of any earlier commit; later commits and every branch, tag and worktree pointing at them move along in one step.

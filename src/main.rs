@@ -8,6 +8,7 @@ mod git;
 mod graph;
 mod oplog;
 mod overview;
+mod preview;
 mod resolver;
 mod samples;
 mod theme;

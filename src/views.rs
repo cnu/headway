@@ -3,6 +3,7 @@
 use crate::app::{Action, DiffDoc, Dialog, FileSel, FlatRow, FollowUp, LineSel, OpKind, Record, RepoData, RepoView, Selection, Summary};
 use crate::git::{self, Change, FileChange, LineKind, RefKind};
 use crate::graph::Target;
+use crate::preview;
 use crate::theme::{self, *};
 use crate::workspace::{ViewPrefs, Workspace};
 use egui::text::{LayoutJob, TextFormat, TextWrapping};
@@ -1965,7 +1966,7 @@ pub enum DiffMode {
     Untracked,
 }
 
-const DIFF_ROW: f32 = 19.0;
+pub const DIFF_ROW: f32 = 19.0;
 
 /// Longest part of a line that gets drawn. Laying out a huge line (minified code,
 /// data files) every frame would freeze the window.
@@ -2245,6 +2246,46 @@ fn handle_line_pick(ui: &Ui, doc: &DiffDoc, ri: usize, resp: &egui::Response, se
     }
 }
 
+/// Space between the "before" and "after" pictures.
+const IMAGE_GAP: f32 = 24.0;
+
+/// Draw one strip of a changed picture. The diff draws only the rows on screen,
+/// so each row paints its own slice: strip 0 has the titles, strip `k` the
+/// picture's rows `(k - 1) * DIFF_ROW ..`.
+fn paint_image_strip(ui: &Ui, rect: Rect, fi: usize, k: usize, pv: &preview::ImagePreview) {
+    let clip = ui.clip_rect();
+    let p = ui.painter().with_clip_rect(clip.intersect(rect));
+    // Pinned to the visible left edge (like the section titles), and shrunk to fit a narrow pane.
+    let left = clip.left() + 16.0;
+    let n = pv.sides.len() as f32;
+    let box_w = ((clip.width() - 32.0 - IMAGE_GAP * (n - 1.0)) / n).clamp(60.0, preview::BOX_W);
+    for (i, side) in pv.sides.iter().enumerate() {
+        let x = left + i as f32 * (box_w + IMAGE_GAP);
+        if k == 0 {
+            let title = if side.error.is_some() { side.label.to_string() } else { format!("{}  ·  {} × {}", side.label, side.size[0], side.size[1]) };
+            // Named for screen readers (and tests): the picture's title.
+            let r = Rect::from_min_size(pos2(x, rect.top()), vec2(box_w, DIFF_ROW));
+            name_it(&ui.interact(r, ui.scope_id().with(("diff_image", fi, i)), Sense::hover()), egui::Role::Image, &title);
+            p.text(pos2(x, rect.center().y), Align2::LEFT_CENTER, title, theme::prop(11.5), DIM);
+            continue;
+        }
+        if let Some(e) = &side.error {
+            if k == 1 {
+                p.text(pos2(x, rect.center().y), Align2::LEFT_CENTER, e, theme::prop(12.0), FAINT);
+            }
+            continue;
+        }
+        // Where the whole picture sits, given that this strip shows part of it.
+        let size = side.display_size();
+        let size = size * (box_w / size.x).min(1.0);
+        let full = Rect::from_min_size(pos2(x, rect.top() - (k - 1) as f32 * DIFF_ROW), size);
+        if !full.intersects(rect) {
+            continue;
+        }
+        preview::paint(&p, ui.ctx(), side, full, &format!("diff-image-{fi}-{i}"));
+    }
+}
+
 pub fn diff_view(
     ui: &mut Ui,
     doc: &DiffDoc,
@@ -2359,6 +2400,11 @@ pub fn diff_view(
                             None => "No text changes (mode or empty file)",
                         };
                         p.text(pos2(tx, y), Align2::LEFT_CENTER, t, theme::prop(12.5), DIM);
+                    }
+                    FlatRow::Image(fi, k) => {
+                        if let Some(pv) = doc.preview(fi) {
+                            paint_image_strip(ui, rect, fi, k, pv);
+                        }
                     }
                     FlatRow::Gap => {}
                     FlatRow::Hunk(fi, hi) => {
