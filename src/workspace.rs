@@ -46,11 +46,22 @@ pub struct ViewPrefs {
     /// Blame settings (ignore whitespace, moved lines, listed commits).
     #[serde(default)]
     pub blame: crate::git::BlameOptions,
+    /// How diffs are shown.
+    #[serde(default)]
+    pub diff: DiffPrefs,
+}
+
+/// How diffs are shown; remembered between runs.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct DiffPrefs {
+    /// Changes to spaces and indentation are left out (`-w`).
+    pub ignore_whitespace: bool,
 }
 
 impl Default for ViewPrefs {
     fn default() -> Self {
-        Self { sidebar_open: true, split: 0.5, blame: Default::default() }
+        Self { sidebar_open: true, split: 0.5, blame: Default::default(), diff: Default::default() }
     }
 }
 

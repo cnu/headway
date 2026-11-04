@@ -15,6 +15,12 @@ workflow uses that version's section as the GitHub release notes.
   side of a change is coloured as a whole file, so strings and comments that
   span lines come out right; it happens in the background once the diff is on
   screen, and each version of a file is only coloured once.
+- **Changed words**: when a line was edited rather than rewritten, the exact
+  words that changed stand out on both the removed and the added line. A
+  change to only spaces or tabs shows them as · and →. **Ignore whitespace**
+  (above the diff, remembered) leaves such changes out with `-w`; files with
+  nothing else changed say so, and lines and hunks can't be staged until it's
+  off again.
 - **Blame and file history**: right-click a file in a commit's details, the
   changes list or a diff, or find any file or folder with Ctrl/Cmd+P. Blame
   shows who last changed each line, grouped by commit, with an age colour

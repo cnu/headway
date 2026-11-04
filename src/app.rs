@@ -7,7 +7,7 @@ use crate::theme::{self, *};
 use crate::workspace::{Config, Workspace};
 use crate::fileview::{self, FileView, Mode};
 use crate::resolver::Resolver;
-use crate::{highlight, overview, preview, views};
+use crate::{diffmodel, highlight, overview, preview, views};
 use egui::{Align, Color32, CornerRadius, Id, Layout, Margin, RichText, Sense, Stroke, Ui};
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
@@ -229,6 +229,12 @@ pub struct DiffDoc {
     pub commit: Option<String>,
     /// Syntax colours of each file, filled in the background after the diff is shown.
     pub syntax: Arc<Vec<std::sync::OnceLock<highlight::Sides>>>,
+    /// The words that changed in lines facing each other: (file, hunk, line) →
+    /// byte ranges, and whether only whitespace changed.
+    pub marks: HashMap<(usize, usize, usize), diffmodel::LineMarks>,
+    /// Whitespace changes are left out, so the hunks don't match the files and
+    /// lines and hunks can't be staged from them.
+    pub whitespace_ignored: bool,
 }
 
 /// Files with more changed lines than this start folded in the uncommitted view.
@@ -256,7 +262,16 @@ impl DiffDoc {
             previews: Vec::new(),
             commit: None,
             syntax: Arc::new((0..n).map(|_| Default::default()).collect()),
+            marks: HashMap::new(),
+            whitespace_ignored: false,
         };
+        for (fi, f) in doc.files.iter().enumerate() {
+            for (hi, h) in f.hunks.iter().enumerate() {
+                for (li, marks) in diffmodel::hunk_marks(&h.lines) {
+                    doc.marks.insert((fi, hi, li), marks);
+                }
+            }
+        }
         doc.rebuild();
         doc
     }
@@ -338,7 +353,12 @@ impl DiffDoc {
 
     /// Whether lines and blocks of this file can be staged/unstaged here.
     pub fn editable(&self, fi: usize) -> bool {
-        self.modes.get(fi).is_some_and(|m| *m != views::DiffMode::Commit) && !self.submodule.get(fi).copied().unwrap_or(false)
+        self.modes.get(fi).is_some_and(|m| *m != views::DiffMode::Commit) && !self.submodule.get(fi).copied().unwrap_or(false) && !self.whitespace_ignored
+    }
+
+    /// The changed words of one line, and whether only whitespace changed.
+    pub fn marks(&self, fi: usize, hi: usize, li: usize) -> Option<(&[std::ops::Range<usize>], bool)> {
+        self.marks.get(&(fi, hi, li)).map(|(r, ws)| (r.as_slice(), *ws))
     }
 
     fn rebuild(&mut self) {
@@ -642,6 +662,8 @@ pub enum Action {
     ToggleAmend,
     FetchAll,
     PullAll,
+    /// How diffs are shown changed: show the open ones again.
+    DiffPrefsChanged,
 }
 
 impl Action {
@@ -915,11 +937,13 @@ impl HeadwayApp {
             rv.detail_loading = true;
         }
         let p = path.to_path_buf();
+        let ws = self.cfg.view.diff.ignore_whitespace;
         self.spawn_stream(move |send| {
             // Parsing and flattening a big diff can take a while: do it here, not in the UI.
-            let d = git::commit_detail(&p, &hash).map(|mut info| {
+            let d = git::commit_detail(&p, &hash, ws).map(|mut info| {
                 let files = std::mem::take(&mut info.files);
                 let mut doc = DiffDoc::new(files, true);
+                doc.whitespace_ignored = ws;
                 doc.load_previews(&p, Some(&info.hash));
                 Detail { info, doc }
             });
@@ -939,8 +963,9 @@ impl HeadwayApp {
         rv.wd_gen += 1;
         let generation = rv.wd_gen;
         let p = path.to_path_buf();
+        let ws = self.cfg.view.diff.ignore_whitespace;
         self.spawn_stream(move |send| {
-            let doc = git::worktree_diffs(&p, &st).map(|(unstaged, staged)| {
+            let doc = git::worktree_diffs(&p, &st, ws).map(|(unstaged, staged)| {
                 let with_sub = |files: Vec<DiffFile>, list: &[git::FileChange]| {
                     files
                         .into_iter()
@@ -954,6 +979,7 @@ impl HeadwayApp {
                     ("UNSTAGED".to_string(), views::DiffMode::Unstaged, with_sub(unstaged, &st.unstaged)),
                     ("STAGED".to_string(), views::DiffMode::Staged, with_sub(staged, &st.staged)),
                 ]);
+                doc.whitespace_ignored = ws;
                 doc.load_previews(&p, None);
                 doc
             });
@@ -1113,9 +1139,11 @@ impl HeadwayApp {
             _ => std::iter::once(c.path.clone()).chain(c.old_path.clone()).collect(),
         };
         let p = path.to_path_buf();
+        let ws = self.cfg.view.diff.ignore_whitespace;
         self.spawn_stream(move |send| {
-            let doc = git::commit_files(&p, &c.hash, &paths).map(|files| {
+            let doc = git::commit_files(&p, &c.hash, &paths, ws).map(|files| {
                 let mut doc = DiffDoc::new(files, true);
+                doc.whitespace_ignored = ws;
                 doc.load_previews(&p, Some(&c.hash));
                 doc
             });
@@ -1673,6 +1701,26 @@ impl HeadwayApp {
                 None => self.refresh_overview(),
             },
             Action::RefreshOverview => self.refresh_overview(),
+            Action::DiffPrefsChanged => {
+                self.save();
+                let Some(p) = active else { return };
+                let Some(rv) = self.tabs.get(&p) else { return };
+                let commit = match &rv.selection {
+                    Some(Selection::Commit(h)) => Some(h.clone()),
+                    _ => None,
+                };
+                let wd = rv.wd_doc.is_some() || rv.selection == Some(Selection::WorkingDir);
+                let history = rv.file_view.as_ref().and_then(|f| f.history.as_ref()).and_then(|h| h.selected);
+                if let Some(h) = commit {
+                    self.load_detail(&p, h);
+                }
+                if wd {
+                    self.load_work_diff(&p);
+                }
+                if let Some(i) = history {
+                    self.select_history(&p, i);
+                }
+            }
             Action::SelectCommit(hash) => {
                 let Some(p) = active else { return };
                 if let Some(rv) = self.tabs.get_mut(&p) {
@@ -2862,6 +2910,21 @@ Binary files a/img and b/img differ
         // Without file headers (single-file view) the hunk comes first.
         let d = DiffDoc::new(git::parse_patch("diff --git a/a b/a\n--- a/a\n+++ b/a\n@@ -1 +1 @@\n-x\n+y\n"), false);
         assert!(matches!(d.rows[0], FlatRow::Hunk(0, 0)));
+    }
+
+    #[test]
+    fn diffs_mark_the_changed_words_of_facing_lines() {
+        let d = DiffDoc::new(git::parse_patch("diff --git a/a b/a\n--- a/a\n+++ b/a\n@@ -1,2 +1,2 @@\n-let a = 1;\n+let a = 2;\n x\n"), false);
+        let word = [8..9, 0..0];
+        assert_eq!(d.marks(0, 0, 0), Some((&word[..1], false)));
+        assert_eq!(d.marks(0, 0, 1), Some((&word[..1], false)));
+        assert_eq!(d.marks(0, 0, 2), None, "unchanged lines have no marks");
+        let mut d = d;
+        assert!(!d.editable(0));
+        d.modes = vec![views::DiffMode::Unstaged];
+        assert!(d.editable(0));
+        d.whitespace_ignored = true;
+        assert!(!d.editable(0), "a -w diff can't be staged from");
     }
 
     fn two_file_doc() -> DiffDoc {

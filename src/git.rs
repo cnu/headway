@@ -751,16 +751,63 @@ pub struct CommitDetail {
     pub files: Vec<DiffFile>,
 }
 
-pub fn commit_detail(repo: &Path, hash: &str) -> GitResult<CommitDetail> {
+/// Said of a file whose only changes are to whitespace, while those are ignored.
+pub const WHITESPACE_ONLY: &str = "Only whitespace changed (hidden by Ignore whitespace)";
+
+/// `-w` when whitespace changes are ignored.
+fn ws_args(ignore_whitespace: bool) -> &'static [&'static str] {
+    if ignore_whitespace { &["-w"] } else { &[] }
+}
+
+/// With whitespace ignored, a file whose changes were all whitespace is left
+/// with no hunks: say so instead of showing nothing.
+fn note_whitespace_only(files: &mut [DiffFile], ignore_whitespace: bool) {
+    if ignore_whitespace {
+        for f in files.iter_mut().filter(|f| f.hunks.is_empty() && !f.binary && f.note.is_none() && f.header.contains("\nindex ")) {
+            f.note = Some(WHITESPACE_ONLY.into());
+        }
+    }
+}
+
+/// `git show -w` leaves out files whose changes were all whitespace. Put them
+/// back, in the commit's order, as notes saying so.
+fn keep_whitespace_only_files(repo: &Path, hash: &str, paths: &[String], files: Vec<DiffFile>) -> GitResult<Vec<DiffFile>> {
+    let mut args = vec!["show", "--format=", "--name-status", "-M", "--diff-merges=first-parent", hash, "--"];
+    args.extend(paths.iter().map(String::as_str));
+    let mut by_path: HashMap<String, DiffFile> = files.into_iter().map(|f| (f.path.clone(), f)).collect();
+    let mut out = Vec::new();
+    for line in run(repo, &args)?.lines() {
+        let f: Vec<&str> = line.split('\t').collect();
+        let Some(change) = f.first().and_then(|s| s.chars().next()).and_then(Change::from_code) else { continue };
+        let (old, path) = match f.as_slice() {
+            [_, old, new] => (Some(unquote_path(old)), unquote_path(new)),
+            [_, path] => (None, unquote_path(path)),
+            _ => continue,
+        };
+        out.push(by_path.remove(&path).unwrap_or_else(|| {
+            DiffFile::placeholder(&FileChange { path: path.clone(), old_path: old, change, submodule: false }, WHITESPACE_ONLY)
+        }));
+    }
+    // Anything name-status didn't list (it should list everything) goes at the end.
+    out.extend(by_path.into_values());
+    Ok(out)
+}
+
+pub fn commit_detail(repo: &Path, hash: &str, ignore_whitespace: bool) -> GitResult<CommitDetail> {
     let head = run(repo, &["show", "-s", "--format=%H%x1f%an%x1f%ae%x1f%cn%x1f%at%x1f%P%x1f%B", hash])?;
     let f: Vec<&str> = head.splitn(7, '\x1f').collect();
     if f.len() < 7 {
         return Err("Unexpected output from git show".into());
     }
-    let patch = run(
-        repo,
-        &["show", "--no-ext-diff", "--full-index", "--format=", "--patch", "-M", "--diff-merges=first-parent", hash],
-    )?;
+    let mut args = vec!["show", "--no-ext-diff", "--full-index", "--format=", "--patch", "-M", "--diff-merges=first-parent"];
+    args.extend(ws_args(ignore_whitespace));
+    args.push(hash);
+    let patch = run(repo, &args)?;
+    let mut files = parse_patch(&patch);
+    note_whitespace_only(&mut files, ignore_whitespace);
+    if ignore_whitespace {
+        files = keep_whitespace_only_files(repo, hash, &[], files)?;
+    }
     Ok(CommitDetail {
         hash: f[0].to_string(),
         author: f[1].to_string(),
@@ -769,7 +816,7 @@ pub fn commit_detail(repo: &Path, hash: &str) -> GitResult<CommitDetail> {
         time: f[4].parse().unwrap_or(0),
         parents: f[5].split(' ').filter(|s| !s.is_empty()).map(String::from).collect(),
         message: f[6].trim_end().to_string(),
-        files: parse_patch(&patch),
+        files,
     })
 }
 
@@ -986,17 +1033,25 @@ pub const MAX_NEW_FILE_BYTES: u64 = 2 * 1024 * 1024;
 
 /// Diffs of every uncommitted change, in the order the status lists them:
 /// (unstaged, including new files) and (staged).
-pub fn worktree_diffs(repo: &Path, st: &Status) -> GitResult<(Vec<DiffFile>, Vec<DiffFile>)> {
-    let take = |out: String| -> HashMap<String, DiffFile> { parse_patch(&out).into_iter().map(|f| (f.path.clone(), f)).collect() };
-    let mut unstaged_map = take(run(repo, &["diff", "--no-ext-diff", "--full-index"])?);
-    let mut staged_map = take(run(repo, &["diff", "--no-ext-diff", "--full-index", "--cached", "-M"])?);
+/// With `ignore_whitespace`, changes to whitespace aren't shown (`-w`).
+pub fn worktree_diffs(repo: &Path, st: &Status, ignore_whitespace: bool) -> GitResult<(Vec<DiffFile>, Vec<DiffFile>)> {
+    let take = |args: &[&str]| -> GitResult<HashMap<String, DiffFile>> {
+        let mut args = args.to_vec();
+        args.extend(ws_args(ignore_whitespace));
+        let mut files = parse_patch(&run(repo, &args)?);
+        note_whitespace_only(&mut files, ignore_whitespace);
+        Ok(files.into_iter().map(|f| (f.path.clone(), f)).collect())
+    };
+    let mut unstaged_map = take(&["diff", "--no-ext-diff", "--full-index"])?;
+    let mut staged_map = take(&["diff", "--no-ext-diff", "--full-index", "--cached", "-M"])?;
+    let none = if ignore_whitespace { WHITESPACE_ONLY } else { "No text changes" };
     let mut new_shown = 0;
     let unstaged = st
         .unstaged
         .iter()
         .map(|fc| {
             if fc.change != Change::Untracked {
-                return unstaged_map.remove(&fc.path).unwrap_or_else(|| DiffFile::placeholder(fc, "No text changes"));
+                return unstaged_map.remove(&fc.path).unwrap_or_else(|| DiffFile::placeholder(fc, none));
             }
             let size = std::fs::metadata(repo.join(&fc.path)).map(|m| m.len()).unwrap_or(0);
             if size > MAX_NEW_FILE_BYTES {
@@ -1015,7 +1070,7 @@ pub fn worktree_diffs(repo: &Path, st: &Status) -> GitResult<(Vec<DiffFile>, Vec
     let staged = st
         .staged
         .iter()
-        .map(|fc| staged_map.remove(&fc.path).unwrap_or_else(|| DiffFile::placeholder(fc, "No text changes")))
+        .map(|fc| staged_map.remove(&fc.path).unwrap_or_else(|| DiffFile::placeholder(fc, none)))
         .collect();
     Ok((unstaged, staged))
 }
@@ -2869,10 +2924,17 @@ pub fn parse_file_log(out: &str, path: &str, folder: bool) -> Vec<FileCommit> {
 }
 
 /// What one commit changed in `paths` (a file under its old and new names, or a folder).
-pub fn commit_files(repo: &Path, hash: &str, paths: &[String]) -> GitResult<Vec<DiffFile>> {
-    let mut args = vec!["show", "--no-ext-diff", "--full-index", "--format=", "--patch", "-M", "--diff-merges=first-parent", hash, "--"];
+pub fn commit_files(repo: &Path, hash: &str, paths: &[String], ignore_whitespace: bool) -> GitResult<Vec<DiffFile>> {
+    let mut args = vec!["show", "--no-ext-diff", "--full-index", "--format=", "--patch", "-M", "--diff-merges=first-parent"];
+    args.extend(ws_args(ignore_whitespace));
+    args.extend([hash, "--"]);
     args.extend(paths.iter().map(String::as_str));
-    Ok(parse_patch(&run(repo, &args)?))
+    let mut files = parse_patch(&run(repo, &args)?);
+    note_whitespace_only(&mut files, ignore_whitespace);
+    if ignore_whitespace {
+        files = keep_whitespace_only_files(repo, hash, paths, files)?;
+    }
+    Ok(files)
 }
 
 /// Commits that changed lines `start..=end` of `path` as it is at `rev`, newest
@@ -3017,6 +3079,38 @@ mod tests {
     }
 
     #[test]
+    fn ignoring_whitespace_hides_whitespace_only_changes() {
+        let dir = temp_repo("ignore-ws");
+        std::fs::write(dir.join("a.rs"), "fn a() {\n    x();\n}\n").unwrap();
+        std::fs::write(dir.join("b.rs"), "fn b() {}\n").unwrap();
+        stage(&dir, &["a.rs".into(), "b.rs".into()]).unwrap();
+        commit(&dir, "first", false).unwrap();
+        // a.rs: only re-indented; b.rs: a real change.
+        std::fs::write(dir.join("a.rs"), "fn a() {\n\tx();\n}\n").unwrap();
+        std::fs::write(dir.join("b.rs"), "fn b() { y(); }\n").unwrap();
+        let st = status(&dir).unwrap();
+
+        let (shown, _) = worktree_diffs(&dir, &st, false).unwrap();
+        assert!(shown.iter().all(|f| f.hunks.len() == 1 && f.note.is_none()));
+        let (ignored, _) = worktree_diffs(&dir, &st, true).unwrap();
+        let a = ignored.iter().find(|f| f.path == "a.rs").unwrap();
+        assert!(a.hunks.is_empty());
+        assert_eq!(a.note.as_deref(), Some(WHITESPACE_ONLY));
+        assert_eq!(ignored.iter().find(|f| f.path == "b.rs").unwrap().hunks.len(), 1, "real changes still show");
+
+        // The same for a commit and for a file's history.
+        stage(&dir, &["a.rs".into(), "b.rs".into()]).unwrap();
+        commit(&dir, "second", false).unwrap();
+        let head = run(&dir, &["rev-parse", "HEAD"]).unwrap().trim().to_string();
+        let d = commit_detail(&dir, &head, true).unwrap();
+        assert_eq!(d.files.iter().find(|f| f.path == "a.rs").and_then(|f| f.note.as_deref()), Some(WHITESPACE_ONLY));
+        assert_eq!(commit_detail(&dir, &head, false).unwrap().files.iter().find(|f| f.path == "a.rs").unwrap().hunks.len(), 1);
+        let files = commit_files(&dir, &head, &["a.rs".into()], true).unwrap();
+        assert_eq!(files[0].note.as_deref(), Some(WHITESPACE_ONLY));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
     fn hunk_stage_unstage_discard_and_commit() {
         let dir = temp_repo("hunks");
         let original: String = (1..=30).map(|i| format!("line {i}\n")).collect();
@@ -3058,7 +3152,7 @@ mod tests {
         assert_eq!(commits.len(), 2);
         assert_eq!(commits[0].summary, "second, amended");
         assert!(commits[0].refs.iter().any(|r| r.kind == RefKind::Head && r.name == "main"));
-        let detail = commit_detail(&dir, &commits[0].hash).unwrap();
+        let detail = commit_detail(&dir, &commits[0].hash, false).unwrap();
         assert_eq!(detail.files.len(), 1);
         assert_eq!(detail.files[0].added, 1);
         let _ = std::fs::remove_dir_all(&dir);
@@ -3371,7 +3465,7 @@ submodule.old.url git@host:old.git
         std::fs::write(dir.join("new.txt"), "hello\n").unwrap();
         std::fs::write(dir.join("big.bin"), vec![b'x'; (MAX_NEW_FILE_BYTES + 1) as usize]).unwrap();
         let st = status(&dir).unwrap();
-        let (unstaged, staged) = worktree_diffs(&dir, &st).unwrap();
+        let (unstaged, staged) = worktree_diffs(&dir, &st, false).unwrap();
         let names: Vec<&str> = unstaged.iter().map(|f| f.path.as_str()).collect();
         assert_eq!(names, st.unstaged.iter().map(|f| f.path.as_str()).collect::<Vec<_>>());
         assert!(names.contains(&"a.txt") && names.contains(&"b.txt") && names.contains(&"new.txt"));
@@ -4931,10 +5025,10 @@ index 4444444..0000000
         assert_eq!(log[0].author, "Test");
 
         // The diff of just this file, under both names for the rename.
-        let files = commit_files(&dir, &log[1].hash, &["src/f.txt".into(), "g.txt".into()]).unwrap();
+        let files = commit_files(&dir, &log[1].hash, &["src/f.txt".into(), "g.txt".into()], false).unwrap();
         assert_eq!(files.len(), 1);
         assert_eq!((files[0].change.clone(), files[0].old_path.as_deref()), (Change::Renamed, Some("src/f.txt")));
-        let files = commit_files(&dir, &log[2].hash, &["src/f.txt".into()]).unwrap();
+        let files = commit_files(&dir, &log[2].hash, &["src/f.txt".into()], false).unwrap();
         assert_eq!((files[0].added, files[0].removed), (1, 1));
 
         // A folder lists what happened inside it, without following anything out.

@@ -557,7 +557,7 @@ fn blame_panel(ui: &mut Ui, b: &mut Blame, keys: bool, actions: &mut Vec<Action>
                 match b.syntax.as_ref().and_then(|h| h.line(ri as u32 + 1, &lines[ri])) {
                     Some(spans) => {
                         let dark = ui.visuals().dark_mode;
-                        let g = p.layout_job(views::code_job(&lines[ri], spans, theme::syntax(highlight::Tok::Plain, dark), dark));
+                        let g = p.layout_job(views::code_job(&lines[ri], spans, theme::syntax(highlight::Tok::Plain, dark), dark, views::Emphasis::NONE));
                         p.galley(pos2(tx, y - g.size().y / 2.0), g, CODE);
                     }
                     None => {

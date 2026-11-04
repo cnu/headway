@@ -5,7 +5,7 @@ use crate::git::{self, Change, FileChange, LineKind, RefKind};
 use crate::graph::Target;
 use crate::{highlight, preview};
 use crate::theme::{self, *};
-use crate::workspace::{ViewPrefs, Workspace};
+use crate::workspace::{DiffPrefs, ViewPrefs, Workspace};
 use egui::text::{LayoutJob, TextFormat, TextWrapping};
 use egui::{Align, Align2, Color32, Layout, Margin, Pos2, Rect, RichText, Sense, Stroke, Ui, pos2, vec2};
 use std::collections::HashMap;
@@ -81,8 +81,8 @@ pub fn repo(
         .resizable(false)
         .frame(egui::Frame::new().fill(PANEL).stroke(Stroke::new(1.0, BORDER)))
         .show(ui, |ui| match rv.selection.clone() {
-            Some(Selection::WorkingDir) | None => staging_panel(ui, rv, actions),
-            Some(Selection::Commit(_)) => commit_panel(ui, rv, actions),
+            Some(Selection::WorkingDir) | None => staging_panel(ui, rv, &mut view.diff, actions),
+            Some(Selection::Commit(_)) => commit_panel(ui, rv, &mut view.diff, actions),
             Some(Selection::Reflog) => reflog_panel(ui, rv, actions),
         });
     let edge = detail.response.rect.left();
@@ -1506,7 +1506,7 @@ fn reflog_row(ui: &mut Ui, path: &Path, data: &RepoData, e: &git::ReflogEntry, a
 // ---------------------------------------------------------------------------
 // Commit details
 
-fn commit_panel(ui: &mut Ui, rv: &mut RepoView, actions: &mut Vec<Action>) {
+fn commit_panel(ui: &mut Ui, rv: &mut RepoView, prefs: &mut DiffPrefs, actions: &mut Vec<Action>) {
     let Some(d) = &rv.detail else {
         ui.add_space(60.0);
         ui.vertical_centered(|ui| {
@@ -1598,6 +1598,7 @@ fn commit_panel(ui: &mut Ui, rv: &mut RepoView, actions: &mut Vec<Action>) {
                             if let Some(all) = fold_buttons(ui, &d.doc) {
                                 fold_all = Some(all);
                             }
+                            diff_options(ui, prefs, actions);
                         });
                     }
                 });
@@ -1708,7 +1709,7 @@ fn file_line_tagged(
 // ---------------------------------------------------------------------------
 // Working directory: staging and committing
 
-fn staging_panel(ui: &mut Ui, rv: &mut RepoView, actions: &mut Vec<Action>) {
+fn staging_panel(ui: &mut Ui, rv: &mut RepoView, prefs: &mut DiffPrefs, actions: &mut Vec<Action>) {
     let Some(data) = &rv.data else { return };
     let st = &data.status;
     let path = rv.path.clone();
@@ -1916,7 +1917,7 @@ fn staging_panel(ui: &mut Ui, rv: &mut RepoView, actions: &mut Vec<Action>) {
             ui.vertical_centered(|ui| ui.add(egui::Spinner::new().color(ACCENT)));
             return;
         };
-        let fold = fold_bar(ui, doc);
+        let fold = fold_bar(ui, doc, prefs, actions);
         line_bar(ui, doc, &mut rv.line_sel, &path, actions);
         let toggled = diff_view(ui, doc, DiffMode::Unstaged, &mut rv.diff_scroll_to, Some(&mut rv.line_sel), &path, actions);
         // Fold/unfold, remembering the choice so it survives reloads after staging.
@@ -2104,46 +2105,92 @@ pub fn display_line(text: &str) -> String {
     out
 }
 
+/// The words of a changed line to draw out: byte ranges, their background, and
+/// whether to show spaces and tabs in them (for whitespace-only changes).
+#[derive(Clone, Copy)]
+pub struct Emphasis<'a> {
+    pub ranges: &'a [std::ops::Range<usize>],
+    pub bg: Color32,
+    pub show_whitespace: bool,
+}
+
+impl Emphasis<'_> {
+    pub const NONE: Emphasis<'static> = Emphasis { ranges: &[], bg: Color32::TRANSPARENT, show_whitespace: false };
+}
+
 /// A line of code laid out like [`display_line`] (tabs widened, very long lines
-/// shortened), coloured by its syntax `spans`; the parts they don't cover are `plain`.
-pub fn code_job(text: &str, spans: &[highlight::Span], plain: Color32, dark: bool) -> LayoutJob {
+/// shortened), coloured by its syntax `spans` (the parts they don't cover are
+/// `plain`), with the changed words in `marks` on a stronger background.
+pub fn code_job(text: &str, spans: &[highlight::Span], plain: Color32, dark: bool, marks: Emphasis) -> LayoutJob {
     let font = theme::mono(12.5);
+    let ws_color = if dark { FAINT } else { Color32::from_rgb(150, 150, 150) };
     let mut job = LayoutJob::default();
     let mut buf = String::new();
-    let mut cur = plain;
-    let flush = |job: &mut LayoutJob, buf: &mut String, color: Color32| {
+    let mut cur = (plain, false);
+    let flush = |job: &mut LayoutJob, buf: &mut String, (color, marked): (Color32, bool)| {
         if !buf.is_empty() {
-            job.append(buf, 0.0, TextFormat::simple(font.clone(), color));
+            let mut f = TextFormat::simple(font.clone(), color);
+            if marked {
+                f.background = marks.bg;
+            }
+            job.append(buf, 0.0, f);
             buf.clear();
         }
     };
-    let mut si = 0;
+    let (mut si, mut mi) = (0, 0);
     for (n, (i, c)) in text.char_indices().enumerate() {
         if n == MAX_LINE_CHARS {
             flush(&mut job, &mut buf, cur);
             buf.push_str("  … (line shortened)");
-            cur = plain;
+            cur = (plain, false);
             break;
         }
         while spans.get(si).is_some_and(|s| s.end as usize <= i) {
             si += 1;
         }
+        while marks.ranges.get(mi).is_some_and(|r| r.end <= i) {
+            mi += 1;
+        }
+        let marked = marks.ranges.get(mi).is_some_and(|r| r.start <= i);
+        let visible_ws = marked && marks.show_whitespace && (c == ' ' || c == '\t');
         let color = match spans.get(si) {
+            _ if visible_ws => ws_color,
             Some(s) if s.start as usize <= i => theme::syntax(s.tok, dark),
             _ => plain,
         };
-        if color != cur {
+        if (color, marked) != cur {
             flush(&mut job, &mut buf, cur);
-            cur = color;
+            cur = (color, marked);
         }
-        if c == '\t' {
-            buf.push_str("    ");
-        } else {
-            buf.push(c);
+        match c {
+            '\t' if visible_ws => buf.push_str("→   "),
+            '\t' => buf.push_str("    "),
+            ' ' if visible_ws => buf.push('·'),
+            _ => buf.push(c),
         }
     }
     flush(&mut job, &mut buf, cur);
     job
+}
+
+/// Draw one line of a diff's code at `pos` (its left middle): syntax colours
+/// when they're ready, and the changed words drawn out.
+#[allow(clippy::too_many_arguments)]
+fn paint_code(p: &egui::Painter, pos: Pos2, doc: &DiffDoc, fi: usize, hi: usize, li: usize, fg: Color32, dark: bool) {
+    let l = &doc.files[fi].hunks[hi].lines[li];
+    let spans = doc.spans(fi, l);
+    let marks = doc.marks(fi, hi, li);
+    if spans.is_none() && marks.is_none() {
+        p.text(pos, Align2::LEFT_CENTER, display_line(&l.text), theme::mono(12.5), fg);
+        return;
+    }
+    let plain = if spans.is_some() { theme::syntax(highlight::Tok::Plain, dark) } else { fg };
+    let emphasis = match marks {
+        Some((ranges, ws)) => Emphasis { ranges, bg: theme::emphasis(l.kind == LineKind::Add, dark), show_whitespace: ws },
+        None => Emphasis::NONE,
+    };
+    let g = p.layout_job(code_job(&l.text, spans.unwrap_or(&[]), plain, dark, emphasis));
+    p.galley(pos2(pos.x, pos.y - g.size().y / 2.0), g, fg);
 }
 
 /// A small button drawn to exactly fill `rect`, so it lines up with the row it sits in
@@ -2233,7 +2280,7 @@ fn discard_note(f: &FileChange) -> &'static str {
 }
 
 /// "N files · +a −r" with Collapse all / Expand all. Returns Some(fold everything?) when clicked.
-fn fold_bar(ui: &mut Ui, doc: &DiffDoc) -> Option<bool> {
+fn fold_bar(ui: &mut Ui, doc: &DiffDoc, prefs: &mut DiffPrefs, actions: &mut Vec<Action>) -> Option<bool> {
     let (rect, _) = ui.allocate_exact_size(vec2(ui.available_width(), 30.0), Sense::hover());
     ui.painter().rect_filled(rect, 0.0, PANEL);
     ui.painter().line_segment([rect.left_bottom(), rect.right_bottom()], Stroke::new(1.0, BORDER));
@@ -2245,8 +2292,21 @@ fn fold_bar(ui: &mut Ui, doc: &DiffDoc) -> Option<bool> {
     ui.label(RichText::new(format!("+{a}")).color(ADD_FG));
     ui.label(RichText::new(format!("−{r}")).color(DEL_FG));
     let mut out = None;
-    ui.with_layout(Layout::right_to_left(Align::Center), |ui| out = fold_buttons(ui, doc));
+    ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+        out = fold_buttons(ui, doc);
+        diff_options(ui, prefs, actions);
+    });
     out
+}
+
+/// How diffs are shown (laid out right to left, next to the fold buttons).
+fn diff_options(ui: &mut Ui, prefs: &mut DiffPrefs, actions: &mut Vec<Action>) {
+    let before = *prefs;
+    ui.checkbox(&mut prefs.ignore_whitespace, "Ignore whitespace")
+        .on_hover_text("Leave out changes to spaces and indentation (-w). Lines and hunks can't be staged while it's on.");
+    if *prefs != before {
+        actions.push(Action::DiffPrefsChanged);
+    }
 }
 
 /// The "Collapse all" and "Expand all" buttons. Returns Some(true) to fold all, Some(false) to unfold all.
@@ -2265,6 +2325,15 @@ fn fold_buttons(ui: &mut Ui, doc: &DiffDoc) -> Option<bool> {
 
 /// The bar above an uncommitted file's diff: how many lines are picked and what to do with them.
 fn line_bar(ui: &mut Ui, doc: &DiffDoc, sel: &mut LineSel, repo: &Path, actions: &mut Vec<Action>) {
+    if doc.whitespace_ignored && doc.modes.iter().any(|m| *m != DiffMode::Commit) {
+        let (rect, _) = ui.allocate_exact_size(vec2(ui.available_width(), 30.0), Sense::hover());
+        ui.painter().rect_filled(rect, 0.0, PANEL);
+        ui.painter().line_segment([rect.left_bottom(), rect.right_bottom()], Stroke::new(1.0, BORDER));
+        let text = "Whitespace changes are hidden, so lines and hunks can't be staged · turn off Ignore whitespace to stage them";
+        ui.painter().text(pos2(rect.left() + 12.0, rect.center().y), Align2::LEFT_CENTER, text, theme::prop(12.0), FAINT);
+        name_it(&ui.interact(rect, ui.scope_id().with("ws_note"), Sense::hover()), egui::Role::Label, text);
+        return;
+    }
     if !(0..doc.files.len()).any(|fi| doc.editable(fi) && !doc.files[fi].hunks.is_empty()) {
         return;
     }
@@ -2569,6 +2638,7 @@ pub fn diff_view(
                             None if f.binary => "Binary file — contents not shown",
                             None => "No text changes (mode or empty file)",
                         };
+                        name_it(&ui.interact(rect, ui.scope_id().with(("diff_note", fi)), Sense::hover()), egui::Role::Label, t);
                         p.text(pos2(tx, y), Align2::LEFT_CENTER, t, theme::prop(12.5), DIM);
                     }
                     FlatRow::Image(fi, k) => {
@@ -2653,16 +2723,7 @@ pub fn diff_view(
                             p.rect_filled(Rect::from_min_size(rect.min, vec2(4.0, DIFF_ROW)), 0.0, BLUE.gamma_multiply(0.4));
                         }
                         p.text(pos2(rect.left() + gutter + 8.0, y), Align2::LEFT_CENTER, mark, theme::mono(12.5), fg);
-                        match doc.spans(fi, l) {
-                            Some(spans) => {
-                                let dark = ui.visuals().dark_mode;
-                                let g = p.layout_job(code_job(&l.text, spans, theme::syntax(highlight::Tok::Plain, dark), dark));
-                                p.galley(pos2(tx, y - g.size().y / 2.0), g, fg);
-                            }
-                            None => {
-                                p.text(pos2(tx, y), Align2::LEFT_CENTER, display_line(&l.text), theme::mono(12.5), fg);
-                            }
-                        }
+                        paint_code(&p, pos2(tx, y), doc, fi, hi, li, fg, ui.visuals().dark_mode);
                     }
                 }
             }

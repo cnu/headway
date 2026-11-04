@@ -1999,3 +1999,29 @@ fn a_narrow_history_shows_two_lines_per_commit() {
     key(&mut h, egui::Key::ArrowUp);
     assert!(h.state().tabs[&r].selection == Some(super::Selection::Commit(rev_of(&r, "HEAD"))));
 }
+
+#[test]
+fn ignore_whitespace_hides_reindented_files_and_stops_line_staging() {
+    let s = scratch("ignore-ws");
+    let r = new_repo(&s.root, "tidy");
+    commit(&r, "a.rs", "fn a() {\n    x();\n}\n", "Start");
+    commit(&r, "b.rs", "fn b() {}\n", "Add b");
+    write(&r, "a.rs", "fn a() {\n\tx();\n}\n");
+    write(&r, "b.rs", "fn b() { y(); }\n");
+    let mut h = app(&s, &[&r], true);
+    assert_eq!(h.get_all_by_label("Stage hunk").count(), 2, "both files have a block of changes");
+
+    click(&mut h, "Ignore whitespace");
+    assert!(h.state().cfg.view.diff.ignore_whitespace, "remembered in the settings");
+    assert!(shows(&h, git::WHITESPACE_ONLY), "the re-indented file says why it shows nothing");
+    assert!(!shows(&h, "Stage hunk"), "a -w diff doesn't match the file, so it can't be staged from");
+    assert!(shows_containing(&h, "Whitespace changes are hidden"));
+
+    // A whole file can still be staged.
+    click_in_row(&mut h, "b.rs", "Stage");
+    assert_eq!(staged_files(&r), ["b.rs"]);
+
+    click(&mut h, "Ignore whitespace");
+    assert!(!shows(&h, git::WHITESPACE_ONLY));
+    assert_eq!(h.get_all_by_label("Stage hunk").count(), 1, "a.rs's block can be staged again");
+}

@@ -28,6 +28,16 @@ pub const HUNK_BG: Color32 = Color32::from_rgb(36, 44, 58);
 pub const CODE: Color32 = Color32::from_rgb(196, 202, 210);
 pub const CODE_LIGHT: Color32 = Color32::from_rgb(36, 41, 47);
 
+/// Behind the words that changed within a removed (`added == false`) or added line.
+pub fn emphasis(added: bool, dark: bool) -> Color32 {
+    match (added, dark) {
+        (true, true) => Color32::from_rgb(44, 112, 74),
+        (false, true) => Color32::from_rgb(124, 50, 58),
+        (true, false) => Color32::from_rgb(168, 234, 184),
+        (false, false) => Color32::from_rgb(255, 186, 186),
+    }
+}
+
 /// The colour of a kind of token in code, for a dark or a light background.
 pub fn syntax(tok: crate::highlight::Tok, dark: bool) -> Color32 {
     use crate::highlight::Tok::*;
