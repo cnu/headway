@@ -194,7 +194,7 @@ fn load_summary(path: &Path) -> Result<Summary, String> {
 // ---------------------------------------------------------------------------
 // Diff documents: a diff flattened into equal-height rows for fast scrolling.
 
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, Debug)]
 pub enum FlatRow {
     /// A group title ("Unstaged", "Staged") in the stacked uncommitted view.
     Section(usize),
@@ -207,6 +207,17 @@ pub enum FlatRow {
     Gap,
     /// A side-by-side row of a hunk (file, hunk, line shown left, line shown right).
     Pair(usize, usize, Option<usize>, Option<usize>),
+    /// A file with too many changed lines to show straight away, and a "Show anyway" button.
+    Large(usize),
+}
+
+/// What a click in the diff asks for.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub enum DiffClick {
+    /// Fold or unfold this file.
+    Fold(usize),
+    /// Show this large file's changes after all.
+    ShowAnyway(usize),
 }
 
 pub struct DiffDoc {
@@ -239,9 +250,13 @@ pub struct DiffDoc {
     pub whitespace_ignored: bool,
     /// Shown side by side (before on the left, after on the right).
     pub split: bool,
+    /// Large files whose changes are shown anyway.
+    pub shown_anyway: std::collections::BTreeSet<usize>,
+    /// Sizes in bytes of the binary files that aren't pictures: (before, after).
+    pub binary_sizes: HashMap<usize, (Option<u64>, Option<u64>)>,
 }
 
-/// Files with more changed lines than this start folded in the uncommitted view.
+/// Files with more changed lines than this are held back until "Show anyway".
 pub const LARGE_FILE_LINES: u32 = 300;
 
 impl DiffDoc {
@@ -269,6 +284,8 @@ impl DiffDoc {
             marks: HashMap::new(),
             whitespace_ignored: false,
             split: false,
+            shown_anyway: Default::default(),
+            binary_sizes: HashMap::new(),
         };
         for (fi, f) in doc.files.iter().enumerate() {
             for (hi, h) in f.hunks.iter().enumerate() {
@@ -281,12 +298,59 @@ impl DiffDoc {
         doc
     }
 
-    /// Read pictures of the image files (slow: call it in the background).
-    /// `commit` is the commit shown, when this is a commit's changes.
-    pub fn load_previews(&mut self, repo: &Path, commit: Option<&str>) {
+    /// Read pictures of the image files, and the sizes of other binary files
+    /// (slow: call it in the background). `commit` is the commit shown, when
+    /// this is a commit's changes.
+    pub fn load_binaries(&mut self, repo: &Path, commit: Option<&str>) {
         self.previews = preview::load_all(repo, &self.files, &self.modes, commit);
         self.commit = commit.map(String::from);
+        let on_disk = |fi: usize| matches!(self.modes.get(fi), Some(views::DiffMode::Unstaged | views::DiffMode::Untracked));
+        let binaries: Vec<usize> = (0..self.files.len()).filter(|&fi| self.files[fi].binary && self.preview(fi).is_none()).collect();
+        let ids: Vec<String> = binaries
+            .iter()
+            .flat_map(|&fi| [self.files[fi].old_id.clone(), self.files[fi].new_id.clone().filter(|_| !on_disk(fi))])
+            .flatten()
+            .collect();
+        let sizes = git::blob_sizes(repo, &ids).unwrap_or_default();
+        for fi in binaries {
+            let f = &self.files[fi];
+            let old = f.old_id.as_ref().and_then(|id| sizes.get(id).copied());
+            let new = if on_disk(fi) {
+                std::fs::metadata(repo.join(&f.path)).ok().filter(|_| f.change != Change::Deleted).map(|m| m.len())
+            } else {
+                f.new_id.as_ref().and_then(|id| sizes.get(id).copied())
+            };
+            self.binary_sizes.insert(fi, (old, new));
+        }
         self.rebuild();
+    }
+
+    /// Whether a file's changes are held back for being large (until "Show anyway").
+    pub fn held_back(&self, fi: usize) -> bool {
+        let f = &self.files[fi];
+        f.added + f.removed > LARGE_FILE_LINES && !f.hunks.is_empty() && !self.shown_anyway.contains(&fi)
+    }
+
+    /// Keep showing the large files `old` (an earlier reading of the same
+    /// changes) was told to show anyway.
+    pub fn keep_shown_anyway(&mut self, old: &DiffDoc) {
+        let keys: std::collections::HashSet<_> = old.shown_anyway.iter().filter(|&&fi| fi < old.files.len()).map(|&fi| old.fold_key(fi)).collect();
+        let shown: Vec<usize> = (0..self.files.len()).filter(|&fi| keys.contains(&self.fold_key(fi))).collect();
+        if !shown.is_empty() {
+            self.shown_anyway.extend(shown);
+            self.rebuild();
+        }
+    }
+
+    /// Act on a click in the diff.
+    pub fn apply(&mut self, click: DiffClick) {
+        match click {
+            DiffClick::Fold(fi) => self.toggle(fi),
+            DiffClick::ShowAnyway(fi) => {
+                self.shown_anyway.insert(fi);
+                self.rebuild();
+            }
+        }
     }
 
     /// The work of colouring this diff's code, to run after it's on screen.
@@ -323,7 +387,6 @@ impl DiffDoc {
     }
 
     /// The stacked uncommitted view: groups of files, each with a title and a kind.
-    /// Very large files start folded.
     pub fn working(groups: Vec<(String, views::DiffMode, Vec<(DiffFile, bool)>)>) -> Self {
         let mut files = Vec::new();
         let mut modes = Vec::new();
@@ -346,7 +409,6 @@ impl DiffDoc {
         doc.modes = modes;
         doc.submodule = submodule;
         doc.sections = sections;
-        doc.collapsed = doc.files.iter().enumerate().filter(|(_, f)| f.added + f.removed > LARGE_FILE_LINES).map(|(i, _)| i).collect();
         doc.rebuild();
         doc
     }
@@ -383,6 +445,13 @@ impl DiffDoc {
                     self.rows.extend((0..p.rows()).map(|k| FlatRow::Image(fi, k)));
                 } else if f.binary || f.hunks.is_empty() {
                     self.rows.push(FlatRow::Note(fi));
+                }
+                if self.held_back(fi) {
+                    self.rows.push(FlatRow::Large(fi));
+                    if self.with_headers {
+                        self.rows.push(FlatRow::Gap);
+                    }
+                    continue;
                 }
                 for (hi, h) in f.hunks.iter().enumerate() {
                     self.rows.push(FlatRow::Hunk(fi, hi));
@@ -970,7 +1039,7 @@ impl HeadwayApp {
                 let mut doc = DiffDoc::new(files, true);
                 doc.whitespace_ignored = ws;
                 doc.set_split(split);
-                doc.load_previews(&p, Some(&info.hash));
+                doc.load_binaries(&p, Some(&info.hash));
                 Detail { info, doc }
             });
             let job = d.as_ref().ok().map(|d| d.doc.highlighter(&p));
@@ -1007,7 +1076,7 @@ impl HeadwayApp {
                 ]);
                 doc.whitespace_ignored = ws;
                 doc.set_split(split);
-                doc.load_previews(&p, None);
+                doc.load_binaries(&p, None);
                 doc
             });
             let job = doc.as_ref().ok().map(|d| d.highlighter(&p));
@@ -1173,7 +1242,7 @@ impl HeadwayApp {
                 let mut doc = DiffDoc::new(files, true);
                 doc.whitespace_ignored = ws;
                 doc.set_split(split);
-                doc.load_previews(&p, Some(&c.hash));
+                doc.load_binaries(&p, Some(&c.hash));
                 doc
             });
             let job = doc.as_ref().ok().map(|d| d.highlighter(&p));
@@ -1361,8 +1430,11 @@ impl HeadwayApp {
                         if rv.selection == Some(Selection::Commit(hash)) {
                             rv.detail_loading = false;
                             match res {
-                                Ok(d) => {
+                                Ok(mut d) => {
                                     let other_commit = rv.detail.as_ref().map(|old| &old.info.hash) != Some(&d.info.hash);
+                                    if let Some(old) = rv.detail.as_ref().filter(|_| !other_commit) {
+                                        d.doc.keep_shown_anyway(&old.doc);
+                                    }
                                     rv.detail = Some(d);
                                     if other_commit {
                                         rv.reset_detail_scroll = true;
@@ -1384,6 +1456,9 @@ impl HeadwayApp {
                                         if let Some(&folded) = rv.wd_folds.get(&doc.fold_key(fi)) {
                                             doc.set_collapsed(fi, folded);
                                         }
+                                    }
+                                    if let Some(old) = &rv.wd_doc {
+                                        doc.keep_shown_anyway(old);
                                     }
                                     rv.wd_doc = Some(doc);
                                 }
@@ -2937,7 +3012,7 @@ Binary files a/img and b/img differ
         let dir = temp_repo("preview");
         std::fs::write(dir.join("i.png"), &png).unwrap();
         d.modes = vec![views::DiffMode::Untracked];
-        d.load_previews(&dir, None);
+        d.load_binaries(&dir, None);
         let n = d.preview(0).unwrap().rows();
         assert!(n > 2);
         assert!(matches!(d.rows[0], FlatRow::File(0)));
@@ -2999,7 +3074,7 @@ Binary files a/img and b/img differ
     }
 
     #[test]
-    fn uncommitted_changes_stack_in_groups_and_big_files_start_folded() {
+    fn uncommitted_changes_stack_in_groups_and_big_files_wait() {
         let small = |name: &str| git::parse_patch(&format!("diff --git a/{name} b/{name}\n--- a/{name}\n+++ b/{name}\n@@ -1 +1 @@\n-x\n+y\n")).remove(0);
         let big_body: String = (0..400).map(|i| format!("+line {i}\n")).collect();
         let big = git::parse_patch(&format!("diff --git a/big b/big\n--- a/big\n+++ b/big\n@@ -0,0 +1,400 @@\n{big_body}")).remove(0);
@@ -3012,7 +3087,20 @@ Binary files a/img and b/img differ
         ]);
         assert_eq!(d.sections, [(0, "UNSTAGED".to_string()), (4, "STAGED".to_string())], "empty groups are left out");
         assert!(matches!(d.rows[0], FlatRow::Section(0)));
-        assert!(d.is_collapsed(1) && !d.is_collapsed(0), "only the big file starts folded");
+        assert!(d.held_back(1) && !d.held_back(0), "only the big file is held back");
+        assert!(!d.is_collapsed(1), "held back, not folded: its name bar says why");
+        let big_rows = &d.rows[d.file_rows[1]..d.file_rows[2]];
+        assert!(matches!(big_rows, [FlatRow::File(1), FlatRow::Large(1), FlatRow::Gap]), "{big_rows:?}");
+        let mut d = d;
+        let before = d.rows.len();
+        d.apply(DiffClick::ShowAnyway(1));
+        assert!(!d.held_back(1));
+        assert_eq!(d.rows.len(), before - 1 + 1 + 400, "a hunk header and 400 lines replace the note");
+        // Reading the changes again keeps it shown.
+        let mut again = DiffDoc::working(vec![("UNSTAGED".into(), views::DiffMode::Unstaged, vec![(d.files[0].clone(), false), (d.files[1].clone(), false)])]);
+        assert!(again.held_back(1));
+        again.keep_shown_anyway(&d);
+        assert!(!again.held_back(1));
         assert_eq!(d.modes[2], views::DiffMode::Untracked, "new files are told apart from edits");
         assert_eq!(d.modes[4], views::DiffMode::Staged);
         assert!(d.editable(0) && !d.editable(3), "submodules get no line/block staging");
@@ -3053,12 +3141,12 @@ Binary files a/img and b/img differ
         // The first row is file "a"'s name bar.
         let name_bar = egui::pos2(200.0, 8.0);
         let hit = frame(&doc, click(name_bar));
-        assert_eq!(hit, Some(0));
+        assert_eq!(hit, Some(DiffClick::Fold(0)));
         doc.toggle(0);
         frame(&doc, vec![]);
         assert!(doc.is_collapsed(0));
         // Clicking it again unfolds it.
-        assert_eq!(frame(&doc, click(name_bar)), Some(0));
+        assert_eq!(frame(&doc, click(name_bar)), Some(DiffClick::Fold(0)));
         doc.toggle(0);
         assert!(!doc.is_collapsed(0));
         // A click on a changed line doesn't fold anything.

@@ -844,8 +844,8 @@ fn history_panel(ui: &mut Ui, h: &mut History, repo: &std::path::Path, keys: boo
             }
             Some(Ok(doc)) => {
                 let toggled = views::diff_view(ui, doc, DiffMode::Commit, &mut h.diff_scroll, None, repo, actions);
-                if let (Some(fi), Some(Ok(doc))) = (toggled, h.diff.as_mut()) {
-                    doc.toggle(fi);
+                if let (Some(click), Some(Ok(doc))) = (toggled, h.diff.as_mut()) {
+                    doc.apply(click);
                 }
             }
         }

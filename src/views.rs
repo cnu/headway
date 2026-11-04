@@ -1,6 +1,6 @@
 //! The repository screen: toolbar, sidebar, history, commit details, staging and diffs.
 
-use crate::app::{Action, DiffDoc, Dialog, FileOpen, FileSel, FlatRow, FollowUp, LineKey, LineSel, OpKind, Record, RepoData, RepoView, Selection, Summary};
+use crate::app::{Action, DiffClick, DiffDoc, Dialog, FileOpen, FileSel, FlatRow, FollowUp, LineKey, LineSel, OpKind, Record, RepoData, RepoView, Selection, Summary};
 use crate::git::{self, Change, FileChange, LineKind, RefKind};
 use crate::graph::Target;
 use crate::{highlight, preview};
@@ -1636,9 +1636,9 @@ fn commit_panel(ui: &mut Ui, rv: &mut RepoView, prefs: &mut DiffPrefs, actions: 
             diff_view(ui, &d.doc, DiffMode::Commit, &mut rv.diff_scroll_to, Some(&mut rv.detail_sel), &rv.path, actions)
         })
         .inner;
-    if let Some(fi) = toggled {
+    if let Some(click) = toggled {
         if let Some(d) = rv.detail.as_mut() {
-            d.doc.toggle(fi);
+            d.doc.apply(click);
         }
     }
 }
@@ -1933,9 +1933,13 @@ fn staging_panel(ui: &mut Ui, rv: &mut RepoView, prefs: &mut DiffPrefs, actions:
                     doc.set_all_collapsed(all);
                     (0..doc.files.len()).collect()
                 }
-                (None, Some(fi)) => {
+                (None, Some(DiffClick::Fold(fi))) => {
                     doc.toggle(fi);
                     vec![fi]
+                }
+                (None, Some(click @ DiffClick::ShowAnyway(_))) => {
+                    doc.apply(click);
+                    vec![]
                 }
                 _ => vec![],
             };
@@ -2505,28 +2509,114 @@ fn handle_line_pick(ui: &Ui, doc: &DiffDoc, key: LineKey, resp: &egui::Response,
 /// Space between the "before" and "after" pictures.
 const IMAGE_GAP: f32 = 24.0;
 
+/// "Binary file, 2.1 MB → 2.3 MB" (or just one size for an added or deleted file).
+pub fn binary_note(old: Option<u64>, new: Option<u64>) -> String {
+    match (old, new) {
+        (Some(o), Some(n)) => format!("Binary file, {} → {}", theme::human_size(o), theme::human_size(n)),
+        (None, Some(n)) => format!("Binary file, {}", theme::human_size(n)),
+        (Some(o), None) => format!("Binary file, was {}", theme::human_size(o)),
+        (None, None) => "Binary file — contents not shown".into(),
+    }
+}
+
+/// A picture's title: which side, its size in pixels and in bytes.
+fn picture_title(side: &preview::ImageSide) -> String {
+    if side.error.is_some() {
+        return side.label.to_string();
+    }
+    let mut t = format!("{}  ·  {} × {}", side.label, side.size[0], side.size[1]);
+    if let Some(b) = side.bytes {
+        t.push_str(&format!("  ·  {}", theme::human_size(b)));
+    }
+    t
+}
+
 /// Draw one strip of a changed picture. The diff draws only the rows on screen,
-/// so each row paints its own slice: strip 0 has the titles, strip `k` the
-/// picture's rows `(k - 1) * DIFF_ROW ..`.
-fn paint_image_strip(ui: &Ui, rect: Rect, fi: usize, k: usize, pv: &preview::ImagePreview) {
+/// so each row paints its own slice: strip 0 has the titles, strip 1 (for an
+/// edited picture) the ways to compare the two, and the strips from
+/// [`preview::ImagePreview::picture_row`] the pictures.
+fn paint_image_strip(ui: &mut Ui, rect: Rect, fi: usize, k: usize, pv: &preview::ImagePreview, path: &str) {
     let clip = ui.clip_rect();
     let p = ui.painter().with_clip_rect(clip.intersect(rect));
     // Pinned to the visible left edge (like the section titles), and shrunk to fit a narrow pane.
     let left = clip.left() + 16.0;
     let n = pv.sides.len() as f32;
     let box_w = ((clip.width() - 32.0 - IMAGE_GAP * (n - 1.0)) / n).clamp(60.0, preview::BOX_W);
-    for (i, side) in pv.sides.iter().enumerate() {
-        let x = left + i as f32 * (box_w + IMAGE_GAP);
-        if k == 0 {
-            let title = if side.error.is_some() { side.label.to_string() } else { format!("{}  ·  {} × {}", side.label, side.size[0], side.size[1]) };
+    // How to compare the two versions, kept per file while the app runs.
+    let state_id = ui.scope_id().with(("image_compare", path));
+    let (mut how, mut t): (preview::Compare, f32) = ui.data(|d| d.get_temp(state_id)).unwrap_or((preview::Compare::TwoUp, 0.5));
+    if !pv.can_compare() {
+        how = preview::Compare::TwoUp;
+    }
+    if k == 0 {
+        for (i, side) in pv.sides.iter().enumerate() {
+            let x = left + i as f32 * (box_w + IMAGE_GAP);
+            let title = picture_title(side);
             // Named for screen readers (and tests): the picture's title.
             let r = Rect::from_min_size(pos2(x, rect.top()), vec2(box_w, DIFF_ROW));
             name_it(&ui.interact(r, ui.scope_id().with(("diff_image", fi, i)), Sense::hover()), egui::Role::Image, &title);
             p.text(pos2(x, rect.center().y), Align2::LEFT_CENTER, title, theme::prop(11.5), DIM);
-            continue;
         }
+        return;
+    }
+    if k == 1 && pv.can_compare() {
+        let mut x = left;
+        for (choice, label, tip) in [
+            (preview::Compare::TwoUp, "2-up", "Before and after next to each other"),
+            (preview::Compare::Swipe, "Swipe", "After over before: move the slider to uncover one or the other"),
+            (preview::Compare::Onion, "Onion skin", "After fades in over before as you move the slider"),
+        ] {
+            let w = p.layout_no_wrap(label.to_string(), theme::prop(11.5), TEXT).size().x + 22.0;
+            let br = Rect::from_min_size(pos2(x, rect.top() + 1.0), vec2(w, DIFF_ROW - 2.0));
+            x += w + 4.0;
+            let fill = if how == choice { SELECT } else { RAISED };
+            if row_button(ui, br, label, false, fill, ("image_compare", fi, label)).on_hover_text(tip).clicked() {
+                how = choice;
+            }
+        }
+        if how != preview::Compare::TwoUp {
+            let label = if how == preview::Compare::Swipe { "Swipe position" } else { "Opacity of after" };
+            let sr = Rect::from_min_size(pos2(x + 12.0, rect.top()), vec2(260.0_f32.min((clip.right() - x - 24.0).max(80.0)), DIFF_ROW));
+            ui.put(sr, egui::Slider::new(&mut t, 0.0..=1.0).show_value(false).text(label));
+        }
+        ui.data_mut(|d| d.insert_temp(state_id, (how, t)));
+        return;
+    }
+    let row = k - pv.picture_row();
+    if how != preview::Compare::TwoUp {
+        // One on top of the other, at the same scale so equal sizes line up exactly.
+        let sizes: Vec<egui::Vec2> = pv.sides.iter().map(|s| s.display_size()).collect();
+        let widest = sizes.iter().map(|s| s.x).fold(1.0, f32::max);
+        let fit = (box_w / widest).min(1.0);
+        let top = rect.top() - row as f32 * DIFF_ROW;
+        let full: Vec<Rect> = sizes.iter().map(|s| Rect::from_min_size(pos2(left, top), *s * fit)).collect();
+        let (before, after) = (&pv.sides[0], &pv.sides[1]);
+        match how {
+            preview::Compare::Swipe => {
+                let at = left + t * widest * fit;
+                let lp = p.with_clip_rect(p.clip_rect().intersect(Rect::from_x_y_ranges(f32::NEG_INFINITY..=at, rect.y_range())));
+                let rp = p.with_clip_rect(p.clip_rect().intersect(Rect::from_x_y_ranges(at..=f32::INFINITY, rect.y_range())));
+                preview::paint(&lp, ui.ctx(), before, full[0], &format!("diff-image-{fi}-0"));
+                preview::paint(&rp, ui.ctx(), after, full[1], &format!("diff-image-{fi}-1"));
+                let tall = full[0].union(full[1]);
+                if tall.y_range().contains(rect.center().y) {
+                    p.line_segment([pos2(at, rect.top()), pos2(at, rect.bottom())], Stroke::new(2.0, ACCENT));
+                }
+            }
+            _ => {
+                // The checkerboard behind all of after, then before, then after faded in.
+                preview::paint_layer(&p, ui.ctx(), after, full[1], &format!("diff-image-{fi}-1"), Color32::TRANSPARENT, true);
+                preview::paint(&p, ui.ctx(), before, full[0], &format!("diff-image-{fi}-0"));
+                let tint = Color32::from_white_alpha((t * 255.0).round() as u8);
+                preview::paint_layer(&p, ui.ctx(), after, full[1], &format!("diff-image-{fi}-1"), tint, false);
+            }
+        }
+        return;
+    }
+    for (i, side) in pv.sides.iter().enumerate() {
+        let x = left + i as f32 * (box_w + IMAGE_GAP);
         if let Some(e) = &side.error {
-            if k == 1 {
+            if row == 0 {
                 p.text(pos2(x, rect.center().y), Align2::LEFT_CENTER, e, theme::prop(12.0), FAINT);
             }
             continue;
@@ -2534,7 +2624,7 @@ fn paint_image_strip(ui: &Ui, rect: Rect, fi: usize, k: usize, pv: &preview::Ima
         // Where the whole picture sits, given that this strip shows part of it.
         let size = side.display_size();
         let size = size * (box_w / size.x).min(1.0);
-        let full = Rect::from_min_size(pos2(x, rect.top() - (k - 1) as f32 * DIFF_ROW), size);
+        let full = Rect::from_min_size(pos2(x, rect.top() - row as f32 * DIFF_ROW), size);
         if !full.intersects(rect) {
             continue;
         }
@@ -2614,7 +2704,7 @@ pub fn diff_view(
     mut line_sel: Option<&mut LineSel>,
     repo: &Path,
     actions: &mut Vec<Action>,
-) -> Option<usize> {
+) -> Option<DiffClick> {
     // The commit shown (`None`: uncommitted changes), for blame and history.
     let at = doc.commit.as_deref();
     let mut toggled = None;
@@ -2691,7 +2781,7 @@ pub fn diff_view(
                         let name_x = vis.left() + 42.0;
                         let hdr = hdr.on_hover_text(if folded { "Click to show this file's changes" } else { "Click to fold this file's changes" });
                         if hdr.clicked() {
-                            toggled = Some(fi);
+                            toggled = Some(DiffClick::Fold(fi));
                         }
                         hdr.context_menu(|ui| file_history_menu(ui, &f.path, at, &f.change, actions));
                         // Buttons for uncommitted files (added after the bar, so they sit on top).
@@ -2725,9 +2815,16 @@ pub fn diff_view(
                     }
                     FlatRow::Note(fi) => {
                         let f = &doc.files[fi];
+                        let sized;
                         let t = match &f.note {
                             Some(n) => n.as_str(),
-                            None if f.binary => "Binary file — contents not shown",
+                            None if f.binary => match doc.binary_sizes.get(&fi) {
+                                Some(&(old, new)) if old.is_some() || new.is_some() => {
+                                    sized = binary_note(old, new);
+                                    sized.as_str()
+                                }
+                                _ => "Binary file — contents not shown",
+                            },
                             None => "No text changes (mode or empty file)",
                         };
                         name_it(&ui.interact(rect, ui.scope_id().with(("diff_note", fi)), Sense::hover()), egui::Role::Label, t);
@@ -2735,7 +2832,19 @@ pub fn diff_view(
                     }
                     FlatRow::Image(fi, k) => {
                         if let Some(pv) = doc.preview(fi) {
-                            paint_image_strip(ui, rect, fi, k, pv);
+                            paint_image_strip(ui, rect, fi, k, pv, &doc.files[fi].path);
+                        }
+                    }
+                    FlatRow::Large(fi) => {
+                        let f = &doc.files[fi];
+                        let n = f.added + f.removed;
+                        let t = format!("Large change: {n} lines changed, hidden to keep things quick");
+                        name_it(&ui.interact(rect, ui.scope_id().with(("diff_large", fi)), Sense::hover()), egui::Role::Label, &t);
+                        p.text(pos2(tx, y), Align2::LEFT_CENTER, &t, theme::prop(12.5), DIM);
+                        let w = p.layout_no_wrap(t, theme::prop(12.5), DIM).size().x;
+                        let br = Rect::from_min_size(pos2(tx + w + 12.0, rect.top() + 1.0), vec2(104.0, DIFF_ROW - 2.0));
+                        if row_button(ui, br, "Show anyway", false, RAISED, ("show_anyway", fi)).clicked() {
+                            toggled = Some(DiffClick::ShowAnyway(fi));
                         }
                     }
                     FlatRow::Gap => {}
@@ -2999,6 +3108,14 @@ mod tests {
         // A removed line's cell picks the removed line, not the added one facing it.
         apply_pick(&d, &mut sel, (0, 0, 1), click(false, false));
         assert_eq!(picked(&sel), [2]);
+    }
+
+    #[test]
+    fn binary_files_say_how_big_they_are() {
+        assert_eq!(binary_note(Some(2_200_000), Some(2_400_000)), "Binary file, 2.1 MB → 2.3 MB");
+        assert_eq!(binary_note(None, Some(10)), "Binary file, 10 B");
+        assert_eq!(binary_note(Some(2048), None), "Binary file, was 2.0 KB");
+        assert_eq!(binary_note(None, None), "Binary file — contents not shown");
     }
 
     #[test]

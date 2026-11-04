@@ -53,6 +53,14 @@ mod imp {
             let _ = std::fs::write(p, text);
         }
 
+        fn write_bytes(&self, file: &str, bytes: &[u8]) {
+            let p = self.dir.join(file);
+            if let Some(parent) = p.parent() {
+                let _ = std::fs::create_dir_all(parent);
+            }
+            let _ = std::fs::write(p, bytes);
+        }
+
         fn commit(&mut self, who: (&str, &str), msg: &str, hours_later: i64) {
             self.clock += hours_later * 3600;
             self.git(&["add", "-A"]);
@@ -76,11 +84,12 @@ mod imp {
     /// Fills a fresh repository with a sample project.
     type Make = fn(&mut Builder);
 
-    const SAMPLES: [(&str, Make); 4] = [
+    const SAMPLES: [(&str, Make); 5] = [
         ("web-shop", build_web_shop),
         ("api-server", build_api),
         ("design-tokens", build_tokens),
         ("price-rules", build_price_rules),
+        ("diff-showcase", build_diff_showcase),
     ];
 
     pub fn sample_workspace() -> Workspace {
@@ -273,6 +282,53 @@ mod imp {
         b.git(&["-c", "user.name=Sam Okafor", "-c", "user.email=sam@example.com", "merge", "feature/discounts"]);
     }
 
+    /// A square picture of one colour with a white band across it, as a PNG.
+    fn badge_png(size: u32, rgb: [u8; 3], band: u32) -> Vec<u8> {
+        let img = image::RgbaImage::from_fn(size, size, |_, y| {
+            if y / 4 == band { image::Rgba([255, 255, 255, 255]) } else { image::Rgba([rgb[0], rgb[1], rgb[2], 255]) }
+        });
+        let mut out = std::io::Cursor::new(Vec::new());
+        let _ = img.write_to(&mut out, image::ImageFormat::Png);
+        out.into_inner()
+    }
+
+    /// Bytes that look like a binary model file.
+    fn model_bin(len: usize, seed: u32) -> Vec<u8> {
+        (0..len).map(|i| ((i as u32).wrapping_mul(2_654_435_761).wrapping_add(seed) >> 24) as u8).collect()
+    }
+
+    fn cart_rs(rate: &str, count: &str, banner: &str, extra: &str, indent: &str) -> String {
+        format!(
+            "//! The shopping cart.\n\n/* Prices are in cents.\n   Totals never go below zero. */\npub const TAX_RATE: f64 = {rate};\n\npub const BANNER: &str = \"Welcome back!\n{banner}\";\n\npub struct Line {{\n    pub price: u64,\n    pub {count}: u32,\n}}\n\npub fn total(lines: &[Line]) -> u64 {{\n{indent}let mut sum = 0;\n    for l in lines {{\n        sum += l.price * l.{count} as u64;\n    }}\n{extra}    (sum as f64 * (1.0 + TAX_RATE)) as u64\n}}\n"
+        )
+    }
+
+    fn rows_csv(version: u32) -> String {
+        std::iter::once("sku,price,stock\n".to_string()).chain((1..=1200).map(|i| format!("SKU-{i:04},{},{}\n", 100 + i * version, (i * 7 + version) % 50))).collect()
+    }
+
+    /// Something of every kind for the diff viewer: highlighted code with a
+    /// multi-line string and comment, renamed words, a re-indented line, a
+    /// changed picture, a binary file that grew, and a change too big to show
+    /// at once (in the latest commit), plus uncommitted edits to stage.
+    fn build_diff_showcase(b: &mut Builder) {
+        b.write("README.md", "# Diff showcase\n\nA little of everything the diff viewer shows.\n");
+        b.write("src/cart.rs", &cart_rs("0.2", "count", "Free delivery over 50 EUR.", "", "    "));
+        b.write_bytes("assets/badge.png", &badge_png(48, [220, 60, 70], 5));
+        b.write_bytes("data/model.bin", &model_bin(3 * 1024, 1));
+        b.write("data/rows.csv", &rows_csv(1));
+        b.commit(JO, "Start the cart", 0);
+        b.write_bytes("assets/badge.png", &badge_png(64, [60, 110, 220], 9));
+        b.write_bytes("data/model.bin", &model_bin(180 * 1024, 2));
+        b.write("data/rows.csv", &rows_csv(2));
+        b.commit(SAM, "Refresh the badge, retrain the model and reprice every row", 30);
+        // Uncommitted: edits to stage line by line, side by side or not.
+        b.write(
+            "src/cart.rs",
+            &cart_rs("0.21", "quantity", "Free delivery over 40 EUR.", "    // Never charge less than nothing.\n    let sum = sum.max(0);\n", "\t"),
+        );
+    }
+
     #[cfg(test)]
     mod tests {
         use super::*;
@@ -343,6 +399,30 @@ mod imp {
             assert!(commits.iter().any(|c| c.summary == "Answer the orders route"));
             assert!(ranges.iter().any(|r| r.path == "server.py"));
             assert!(!git::status(&dir).unwrap().unstaged.is_empty());
+            let _ = std::fs::remove_dir_all(&dir);
+        }
+
+        #[test]
+        fn diff_showcase_has_every_kind_of_change() {
+            use crate::app::{DiffDoc, LARGE_FILE_LINES};
+            use crate::git;
+            let dir = std::env::temp_dir().join(format!("headway-sample-diff-showcase-{}", std::process::id()));
+            let _ = std::fs::remove_dir_all(&dir);
+            build_one(&dir, build_diff_showcase);
+            // The latest commit: a picture, a binary file and a large change.
+            let head = git::run(&dir, &["rev-parse", "HEAD"]).unwrap().trim().to_string();
+            let d = git::commit_detail(&dir, &head, false).unwrap();
+            let file = |p: &str| d.files.iter().find(|f| f.path == p).unwrap();
+            assert!(file("assets/badge.png").binary && file("data/model.bin").binary);
+            assert!(file("data/rows.csv").added + file("data/rows.csv").removed > LARGE_FILE_LINES);
+            // Uncommitted: code with renamed words and a line only re-indented.
+            let st = git::status(&dir).unwrap();
+            let (unstaged, _) = git::worktree_diffs(&dir, &st, false).unwrap();
+            let doc = DiffDoc::new(unstaged, true);
+            assert_eq!(doc.files[0].path, "src/cart.rs");
+            assert!(doc.marks.values().any(|(r, ws)| !ws && !r.is_empty()), "renamed words are marked");
+            assert!(doc.marks.values().any(|(_, ws)| *ws), "a whitespace-only change");
+            assert!(crate::highlight::knows("src/cart.rs"));
             let _ = std::fs::remove_dir_all(&dir);
         }
 

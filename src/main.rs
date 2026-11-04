@@ -43,7 +43,7 @@ fn main() -> eframe::Result {
             }
             "--help" | "-h" => {
                 if cfg!(debug_assertions) {
-                    println!("headway [--screenshot <file.png>] [--reset-sample web-shop|api-server|design-tokens]");
+                    println!("headway [--screenshot <file.png>] [--reset-sample web-shop|api-server|design-tokens|price-rules|diff-showcase]");
                 } else {
                     println!("headway [--screenshot <file.png>]");
                 }

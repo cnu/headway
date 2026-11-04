@@ -26,6 +26,18 @@ workflow uses that version's section as the GitHub release notes.
   removed lines face a gap, and both columns scroll together. Pick, stage,
   unstage and discard lines and hunks just as in the unified view; picks stay
   put when switching between the two.
+- **Comparing pictures**: an edited picture's titles give its size in pixels
+  and in bytes, and besides **2-up** (next to each other) it can be shown as a
+  **Swipe** (move a line across to uncover before or after) or an **Onion
+  skin** (after fades in over before).
+- **Binary files** say how big they were and are ("Binary file, 2.1 MB →
+  2.3 MB") instead of only "Binary file".
+- **Large changes**: a file with more than 300 changed lines is held back with
+  a **Show anyway** button, in commits as well as uncommitted changes, so a
+  huge generated file doesn't slow the diff down. Showing one keeps it shown
+  while you stage. Development builds add a **diff-showcase** sample with one
+  of everything (`--reset-sample diff-showcase` builds it in an existing
+  setup).
 - **Blame and file history**: right-click a file in a commit's details, the
   changes list or a diff, or find any file or folder with Ctrl/Cmd+P. Blame
   shows who last changed each line, grouped by commit, with an age colour

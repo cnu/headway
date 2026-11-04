@@ -60,6 +60,8 @@ pub struct ImageSide {
     pub label: &'static str,
     /// Size of the picture as stored in the file.
     pub size: [usize; 2],
+    /// Size of the file in bytes, when it was read.
+    pub bytes: Option<u64>,
     /// Why it can't be shown, if so.
     pub error: Option<String>,
     /// Decoded pixels, handed to the GPU (and dropped here) on first draw.
@@ -69,11 +71,11 @@ pub struct ImageSide {
 
 impl ImageSide {
     fn ok(label: &'static str, size: [usize; 2], img: ColorImage) -> Self {
-        Self { label, size, error: None, pixels: Mutex::new(Some(img)), tex: OnceLock::new() }
+        Self { label, size, bytes: None, error: None, pixels: Mutex::new(Some(img)), tex: OnceLock::new() }
     }
 
     fn failed(label: &'static str, error: String) -> Self {
-        Self { label, size: [0, 0], error: Some(error), pixels: Mutex::new(None), tex: OnceLock::new() }
+        Self { label, size: [0, 0], bytes: None, error: Some(error), pixels: Mutex::new(None), tex: OnceLock::new() }
     }
 
     /// How much blowing up (or shrinking) the picture gets when drawn.
@@ -106,20 +108,55 @@ pub struct ImagePreview {
     pub sides: Vec<ImageSide>,
 }
 
+/// How the two versions of a changed picture are shown.
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+pub enum Compare {
+    /// Next to each other.
+    #[default]
+    TwoUp,
+    /// On top of each other: before on the left of a line you move, after on the right.
+    Swipe,
+    /// On top of each other: after fades in over before.
+    Onion,
+}
+
 impl ImagePreview {
-    /// Diff rows it takes: a title row, the pictures, and a little space.
+    /// Whether there are two pictures to compare (an edit, both readable).
+    pub fn can_compare(&self) -> bool {
+        self.sides.len() == 2 && self.sides.iter().all(|s| s.error.is_none())
+    }
+
+    /// The first diff row of the pictures: after the titles, and the compare
+    /// controls when there are two pictures.
+    pub fn picture_row(&self) -> usize {
+        if self.can_compare() { 2 } else { 1 }
+    }
+
+    /// Diff rows it takes: titles, controls, the pictures, and a little space.
     pub fn rows(&self) -> usize {
         let h = self.sides.iter().map(|s| if s.error.is_some() { DIFF_ROW } else { s.display_size().y }).fold(0.0, f32::max);
-        1 + (h / DIFF_ROW).ceil() as usize + 1
+        self.picture_row() + (h / DIFF_ROW).ceil() as usize + 1
     }
 }
 
 /// Draw a picture filling `full`, over a checkerboard (so see-through parts show
 /// as such) and inside a thin border. Only what's inside the painter's clip is drawn.
 pub fn paint(p: &Painter, ctx: &egui::Context, side: &ImageSide, full: Rect, name: &str) {
+    paint_layer(p, ctx, side, full, name, Color32::WHITE, true);
+}
+
+/// Like [`paint`], with the picture tinted (for fading it in), and without the
+/// checkerboard and border when it goes over another picture.
+pub fn paint_layer(p: &Painter, ctx: &egui::Context, side: &ImageSide, full: Rect, name: &str, tint: Color32, base: bool) {
     const SQ: f32 = 8.0;
     let area = full.intersect(p.clip_rect());
     if !area.is_positive() {
+        return;
+    }
+    if !base {
+        if let Some(tex) = side.texture(ctx, name) {
+            p.image(tex.id(), full, Rect::from_min_max(pos2(0.0, 0.0), pos2(1.0, 1.0)), tint);
+        }
         return;
     }
     let (c0, c1) = (Color32::from_gray(58), Color32::from_gray(44));
@@ -134,7 +171,7 @@ pub fn paint(p: &Painter, ctx: &egui::Context, side: &ImageSide, full: Rect, nam
         row += 1.0;
     }
     if let Some(tex) = side.texture(ctx, name) {
-        p.image(tex.id(), full, Rect::from_min_max(pos2(0.0, 0.0), pos2(1.0, 1.0)), Color32::WHITE);
+        p.image(tex.id(), full, Rect::from_min_max(pos2(0.0, 0.0), pos2(1.0, 1.0)), tint);
     }
     p.rect_stroke(full, 0.0, Stroke::new(1.0, crate::theme::BORDER), egui::StrokeKind::Outside);
 }
@@ -184,6 +221,8 @@ enum Source {
     Disk(String),
 }
 
+/// Read one side's bytes: from git with `git cat-file blob <rev>:<path>` (the
+/// file as committed or staged, like `git show <rev>:<path>`), or from disk.
 fn read(repo: &Path, src: &Source) -> Result<Vec<u8>, String> {
     let bytes = match src {
         Source::Object(spec) => git::run_bytes(repo, &["cat-file", "blob", spec])?,
@@ -239,10 +278,16 @@ fn decode_svg(bytes: &[u8]) -> Result<([usize; 2], ColorImage), String> {
 }
 
 fn side(repo: &Path, label: &'static str, src: Source, svg: bool) -> ImageSide {
-    match read(repo, &src).and_then(|b| decode(&b, svg)) {
+    let bytes = match read(repo, &src) {
+        Ok(b) => b,
+        Err(e) => return ImageSide::failed(label, e),
+    };
+    let mut side = match decode(&bytes, svg) {
         Ok((size, img)) => ImageSide::ok(label, size, img),
         Err(e) => ImageSide::failed(label, e),
-    }
+    };
+    side.bytes = Some(bytes.len() as u64);
+    side
 }
 
 /// The picture(s) for one changed file, or `None` if it isn't a picture.

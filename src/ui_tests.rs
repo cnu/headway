@@ -1752,26 +1752,42 @@ fn png(w: u32, h: u32, rgb: [u8; 3]) -> Vec<u8> {
 fn changed_pictures_show_before_and_after() {
     let s = scratch("pictures");
     let r = new_repo(&s.root, "art");
-    std::fs::write(r.join("logo.png"), png(40, 20, [200, 0, 0])).unwrap();
+    let (old_png, new_png) = (png(40, 20, [200, 0, 0]), png(64, 32, [0, 0, 200]));
+    std::fs::write(r.join("logo.png"), &old_png).unwrap();
+    std::fs::write(r.join("data.bin"), vec![0u8; 3 * 1024]).unwrap();
     commit(&r, "readme.txt", "hi\n", "Add logo");
-    std::fs::write(r.join("logo.png"), png(64, 32, [0, 0, 200])).unwrap();
+    std::fs::write(r.join("logo.png"), &new_png).unwrap();
+    std::fs::write(r.join("data.bin"), vec![1u8; 5 * 1024 * 1024 / 2]).unwrap();
     write(&r, "icon.svg", r#"<svg xmlns="http://www.w3.org/2000/svg" width="24" height="24"><circle cx="12" cy="12" r="10"/></svg>"#);
     std::fs::write(r.join("broken.png"), b"not really a png").unwrap();
     let mut h = app(&s, &[&r], true);
 
-    // Uncommitted: the edited picture side by side, the new ones on their own.
-    assert!(shows(&h, "Before  ·  40 × 20"), "old picture");
-    assert!(shows(&h, "After  ·  64 × 32"), "new picture");
-    assert!(shows(&h, "Added  ·  24 × 24"), "new drawing");
+    // Uncommitted: the edited picture side by side, the new ones on their own,
+    // each with its size in pixels and in bytes.
+    assert!(shows(&h, &format!("Before  ·  40 × 20  ·  {} B", old_png.len())), "old picture");
+    assert!(shows(&h, &format!("After  ·  64 × 32  ·  {} B", new_png.len())), "new picture");
+    assert!(shows_containing(&h, "Added  ·  24 × 24  ·  "), "new drawing");
     assert!(shows(&h, "Added"), "unreadable picture still gets a title");
+    // Other binary files say how big they were and are.
+    assert!(shows(&h, "Binary file, 3.0 KB → 2.5 MB"));
+
+    // An edited picture can be compared in place: swipe, onion skin, back to 2-up.
+    assert!(!shows_containing(&h, "Swipe position"));
+    click(&mut h, "Swipe");
+    assert!(shows_containing(&h, "Swipe position"));
+    click(&mut h, "Onion skin");
+    assert!(shows_containing(&h, "Opacity of after") && !shows_containing(&h, "Swipe position"));
+    click(&mut h, "2-up");
+    assert!(!shows_containing(&h, "Opacity of after"));
 
     // A commit's changes show the picture it added.
-    git_ok(&r, &["checkout", "--", "logo.png"]);
+    git_ok(&r, &["checkout", "--", "logo.png", "data.bin"]);
     std::fs::remove_file(r.join("broken.png")).unwrap();
     std::fs::remove_file(r.join("icon.svg")).unwrap();
     ctrl(&mut h, egui::Key::R);
     click(&mut h, "Add logo");
-    assert!(shows(&h, "Added  ·  40 × 20"));
+    assert!(shows(&h, &format!("Added  ·  40 × 20  ·  {} B", old_png.len())));
+    assert!(shows(&h, "Binary file, 3.0 KB"), "an added binary file has one size");
 }
 
 #[test]
@@ -2083,4 +2099,35 @@ fn side_by_side_diffs_stage_lines_and_hunks() {
     let removed = h.get_all_by_label("line line 2").next().unwrap().rect();
     let added = h.get_all_by_label("line line two").next().unwrap().rect();
     assert!(added.top() > removed.top() && (added.left() - removed.left()).abs() < 1.0, "unified again: the new line is below the old one");
+}
+
+#[test]
+fn large_changes_wait_for_show_anyway() {
+    let s = scratch("large");
+    let r = new_repo(&s.root, "data");
+    commit(&r, "small.txt", "a\n", "Start");
+    let big: String = (1..=500).map(|i| format!("row {i}\n")).collect();
+    write(&r, "big.txt", &big);
+    write(&r, "small.txt", "b\n");
+    git_ok(&r, &["add", "big.txt"]);
+    let mut h = app(&s, &[&r], true);
+
+    let note = "Large change: 500 lines changed, hidden to keep things quick";
+    assert!(shows(&h, note), "the big file is held back");
+    assert!(!shows(&h, "line row 1"));
+    assert!(shows(&h, "line b"), "small files show as usual");
+    click(&mut h, "Show anyway");
+    assert!(!shows(&h, note));
+    assert!(shows(&h, "line row 1"));
+    // It stays shown when the changes are read again, e.g. after staging another file.
+    click_in_row(&mut h, "small.txt", "Stage");
+    assert!(!shows(&h, note) && shows(&h, "line row 1"));
+
+    // A commit's changes are held back the same way.
+    git_ok(&r, &["commit", "-q", "-m", "Add a lot of rows"]);
+    ctrl(&mut h, egui::Key::R);
+    click(&mut h, "Add a lot of rows");
+    assert!(shows(&h, note));
+    click(&mut h, "Show anyway");
+    assert!(!shows(&h, note));
 }

@@ -95,6 +95,21 @@ pub fn age_of(time: i64, oldest: i64, newest: i64) -> f32 {
     1.0 - days(newest - time) / days(newest - oldest)
 }
 
+/// A file size the way people read it: "512 B", "12.3 KB", "2.1 MB".
+pub fn human_size(bytes: u64) -> String {
+    const UNITS: [&str; 4] = ["KB", "MB", "GB", "TB"];
+    if bytes < 1024 {
+        return format!("{bytes} B");
+    }
+    let mut v = bytes as f64 / 1024.0;
+    let mut u = 0;
+    while v >= 1024.0 && u < UNITS.len() - 1 {
+        v /= 1024.0;
+        u += 1;
+    }
+    if v >= 100.0 { format!("{v:.0} {}", UNITS[u]) } else { format!("{v:.1} {}", UNITS[u]) }
+}
+
 pub fn mono(size: f32) -> FontId {
     FontId::new(size, FontFamily::Monospace)
 }
@@ -203,6 +218,17 @@ pub fn initials(name: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn sizes_read_like_people_write_them() {
+        assert_eq!(human_size(0), "0 B");
+        assert_eq!(human_size(1023), "1023 B");
+        assert_eq!(human_size(1024), "1.0 KB");
+        assert_eq!(human_size(12_600), "12.3 KB");
+        assert_eq!(human_size(2_200_000), "2.1 MB");
+        assert_eq!(human_size(150 * 1024 * 1024), "150 MB");
+        assert_eq!(human_size(3 << 40), "3.0 TB");
+    }
 
     #[test]
     fn dates_are_formatted_in_utc() {
