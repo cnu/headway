@@ -1,6 +1,6 @@
 [package]
 name = "headway"
-version = "0.1.0"
+version = "0.2.0"
 edition = "2024"
 description = "A fast, friendly native Git client with workspaces"
 license = "MIT OR Apache-2.0"
