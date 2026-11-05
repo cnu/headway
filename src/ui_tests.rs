@@ -78,7 +78,18 @@ fn app_sized(s: &Scratch, repos: &[&Path], open: bool, size: egui::Vec2) -> Harn
         ws.open_tabs = vec![ws.repos[0].clone()];
         ws.active_tab = Some(0);
     }
-    let cfg = Config::for_test(vec![ws], s.root.join("settings.json"));
+    app_with(Config::for_test(vec![ws], s.root.join("settings.json")), size)
+}
+
+/// The app started again from the settings an earlier run saved.
+fn app_restarted(s: &Scratch) -> Harness<'static, HeadwayApp> {
+    let file = s.root.join("settings.json");
+    let mut cfg: Config = serde_json::from_str(&std::fs::read_to_string(&file).unwrap()).unwrap();
+    cfg.file = Some(file);
+    app_with(cfg, egui::vec2(1600.0, 1000.0))
+}
+
+fn app_with(cfg: Config, size: egui::Vec2) -> Harness<'static, HeadwayApp> {
     let mut h = Harness::builder()
         .with_size(size)
         // Frames at a normal 60 per second (double-clicks need two clicks within 0.3 s).
@@ -2202,4 +2213,143 @@ fn dragging_side_by_side_stays_in_its_column() {
     assert!(shows(&h, "3 lines picked"));
     click(&mut h, "Stage lines");
     assert!(git_ok(&r, &["diff"]).is_empty(), "everything is staged now");
+}
+
+/// How the last frame painted the text that reads exactly `text`: each run of
+/// it with its colour and background, as they reached the screen.
+fn painted(h: &Harness<'static, HeadwayApp>, text: &str) -> Vec<(String, egui::Color32, egui::Color32)> {
+    fn walk(shape: &egui::Shape, out: &mut Vec<std::sync::Arc<egui::Galley>>) {
+        match shape {
+            egui::Shape::Text(t) => out.push(t.galley.clone()),
+            egui::Shape::Vec(v) => v.iter().for_each(|s| walk(s, out)),
+            _ => {}
+        }
+    }
+    let mut galleys = Vec::new();
+    h.output().shapes.iter().for_each(|c| walk(&c.shape, &mut galleys));
+    let g = galleys.into_iter().find(|g| g.job.text == text).unwrap_or_else(|| panic!("“{text}” isn't painted"));
+    g.job.sections.iter().map(|s| (g.job.text[s.byte_range.start.0..s.byte_range.end.0].to_string(), s.format.color, s.format.background)).collect()
+}
+
+/// The colour and background of the run of painted `line` that holds `word`.
+fn run_of(h: &Harness<'static, HeadwayApp>, line: &str, word: &str) -> (egui::Color32, egui::Color32) {
+    let runs = painted(h, line);
+    runs.iter().find(|(t, ..)| t.contains(word)).map(|(_, c, b)| (*c, *b)).unwrap_or_else(|| panic!("no run with “{word}” in {runs:?}"))
+}
+
+#[test]
+fn syntax_colours_and_changed_words_reach_diffs_and_blame() {
+    use crate::{highlight, theme};
+    use egui::Color32;
+    let s = scratch("colours");
+    let r = new_repo(&s.root, "calc");
+    let before = "fn total(price: u32, count: u32) -> u32 {\n    price * count\n}\n\nfn other() {\n    let x = 1;\n}\n";
+    let after = before.replace("price * count", "price * quantity").replace("    let x", "\tlet x");
+    commit(&r, "calc.rs", before, "Start");
+    write(&r, "calc.rs", &after);
+    let mut h = app(&s, &[&r], true);
+    let dark = h.ctx.theme() == egui::Theme::Dark;
+
+    // What the highlighter makes of `fn`, which is what should be painted.
+    let expected = highlight::highlight("calc.rs", &after).expect("Rust is known");
+    let fn_tok = expected.line(1, "fn total(price: u32, count: u32) -> u32 {").unwrap()[0].tok;
+    assert_ne!(fn_tok, highlight::Tok::Plain);
+    let fn_colour = theme::syntax(fn_tok, dark);
+
+    let check = |h: &Harness<'static, HeadwayApp>, layout: &str| {
+        // Colours arrive from the background job and are painted.
+        let (c, _) = run_of(h, "fn total(price: u32, count: u32) -> u32 {", "fn");
+        assert_eq!(c, fn_colour, "{layout}: the keyword is coloured");
+        let (_, bg) = run_of(h, "fn total(price: u32, count: u32) -> u32 {", "total");
+        assert_eq!(bg, Color32::TRANSPARENT, "{layout}: an unchanged line has no marks");
+        // Only the changed word is marked, on both sides.
+        assert_eq!(run_of(h, "    price * quantity", "quantity").1, theme::emphasis(true, dark), "{layout}");
+        assert_eq!(run_of(h, "    price * count", "count").1, theme::emphasis(false, dark), "{layout}");
+        assert_eq!(run_of(h, "    price * quantity", "price").1, Color32::TRANSPARENT, "{layout}: unchanged words aren't marked");
+        // A whitespace-only change marks the whitespace itself, drawn so it can be seen.
+        assert_eq!(run_of(h, "→   let x = 1;", "→").1, theme::emphasis(true, dark), "{layout}");
+        assert_eq!(run_of(h, "····let x = 1;", "····").1, theme::emphasis(false, dark), "{layout}");
+        assert_eq!(run_of(h, "→   let x = 1;", "let").1, Color32::TRANSPARENT, "{layout}");
+    };
+    check(&h, "unified");
+    click(&mut h, "Unified");
+    click(&mut h, "Side by side");
+    check(&h, "side by side");
+
+    // A commit's changes, read from git's blobs rather than the working copy.
+    git_ok(&r, &["commit", "-q", "-am", "Rename count"]);
+    ctrl(&mut h, egui::Key::R);
+    click(&mut h, "Rename count");
+    check(&h, "a commit");
+
+    // Blame colours the file the same way.
+    h.state_mut().do_action(super::Action::File(super::FileOpen::Blame { rev: None, path: "calc.rs".into(), line: None, back: false }));
+    settle(&mut h);
+    assert_eq!(run_of(&h, "fn total(price: u32, count: u32) -> u32 {", "fn").0, fn_colour, "blame");
+}
+
+#[test]
+fn side_by_side_unstages_picked_ranges_in_a_narrow_window() {
+    let s = scratch("split-narrow");
+    let r = new_repo(&s.root, "words");
+    commit(&r, "a.txt", "top\nold one\nold two\nold three\nbottom\n", "Start");
+    write(&r, "a.txt", "top\nnew one\nnew two\nnew three\nbottom\n");
+    git_ok(&r, &["add", "a.txt"]);
+    let size = egui::vec2(900.0, 900.0);
+    let mut h = app_sized(&s, &[&r], true, size);
+    click(&mut h, "Unified");
+    click(&mut h, "Side by side");
+
+    // The options move to their own row instead of running into each other.
+    let ws = h.get_by_label("Ignore whitespace").rect();
+    let layout = h.get_by_label("Side by side").rect();
+    assert!(!ws.intersects(layout), "{ws:?} overlaps {layout:?}");
+    // Both columns fit in the window, before on the left.
+    let left = h.get_all_by_label("line old one").next().unwrap().rect();
+    let right = h.get_all_by_label("line new one").next().unwrap().rect();
+    assert!(left.right() <= right.left() + 1.0 && right.left() < size.x, "{left:?} {right:?}");
+    assert!((left.center().y - right.center().y).abs() < 1.0);
+
+    // Shift-click picks every changed line from the first pick to the second,
+    // across both columns.
+    click(&mut h, "line old one");
+    h.get_all_by_label("line new two").next().unwrap().click_modifiers(egui::Modifiers::SHIFT);
+    settle(&mut h);
+    assert!(shows(&h, "5 lines picked"));
+    click(&mut h, "Unstage lines");
+    let cached = git_ok(&r, &["diff", "--cached"]);
+    assert!(cached.contains("+new three\n") && !cached.contains("-old") && !cached.contains("new one") && !cached.contains("new two"), "{cached}");
+    let unstaged = git_ok(&r, &["diff"]);
+    assert!(unstaged.contains("-old one\n-old two\n-old three\n+new one\n+new two\n"), "{unstaged}");
+}
+
+#[test]
+fn ignore_whitespace_on_a_commit_and_both_choices_survive_a_restart() {
+    let s = scratch("ws-commit");
+    let r = new_repo(&s.root, "tidy");
+    commit(&r, "a.rs", "fn a() {\n    x();\n}\n", "Start");
+    write(&r, "a.rs", "fn a() {\n\tx();\n}\n");
+    commit(&r, "b.rs", "fn b() { y(); }\n", "Reindent a, add b");
+    write(&r, "b.rs", "fn b() { z(); }\n");
+    let mut h = app(&s, &[&r], true);
+
+    click(&mut h, "Reindent a, add b");
+    assert!(shows(&h, "line \tx();"), "the re-indented line is shown");
+    click(&mut h, "Ignore whitespace");
+    assert!(shows(&h, git::WHITESPACE_ONLY), "the commit still lists a.rs, saying why it's empty");
+    assert!(!shows(&h, "line \tx();"));
+    assert!(shows(&h, "line fn b() { y(); }"), "real changes are still shown");
+    click(&mut h, "Unified");
+    click(&mut h, "Side by side");
+    drop(h);
+
+    // Started again: both choices are back and applied to what's on screen.
+    let mut h = app_restarted(&s);
+    assert_eq!(h.state().cfg.view.diff, crate::workspace::DiffPrefs { ignore_whitespace: true, split: true });
+    let wd = h.state().tabs[&r].wd_doc.as_ref().expect("the uncommitted changes are open");
+    assert!(wd.split && wd.whitespace_ignored);
+    assert!(shows(&h, "Side by side"));
+    click(&mut h, "Reindent a, add b");
+    assert!(shows(&h, git::WHITESPACE_ONLY));
+    assert!(h.state().tabs[&r].detail.as_ref().unwrap().doc.split);
 }
