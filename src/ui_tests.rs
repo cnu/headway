@@ -1720,6 +1720,28 @@ fn undo_from_the_menu_and_with_the_shortcut() {
 }
 
 #[test]
+fn ctrl_z_right_after_committing_takes_the_commit_back() {
+    let s = scratch("undo-commit-key");
+    let r = new_repo(&s.root, "shop");
+    commit(&r, "a.txt", "one\n", "Start shop");
+    write(&r, "b.txt", "two\n");
+    git_ok(&r, &["add", "-A"]);
+    let mut h = app(&s, &[&r], true);
+
+    // Type the message, commit, and press Ctrl+Z straight away: the shortcut undoes the
+    // commit rather than the typing in the message box.
+    type_into(&mut h, "Describe your change", "Add cart page");
+    click(&mut h, "Commit 1 file to main");
+    assert_eq!(head_subject(&r), "Add cart page");
+    ctrl(&mut h, egui::Key::Z);
+
+    assert_eq!(head_subject(&r), "Start shop");
+    assert_eq!(staged_files(&r), ["b.txt"], "the undone commit's changes are staged again");
+    assert_eq!(std::fs::read_to_string(r.join("b.txt")).unwrap(), "two\n", "nothing is lost from the working tree");
+    assert!(shows(&h, "Undid commit “Add cart page”"));
+}
+
+#[test]
 fn reflog_finds_a_lost_commit_and_resets_to_it() {
     let s = scratch("reflog");
     let r = new_repo(&s.root, "shop");
