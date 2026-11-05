@@ -1,0 +1,39 @@
+name: Bug report
+description: Something went wrong in Headway
+labels: [bug]
+body:
+  - type: textarea
+    id: what
+    attributes:
+      label: What happened
+      description: What you did, what you expected, and what happened instead. Screenshots help.
+    validations:
+      required: true
+  - type: textarea
+    id: steps
+    attributes:
+      label: How to make it happen again
+      placeholder: |
+        1. Open a repository with …
+        2. Right-click …
+  - type: input
+    id: version
+    attributes:
+      label: Headway version and platform
+      placeholder: Headway 0.2.0 on macOS 15 (Apple silicon), git 2.47
+    validations:
+      required: true
+  - type: textarea
+    id: log
+    attributes:
+      label: Command log
+      description: |
+        Headway records every git command it runs. Save the last two days of it with
+        `headway --export-log headway-log.jsonl` (add `--days 7` to go further back), then drag the
+        file in here. Credentials are taken out and your home folder is written as `~`, but the log
+        does name your folders, branches and commit messages: have a look first if that matters.
+      placeholder: Drop headway-log.jsonl here
+  - type: textarea
+    id: more
+    attributes:
+      label: Anything else

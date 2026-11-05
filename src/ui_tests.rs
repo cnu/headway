@@ -2353,3 +2353,49 @@ fn ignore_whitespace_on_a_commit_and_both_choices_survive_a_restart() {
     assert!(shows(&h, git::WHITESPACE_ONLY));
     assert!(h.state().tabs[&r].detail.as_ref().unwrap().doc.split);
 }
+
+#[test]
+fn the_command_log_keeps_receipts_for_staging_and_committing() {
+    use crate::cmdlog::{self, Mode, testing::TestLog};
+    // This test's own log folder; the app's worker threads log into it too.
+    let log = TestLog::new("ui-receipts", Mode::Normal);
+    let s = scratch("cmdlog");
+    let r = new_repo(&s.root, "shop");
+    commit(&r, "a.txt", "one\ntwo\n", "Start");
+    let before = git_ok(&r, &["rev-parse", "HEAD"]).trim().to_string();
+    write(&r, "a.txt", "one\ntwo\nthree\n");
+    let mut h = app(&s, &[&r], true);
+    click(&mut h, "a.txt");
+    click(&mut h, "Stage hunk");
+    assert_eq!(staged_files(&r), ["a.txt"]);
+    type_into(&mut h, "Describe your change", "Add three");
+    h.get_all_by_label_contains("to main").next().unwrap().click();
+    settle(&mut h);
+    assert_eq!(head_subject(&r), "Add three");
+    let after = git_ok(&r, &["rev-parse", "HEAD"]).trim().to_string();
+
+    let recent = cmdlog::recent(&r, cmdlog::RECENT);
+    let action = |label: &str| recent.iter().find(|e| e.kind == "action" && e.label.as_deref() == Some(label)).unwrap_or_else(|| panic!("no “{label}” action in {recent:#?}"));
+    let commands = |id| recent.iter().filter(move |e| e.kind == "git" && e.action_id == id).collect::<Vec<_>>();
+
+    // Staging a hunk: the patch git was given is kept, and it's linked to the action.
+    let stage = action("Stage hunk");
+    assert_eq!(stage.ok, Some(true));
+    let apply = commands(stage.action_id).into_iter().find(|e| e.argv.as_ref().is_some_and(|a| a[0] == "apply")).expect("the apply command");
+    assert_eq!(apply.action.as_deref(), Some("Stage hunk"));
+    let patch = std::fs::read_to_string(log.dir.join("blobs").join(apply.stdin_blob.as_ref().unwrap())).unwrap();
+    assert!(patch.contains("+three"), "{patch}");
+
+    // Committing: undoable, so the receipt names the undo entry and how main moved.
+    let commit = recent.iter().find(|e| e.kind == "action" && e.undo_id.is_some()).expect("the commit's action entry");
+    assert_eq!(commit.refs.as_ref().unwrap()[0].name, "refs/heads/main");
+    assert_eq!((commit.refs.as_ref().unwrap()[0].before.as_deref(), commit.refs.as_ref().unwrap()[0].after.as_deref()), (Some(before.as_str()), Some(after.as_str())));
+    assert!(commands(commit.action_id).iter().any(|e| e.argv.as_ref().is_some_and(|a| a[0] == "commit")));
+
+    // Refreshes are named, and only changes reached the disk.
+    let names: std::collections::BTreeSet<_> = recent.iter().filter_map(|e| e.action.clone()).collect();
+    assert!(names.contains("load repo"), "{names:?} {}", recent.len());
+    let disk = log.on_disk();
+    assert!(disk.iter().filter(|e| e.kind == "git").all(|e| e.class == Some(cmdlog::Class::Write)));
+    assert!(disk.iter().any(|e| e.kind == "action" && e.undo_id == commit.undo_id));
+}

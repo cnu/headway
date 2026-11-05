@@ -3,6 +3,9 @@
 //!
 //! The git side (what to save, how to put it back) is in [`crate::git`]; this keeps
 //! the list and decides which entry may be undone.
+//!
+//! Not the command log ([`crate::cmdlog`]), which records every git command that ran;
+//! this only keeps what is needed to take an action back.
 
 use crate::git::{self, GitResult, UndoEntry, Undoable};
 use std::path::{Path, PathBuf};

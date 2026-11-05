@@ -9,39 +9,85 @@ use std::process::{Command, Stdio};
 
 use serde::{Deserialize, Serialize};
 
+use crate::cmdlog;
+
 pub type GitResult<T> = Result<T, String>;
 
+/// `-c` options every command gets: personal git settings must not change the
+/// output we read. The command log records them once per session.
+pub const FIXED_CONFIG: &[&str] = &[
+    "color.ui=false",
+    "color.diff=false",
+    "color.status=false",
+    "color.branch=false",
+    "core.quotepath=false",
+    "diff.mnemonicPrefix=false",
+    "diff.noprefix=false",
+    "diff.relative=false",
+    "log.showSignature=false",
+];
+
+/// Environment every command gets (never a prompt, no optional locks, English output).
+pub const FIXED_ENV: &[(&str, &str)] = &[("GIT_TERMINAL_PROMPT", "0"), ("GIT_OPTIONAL_LOCKS", "0"), ("LC_ALL", "C")];
+
+/// Only [`exec`] and [`spawn_recorded`] may use this, so every command is in the
+/// command log (a test checks).
 fn base_cmd(repo: &Path) -> Command {
     let mut cmd = Command::new("git");
-    cmd.arg("-C")
-        .arg(repo)
-        // Personal git settings must not change the output we read.
-        .args([
-            "-c", "color.ui=false",
-            "-c", "color.diff=false",
-            "-c", "color.status=false",
-            "-c", "color.branch=false",
-            "-c", "core.quotepath=false",
-            "-c", "diff.mnemonicPrefix=false",
-            "-c", "diff.noprefix=false",
-            "-c", "diff.relative=false",
-            "-c", "log.showSignature=false",
-        ])
-        .env("GIT_TERMINAL_PROMPT", "0")
-        .env("GIT_OPTIONAL_LOCKS", "0")
-        .env("LC_ALL", "C")
-        .stdin(Stdio::null())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped());
+    cmd.arg("-C").arg(repo);
+    for c in FIXED_CONFIG {
+        cmd.arg("-c").arg(c);
+    }
+    cmd.envs(FIXED_ENV.iter().copied()).stdin(Stdio::null()).stdout(Stdio::piped()).stderr(Stdio::piped());
     cmd
+}
+
+/// Run git to the end and record it in the command log: with extra environment
+/// variables, and data on stdin (written on another thread, so a large answer
+/// can't block us).
+fn exec(repo: &Path, args: &[&str], env: &[(&str, &str)], stdin: Option<&[u8]>) -> std::io::Result<std::process::Output> {
+    let mut cmd = base_cmd(repo);
+    cmd.args(args).envs(env.iter().copied());
+    if stdin.is_some() {
+        cmd.stdin(Stdio::piped());
+    }
+    let call = cmdlog::Call::start(repo, args, env, stdin);
+    let res = cmd.spawn().and_then(|mut child| match (stdin, child.stdin.take()) {
+        (Some(input), Some(mut pipe)) => std::thread::scope(|s| {
+            // git may stop reading early (and say why on stderr); its exit code tells.
+            s.spawn(move || pipe.write_all(input));
+            child.wait_with_output()
+        }),
+        _ => child.wait_with_output(),
+    });
+    match &res {
+        Ok(out) => call.finish(out.status.code(), cmdlog::Out::Bytes(&out.stdout), &out.stderr),
+        Err(e) => call.failed(e),
+    }
+    res
+}
+
+/// Start git for a caller that reads its output as it comes; record it with
+/// [`cmdlog::Call::finish`] when it ends.
+fn spawn_recorded(repo: &Path, args: &[&str], stdin: bool) -> GitResult<(std::process::Child, cmdlog::Call)> {
+    let mut cmd = base_cmd(repo);
+    cmd.args(args);
+    if stdin {
+        cmd.stdin(Stdio::piped());
+    }
+    let call = cmdlog::Call::start(repo, args, &[], None);
+    match cmd.spawn() {
+        Ok(child) => Ok((child, call)),
+        Err(e) => {
+            call.failed(&e);
+            Err(format!("Could not start git: {e}"))
+        }
+    }
 }
 
 /// Run git and return stdout. Non-zero exit becomes an error with stderr.
 pub fn run(repo: &Path, args: &[&str]) -> GitResult<String> {
-    let out = base_cmd(repo)
-        .args(args)
-        .output()
-        .map_err(|e| format!("Could not start git: {e}"))?;
+    let out = exec(repo, args, &[], None).map_err(|e| format!("Could not start git: {e}"))?;
     if out.status.success() {
         Ok(String::from_utf8_lossy(&out.stdout).into_owned())
     } else {
@@ -57,10 +103,7 @@ pub fn run(repo: &Path, args: &[&str]) -> GitResult<String> {
 
 /// Run git, accepting any exit code (used for `diff --no-index` which exits 1 on differences).
 fn run_any(repo: &Path, args: &[&str]) -> GitResult<String> {
-    let out = base_cmd(repo)
-        .args(args)
-        .output()
-        .map_err(|e| format!("Could not start git: {e}"))?;
+    let out = exec(repo, args, &[], None).map_err(|e| format!("Could not start git: {e}"))?;
     Ok(String::from_utf8_lossy(&out.stdout).into_owned())
 }
 
@@ -71,16 +114,7 @@ pub fn run_stdin(repo: &Path, args: &[&str], input: &str) -> GitResult<String> {
 
 /// Like [`run_stdin`], with extra environment variables for git.
 fn run_stdin_env(repo: &Path, args: &[&str], input: &str, env: &[(&str, &str)]) -> GitResult<String> {
-    let mut child = base_cmd(repo)
-        .args(args)
-        .envs(env.iter().copied())
-        .stdin(Stdio::piped())
-        .spawn()
-        .map_err(|e| format!("Could not start git: {e}"))?;
-    if let Some(mut stdin) = child.stdin.take() {
-        stdin.write_all(input.as_bytes()).map_err(|e| e.to_string())?;
-    }
-    let out = child.wait_with_output().map_err(|e| e.to_string())?;
+    let out = exec(repo, args, env, Some(input.as_bytes())).map_err(|e| format!("Could not start git: {e}"))?;
     if out.status.success() {
         Ok(String::from_utf8_lossy(&out.stdout).into_owned())
     } else {
@@ -1438,12 +1472,24 @@ fn write_object(repo: &Path, kind: &str, text: &str) -> GitResult<String> {
 /// Read many objects with one `git cat-file --batch`.
 fn read_objects(repo: &Path, ids: &[String]) -> GitResult<HashMap<String, String>> {
     let input: String = ids.iter().map(|i| format!("{i}\n")).collect();
-    let mut child = base_cmd(repo).args(["cat-file", "--batch"]).stdin(Stdio::piped()).spawn().map_err(|e| e.to_string())?;
+    let (mut child, mut call) = spawn_recorded(repo, &["cat-file", "--batch"], true)?;
+    // One log entry when it starts and one when it ends, not one per object.
+    call.started(ids.len());
     let mut stdin = child.stdin.take().ok_or("no stdin")?;
     // Write on another thread so a large answer can't block us.
     let writer = std::thread::spawn(move || stdin.write_all(input.as_bytes()));
-    let out = child.wait_with_output().map_err(|e| e.to_string())?;
+    let out = child.wait_with_output();
     let _ = writer.join();
+    let out = match out {
+        Ok(out) => {
+            call.finish(out.status.code(), cmdlog::Out::Len(out.stdout.len() as u64), &out.stderr);
+            out
+        }
+        Err(e) => {
+            call.failed(&e);
+            return Err(e.to_string());
+        }
+    };
     let bytes = out.stdout;
     let mut map = HashMap::new();
     let mut i = 0;
@@ -1639,7 +1685,7 @@ pub fn operation(repo: &Path) -> GitResult<Option<Operation>> {
     let exists = |name: &str| git_path(repo, name).is_ok_and(|p| p.exists());
     let branch = run(repo, &["symbolic-ref", "-q", "--short", "HEAD"]).ok().map(|s| s.trim().to_string()).filter(|s| !s.is_empty());
     let head_name = || branch.clone().unwrap_or_else(|| short_id(repo, "HEAD"));
-    let merge_tool = run(repo, &["config", "merge.tool"]).ok().map(|s| s.trim().to_string()).filter(|s| !s.is_empty());
+    let merge_tool = run(repo, &["config", "--get", "merge.tool"]).ok().map(|s| s.trim().to_string()).filter(|s| !s.is_empty());
     let before = || run(repo, &["rev-parse", "-q", "--verify", "ORIG_HEAD"]).ok().map(|s| short_id(repo, s.trim()));
     let op = if exists("rebase-merge") || exists("rebase-apply") {
         let dir = if exists("rebase-merge") { "rebase-merge" } else { "rebase-apply" };
@@ -1722,7 +1768,7 @@ pub fn skip_operation(repo: &Path, kind: OpType) -> GitResult<String> {
 }
 
 fn run_env(repo: &Path, args: &[&str], env: &[(&str, &str)]) -> GitResult<String> {
-    let out = base_cmd(repo).args(args).envs(env.iter().copied()).output().map_err(|e| format!("Could not start git: {e}"))?;
+    let out = exec(repo, args, env, None).map_err(|e| format!("Could not start git: {e}"))?;
     if out.status.success() {
         Ok(String::from_utf8_lossy(&out.stdout).into_owned())
     } else {
@@ -1732,7 +1778,7 @@ fn run_env(repo: &Path, args: &[&str], env: &[(&str, &str)]) -> GitResult<String
 }
 
 pub(crate) fn run_bytes(repo: &Path, args: &[&str]) -> GitResult<Vec<u8>> {
-    let out = base_cmd(repo).args(args).output().map_err(|e| format!("Could not start git: {e}"))?;
+    let out = exec(repo, args, &[], None).map_err(|e| format!("Could not start git: {e}"))?;
     if out.status.success() { Ok(out.stdout) } else { Err(String::from_utf8_lossy(&out.stderr).trim().to_string()) }
 }
 
@@ -2571,7 +2617,8 @@ fn parse_reflog_line(line: &str) -> Option<ReflogEntry> {
 /// Run git and hand each line of its output to `on_line` as soon as it arrives
 /// (for slow commands worth showing early, like blame).
 pub fn stream(repo: &Path, args: &[&str], mut on_line: impl FnMut(&str)) -> GitResult<()> {
-    let mut child = base_cmd(repo).args(args).spawn().map_err(|e| format!("Could not start git: {e}"))?;
+    let (mut child, call) = spawn_recorded(repo, args, false)?;
+    let mut out_bytes: u64 = 0;
     // stderr is read on its own thread, so a chatty git can't fill the pipe and stall.
     let mut err_pipe = child.stderr.take();
     let err_reader = std::thread::spawn(move || {
@@ -2588,17 +2635,31 @@ pub fn stream(repo: &Path, args: &[&str], mut on_line: impl FnMut(&str)) -> GitR
             buf.clear();
             match r.read_until(b'\n', &mut buf) {
                 Ok(0) => break,
-                Ok(_) => on_line(String::from_utf8_lossy(&buf).trim_end_matches(['\n', '\r'])),
+                Ok(n) => {
+                    out_bytes += n as u64;
+                    on_line(String::from_utf8_lossy(&buf).trim_end_matches(['\n', '\r']))
+                }
                 Err(e) => {
                     let _ = child.kill();
                     let _ = child.wait();
+                    call.finish(None, cmdlog::Out::Len(out_bytes), err_reader.join().unwrap_or_default().as_bytes());
                     return Err(e.to_string());
                 }
             }
         }
     }
-    let status = child.wait().map_err(|e| e.to_string())?;
+    let status = child.wait();
     let err = err_reader.join().unwrap_or_default();
+    let status = match status {
+        Ok(s) => {
+            call.finish(s.code(), cmdlog::Out::Len(out_bytes), err.as_bytes());
+            s
+        }
+        Err(e) => {
+            call.failed(&e);
+            return Err(e.to_string());
+        }
+    };
     if status.success() {
         Ok(())
     } else {
@@ -2798,10 +2859,7 @@ pub fn blob_id(repo: &Path, rev: Option<&str>, path: &str) -> GitResult<String> 
 pub fn blame_text(repo: &Path, rev: Option<&str>, path: &str) -> GitResult<Vec<String>> {
     let bytes = match rev {
         Some(r) => {
-            let out = base_cmd(repo)
-                .args(["cat-file", "blob", &format!("{r}:{path}")])
-                .output()
-                .map_err(|e| format!("Could not start git: {e}"))?;
+            let out = exec(repo, &["cat-file", "blob", &format!("{r}:{path}")], &[], None).map_err(|e| format!("Could not start git: {e}"))?;
             if !out.status.success() {
                 return Err(String::from_utf8_lossy(&out.stderr).trim().to_string());
             }
@@ -3019,6 +3077,32 @@ pub fn tracked_files(repo: &Path) -> GitResult<Vec<String>> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Every git command must be in the command log: only the recorder may use
+    /// `base_cmd`, and only `base_cmd` may start git.
+    #[test]
+    fn every_git_command_goes_through_the_command_log() {
+        let src = include_str!("git.rs");
+        let src = &src[..src.find("#[cfg(test)]\nmod tests {").unwrap()];
+        let mut func = "";
+        let mut uses = 0;
+        for (n, line) in src.lines().enumerate() {
+            let t = line.trim_start();
+            for prefix in ["fn ", "pub fn ", "pub(crate) fn "] {
+                if let Some(rest) = t.strip_prefix(prefix) {
+                    func = rest.split(['(', '<']).next().unwrap_or("");
+                }
+            }
+            if line.contains("base_cmd(") {
+                uses += 1;
+                assert!(["base_cmd", "exec", "spawn_recorded"].contains(&func), "git.rs:{}: {func} uses base_cmd directly; go through exec() or spawn_recorded() so the command is logged", n + 1);
+            }
+            if line.contains("Command::new(") {
+                assert_eq!(func, "base_cmd", "git.rs:{}: start git with base_cmd", n + 1);
+            }
+        }
+        assert_eq!(uses, 3, "the definition and the two recorders");
+    }
 
     fn temp_repo(name: &str) -> PathBuf {
         let dir = std::env::temp_dir().join(format!("headway-test-{name}-{}", std::process::id()));
@@ -5189,5 +5273,99 @@ index 4444444..0000000
         // After the second hunk removed two lines.
         assert_eq!(line_before(f, 12), 12);
         assert_eq!(line_before(f, 13), 13);
+    }
+
+    // ---- The command log, recording the commands above
+
+    use crate::cmdlog::testing::TestLog;
+
+    fn git_entries(entries: &[cmdlog::Entry]) -> Vec<&cmdlog::Entry> {
+        entries.iter().filter(|e| e.kind == "git").collect()
+    }
+
+    /// A repository with one commit.
+    fn logged_repo(name: &str) -> PathBuf {
+        let dir = temp_repo(name);
+        std::fs::write(dir.join("a.txt"), "1\n").unwrap();
+        run(&dir, &["add", "a.txt"]).unwrap();
+        run(&dir, &["commit", "-q", "-m", "1"]).unwrap();
+        dir
+    }
+
+    #[test]
+    fn reads_stay_in_memory_in_normal_mode_and_go_to_disk_in_verbose() {
+        let dir = logged_repo("cmdlog-modes");
+        {
+            let log = TestLog::new("git-normal", cmdlog::Mode::Normal);
+            run(&dir, &["status"]).unwrap();
+            let disk = log.on_disk();
+            assert_eq!(disk.len(), 1, "only the session entry: {disk:?}");
+            assert_eq!(disk[0].kind, "session");
+            assert_eq!(disk[0].version.as_deref(), Some(env!("CARGO_PKG_VERSION")));
+            assert!(disk[0].git_version.as_deref().is_some_and(|v| v.starts_with("git version")));
+            assert!(disk[0].git_config.as_ref().unwrap().contains(&"color.ui=false".to_string()));
+            let recent = log.recent(&dir);
+            assert_eq!(recent.len(), 1);
+            assert_eq!(recent[0].argv.as_deref(), Some(&["status".to_string()][..]));
+            assert_eq!((recent[0].class, recent[0].action.as_deref(), recent[0].exit.clone()), (Some(cmdlog::Class::Read), Some("refresh"), Some(0.into())));
+            assert!(recent[0].stdout.is_none() && recent[0].stdout_len.is_some(), "reads keep only the length");
+        }
+        {
+            let log = TestLog::new("git-verbose", cmdlog::Mode::Verbose);
+            run(&dir, &["status"]).unwrap();
+            let disk = log.on_disk();
+            let git = git_entries(&disk);
+            assert_eq!(git.len(), 1);
+            assert_eq!(git[0].repo.as_deref(), Some(cmdlog::tilde(&dir).as_str()));
+            assert!(git[0].ts.ends_with('Z') && git[0].v == cmdlog::SCHEMA);
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_failing_command_records_its_exit_code_and_stderr() {
+        let dir = logged_repo("cmdlog-fails");
+        let log = TestLog::new("git-fails", cmdlog::Mode::Normal);
+        assert!(run(&dir, &["checkout", "no-such-branch"]).is_err());
+        let disk = log.on_disk();
+        let e = git_entries(&disk)[0].clone();
+        assert_eq!(e.exit, Some(1.into()));
+        assert!(e.stderr.as_deref().is_some_and(|s| s.contains("no-such-branch")), "{e:?}");
+        assert_eq!(e.class, Some(cmdlog::Class::Write));
+        assert!(e.duration_ms.is_some());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn apply_keeps_the_patch_and_env_is_recorded() {
+        let dir = logged_repo("cmdlog-apply");
+        std::fs::write(dir.join("a.txt"), "2\n").unwrap();
+        let patch = run(&dir, &["diff"]).unwrap();
+        let log = TestLog::new("git-apply", cmdlog::Mode::Normal);
+        run_stdin(&dir, &["apply", "--cached"], &patch).unwrap();
+        let _ = skip_operation(&dir, OpType::Rebase);
+        let disk = log.on_disk();
+        let apply = git_entries(&disk).into_iter().find(|e| e.argv.as_ref().is_some_and(|a| a[0] == "apply")).unwrap().clone();
+        assert_eq!(apply.stdin_len, Some(patch.len() as u64));
+        let blob = apply.stdin_blob.unwrap();
+        assert_eq!(blob, format!("{}.patch", apply.stdin_hash.unwrap()));
+        assert_eq!(std::fs::read_to_string(log.dir.join("blobs").join(blob)).unwrap(), patch);
+        let with_env = git_entries(&disk).into_iter().find(|e| e.env.is_some()).unwrap().clone();
+        assert_eq!(with_env.env.unwrap(), ["GIT_EDITOR=true"]);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn logging_off_writes_no_files() {
+        let dir = logged_repo("cmdlog-off");
+        let log = TestLog::new("git-off", cmdlog::Mode::Off);
+        run(&dir, &["status"]).unwrap();
+        run(&dir, &["tag", "v1"]).unwrap();
+        let (res, _) = cmdlog::run_action(&dir, 1, "Tag", None, |d| run(d, &["tag", "v2"]), |e| e.to_string());
+        res.unwrap();
+        log.logger.flush();
+        assert!(!log.dir.exists(), "no folder, no files");
+        assert!(log.recent(&dir).is_empty());
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

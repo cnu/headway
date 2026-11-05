@@ -22,6 +22,7 @@ Headway is a desktop Git client for Linux, macOS and Windows. It groups the repo
 - **Commits** — commit, amend, and edit the message of any earlier commit; later commits and every branch, tag and worktree pointing at them move along in one step.
 - **Undo** — Ctrl/Cmd+Z takes back commits, amends, resets, merges, rebases, checkouts, branch deletes, stash drops and discarded files, hunks or lines, and says why when it isn't safe. A **reflog** view finds lost commits and gets you back to them.
 - **Branches, tags, remotes, stashes, worktrees and submodules** — all in the sidebar, with the usual actions on a right-click.
+- **Command log** — a record on your computer of every git command Headway runs and why, for when something needs explaining ([Troubleshooting](#troubleshooting)).
 
 ## Install
 
@@ -49,6 +50,36 @@ On Linux, `assets/linux/install.sh` adds a desktop entry and icons for your user
 ```bash
 ./assets/linux/install.sh ~/.cargo/bin/headway
 ```
+
+## Troubleshooting
+
+Headway keeps a **command log**: every git command it runs, in which folder, for which of your actions, how long it took and what git said. Actions that change something also note the branches and tags they moved and their undo entry. It lives in your data folder:
+
+| Platform | Folder |
+|---|---|
+| Linux | `~/.local/share/headway/logs` |
+| macOS | `~/Library/Application Support/headway/logs` |
+| Windows | `%APPDATA%\headway\logs` |
+
+`headway --log-path` prints it. There's one file per day (`headway-YYYY-MM-DD.jsonl`, one JSON object per line), plus the patches behind line and hunk staging in `blobs/`, and a `crash-….jsonl` file if Headway ever crashes. Files older than 14 days are deleted, and the folder is kept under 50 MB.
+
+The log contains the commands Headway ran, folder names, commit messages, branch names and file paths. Passwords and tokens are taken out of web addresses, `-c` options and git's output. The log never leaves your computer unless you send it.
+
+How much is logged is set with `HEADWAY_LOG` when you start Headway:
+
+- `HEADWAY_LOG=normal` (the default): commands that change something, and every action. Read-only commands are only kept in memory, and written out if Headway crashes.
+- `HEADWAY_LOG=verbose`: read-only commands too (the default in development builds).
+- `HEADWAY_LOG=off`: nothing at all.
+
+`HEADWAY_LOG_DIR=<folder>` puts the log somewhere else.
+
+**Reporting a bug?** Save the last two days of the log (and any crashes) to one file, and attach it to your [issue](https://github.com/cnu/headway/issues/new/choose). Your home folder is written as `~` in it. Read it first if you like, since it names your folders and commits.
+
+```bash
+headway --export-log headway-log.jsonl
+```
+
+Add `--days 7` for more. On Windows, run these from a Command Prompt or PowerShell to see their output.
 
 ## Development
 

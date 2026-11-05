@@ -1600,6 +1600,7 @@ dependencies = [
  "similar",
  "syntect",
  "two-face",
+ "windows-sys 0.61.2",
  "winresource",
 ]
 

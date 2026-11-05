@@ -39,6 +39,10 @@ lto = "fat"          # optimise across all libraries together
 codegen-units = 1    # slower to build, smaller and faster to run
 strip = true         # leave out debugging symbols
 
+# Lets the console-less release build print --help, --log-path and --export-log output.
+[target.'cfg(windows)'.dependencies]
+windows-sys = { version = "0.61.2", features = ["Win32_System_Console"] }
+
 # Embeds the app icon into headway.exe (see build.rs).
 [target.'cfg(windows)'.build-dependencies]
 winresource = "0.1.34"

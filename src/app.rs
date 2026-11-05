@@ -7,7 +7,7 @@ use crate::theme::{self, *};
 use crate::workspace::{Config, Workspace};
 use crate::fileview::{self, FileView, Mode};
 use crate::resolver::Resolver;
-use crate::{diffmodel, highlight, overview, preview, views};
+use crate::{cmdlog, diffmodel, highlight, overview, preview, views};
 use egui::{Align, Color32, CornerRadius, Id, Layout, Margin, RichText, Sense, Stroke, Ui};
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
@@ -55,16 +55,17 @@ fn load_repo(path: &Path, limit: usize, hidden: Vec<String>) -> Result<RepoData,
         return Err("This folder is not a git repository.".into());
     }
     let crashed = |_| "A background task stopped unexpectedly".to_string();
+    // Each reader logs under this thread's action ("load repo").
     std::thread::scope(|s| {
-        let st = s.spawn(|| git::status(path));
-        let lg = s.spawn(|| git::log_filtered(path, limit, &hidden));
-        let br = s.spawn(|| git::branches(path));
-        let sh = s.spawn(|| git::stashes(path));
-        let rm = s.spawn(|| git::remotes(path));
-        let wt = s.spawn(|| git::worktrees(path));
-        let ru = s.spawn(|| git::remote_urls(path));
-        let sm = s.spawn(|| git::submodules(path));
-        let op = s.spawn(|| git::operation(path));
+        let st = s.spawn(cmdlog::carried(|| git::status(path)));
+        let lg = s.spawn(cmdlog::carried(|| git::log_filtered(path, limit, &hidden)));
+        let br = s.spawn(cmdlog::carried(|| git::branches(path)));
+        let sh = s.spawn(cmdlog::carried(|| git::stashes(path)));
+        let rm = s.spawn(cmdlog::carried(|| git::remotes(path)));
+        let wt = s.spawn(cmdlog::carried(|| git::worktrees(path)));
+        let ru = s.spawn(cmdlog::carried(|| git::remote_urls(path)));
+        let sm = s.spawn(cmdlog::carried(|| git::submodules(path)));
+        let op = s.spawn(cmdlog::carried(|| git::operation(path)));
         let status = st.join().map_err(crashed)??;
         let commits = lg.join().map_err(crashed)??;
         let (branches, tags) = br.join().map_err(crashed)??;
@@ -166,7 +167,7 @@ fn load_summary(path: &Path) -> Result<Summary, String> {
                 .iter()
                 .filter(|w| !w.is_main && !w.bare)
                 .map(|w| {
-                    let job = (!w.prunable).then(|| s.spawn(|| git::status(&w.path)));
+                    let job = (!w.prunable).then(|| s.spawn(cmdlog::carried(|| git::status(&w.path))));
                     (w, job)
                 })
                 .collect();
@@ -992,7 +993,10 @@ impl HeadwayApp {
         let tx = self.tx.clone();
         let ctx = self.ctx.clone();
         self.pending.fetch_add(1, Ordering::SeqCst);
+        // The worker logs its git commands for the same action (and logger) as this thread.
+        let scope = cmdlog::capture();
         std::thread::spawn(move || {
+            let _scope = scope.enter();
             let _ = tx.send(f());
             ctx.request_repaint();
         });
@@ -1016,12 +1020,18 @@ impl HeadwayApp {
         let limit = rv.limit;
         let p = path.to_path_buf();
         let hidden = self.cfg.hidden_refs.get(path).cloned().unwrap_or_default();
-        self.spawn(move || Msg::Repo(p.clone(), load_repo(&p, limit, hidden)));
+        self.spawn(move || {
+            let _name = cmdlog::named("load repo");
+            Msg::Repo(p.clone(), load_repo(&p, limit, hidden))
+        });
     }
 
     fn reload_summary(&self, path: &Path) {
         let p = path.to_path_buf();
-        self.spawn(move || Msg::Summary(p.clone(), load_summary(&p)));
+        self.spawn(move || {
+            let _name = cmdlog::named("load summary");
+            Msg::Summary(p.clone(), load_summary(&p))
+        });
     }
 
     fn refresh_overview(&self) {
@@ -1127,7 +1137,9 @@ impl HeadwayApp {
         let ctx = self.ctx.clone();
         let pending = self.pending.clone();
         self.pending.fetch_add(1, Ordering::SeqCst);
+        let scope = cmdlog::capture();
         std::thread::spawn(move || {
+            let _scope = scope.enter();
             let send = |m: Msg| {
                 pending.fetch_add(1, Ordering::SeqCst);
                 let _ = tx.send(m);
@@ -1151,6 +1163,7 @@ impl HeadwayApp {
         if highlight::knows(&file) {
             let (p, rev, file) = (p.clone(), rev.clone(), file.clone());
             self.spawn(move || {
+                let _name = cmdlog::named("blame");
                 let syntax = git::blob_id(&p, rev.as_deref(), &file).ok().and_then(|id| {
                     highlight::cached(&id, &file, || match rev {
                         Some(_) => git::small_blobs(&p, std::slice::from_ref(&id), highlight::MAX_BYTES as u64).ok()?.remove(&id),
@@ -1165,6 +1178,7 @@ impl HeadwayApp {
             });
         }
         self.spawn_stream(move |send| {
+            let _name = cmdlog::named("blame");
             let ignore = git::ignore_revs(&p);
             let text = git::blame_text(&p, rev.as_deref(), &file);
             let ok = text.is_ok();
@@ -1376,14 +1390,11 @@ impl HeadwayApp {
         self.next_id += 1;
         self.busy.push((id, repo.clone(), label.clone()));
         self.spawn(move || {
-            // An undoable action saves what it changes first, on this same worker.
-            let (result, undo) = match record {
-                None => (op(&repo), None),
-                Some(r) => match crate::oplog::run_recorded(&repo, &r.undo, &r.what, op) {
-                    Ok((out, entry)) => (Ok(out), entry.map(|e| e.id)),
-                    Err(e) => (Err(e), None),
-                },
-            };
+            // An undoable action saves what it changes first, on this same worker. Every
+            // git command it runs is logged as part of action `id`.
+            let rec = record.as_ref().map(|r| (&r.undo, r.what.as_str()));
+            let (result, undo) = cmdlog::run_action(&repo, id, &label, rec, op, |e| failure_text(&label, kind, e));
+            let undo = undo.map(|e| e.id);
             Msg::OpDone { id, repo, label, result, kind, undo }
         });
         id
@@ -1606,9 +1617,7 @@ impl HeadwayApp {
                                 }
                             }
                         }
-                        // Undo explains itself; git's hints would only confuse.
-                        Err(e) if kind == OpKind::Undo => self.toast(format!("Couldn't undo\n{e}"), true),
-                        Err(e) => self.toast(format!("{label} failed\n{}", friendly_error(&e)), true),
+                        Err(e) => self.toast(failure_text(&label, kind, &e), true),
                     }
                     if self.tabs.contains_key(&repo) {
                         self.reload_repo(&repo);
@@ -1622,7 +1631,7 @@ impl HeadwayApp {
                             self.toast(format!("Cloned {}", git::repo_name(&path)), false);
                             self.add_repo(path, true);
                         }
-                        Err(e) => self.toast(format!("Clone failed\n{}", friendly_error(&e)), true),
+                        Err(e) => self.toast(clone_failure_text(&e), true),
                     }
                 }
             }
@@ -2336,7 +2345,12 @@ impl HeadwayApp {
                         self.next_id += 1;
                         let (u, d) = (url.trim().to_string(), PathBuf::from(dest.trim()));
                         self.busy.push((id, d.clone(), "Cloning".into()));
-                        self.spawn(move || Msg::Cloned(id, git::clone(&u, &d)));
+                        self.spawn(move || {
+                            // No branches to compare before a clone: the folder isn't a repository yet.
+                            let what = format!("clone {u}");
+                            let (res, _) = cmdlog::traced(&d, id, &what, "Clone", false, clone_failure_text, || (git::clone(&u, &d), None));
+                            Msg::Cloned(id, res)
+                        });
                         keep = false;
                     }
                     if cancel {
@@ -2932,6 +2946,19 @@ fn first_file(st: &Status) -> Option<FileSel> {
 }
 
 /// Turn common git errors into plain language.
+/// The message shown when a git action fails (the command log keeps the same text).
+fn failure_text(label: &str, kind: OpKind, e: &str) -> String {
+    match kind {
+        // Undo explains itself; git's hints would only confuse.
+        OpKind::Undo => format!("Couldn't undo\n{e}"),
+        _ => format!("{label} failed\n{}", friendly_error(e)),
+    }
+}
+
+fn clone_failure_text(e: &str) -> String {
+    format!("Clone failed\n{}", friendly_error(e))
+}
+
 pub fn friendly_error(e: &str) -> String {
     let lower = e.to_lowercase();
     let hint = if lower.contains("could not read username") || lower.contains("authentication failed") || lower.contains("terminal prompts disabled") {
@@ -2956,6 +2983,46 @@ pub fn friendly_error(e: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// How much the command log adds to a full refresh (history, branches, status and
+    /// the overview card), and what a ref snapshot costs. Not run by default:
+    /// `HEADWAY_BENCH_REPOS=/path/a:/path/b cargo test --release refresh_timings -- --ignored --nocapture`
+    #[test]
+    #[ignore]
+    fn refresh_timings_with_and_without_the_command_log() {
+        use crate::cmdlog::{Mode, testing::TestLog};
+        let repos = std::env::var("HEADWAY_BENCH_REPOS").expect("set HEADWAY_BENCH_REPOS");
+        let median = |f: &dyn Fn()| {
+            f(); // warm the caches
+            let mut t: Vec<f64> = (0..7)
+                .map(|_| {
+                    let s = std::time::Instant::now();
+                    f();
+                    s.elapsed().as_secs_f64() * 1000.0
+                })
+                .collect();
+            t.sort_by(f64::total_cmp);
+            t[t.len() / 2]
+        };
+        for repo in std::env::split_paths(&repos) {
+            let refresh = || {
+                let _name = cmdlog::named("load repo");
+                load_repo(&repo, PAGE, Vec::new()).unwrap();
+                load_summary(&repo).unwrap();
+            };
+            let off = median(&refresh);
+            let normal = {
+                let _log = TestLog::new("bench-normal", Mode::Normal);
+                median(&refresh)
+            };
+            let verbose = {
+                let _log = TestLog::new("bench-verbose", Mode::Verbose);
+                median(&refresh)
+            };
+            let snapshot = median(&|| drop(git::ref_state(&repo)));
+            println!("{}: refresh off {off:.1} ms, normal {normal:.1} ms, verbose {verbose:.1} ms; ref snapshot {snapshot:.1} ms", repo.display());
+        }
+    }
 
     fn temp_repo(name: &str) -> PathBuf {
         let dir = std::env::temp_dir().join(format!("headway-apptest-{name}-{}", std::process::id()));

@@ -90,6 +90,16 @@ workflow uses that version's section as the GitHub release notes.
 ## [0.1.0] - 2026-11-04
 
 First release.
+- **Command log**: every git command Headway runs is recorded on your
+  computer, with the folder, the action you took that ran it, how long it
+  took and what git said, so there's a clear record if something goes wrong.
+  Commands that change something and every action (with the undo entry it
+  left, and the branches and tags it moved) are kept for 14 days in
+  `logs/` under the data folder; read-only commands are only kept in memory
+  unless `HEADWAY_LOG=verbose`. Passwords and tokens are taken out, and
+  nothing is sent anywhere. `headway --export-log report.jsonl` saves the
+  last two days to attach to a bug report, `headway --log-path` says where
+  the log is, and `HEADWAY_LOG=off` turns it off.
 
 ### Added
 

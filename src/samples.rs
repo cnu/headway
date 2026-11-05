@@ -20,6 +20,8 @@ mod imp {
         clock: i64,
     }
 
+    // These run git directly, not through crate::git, so building the samples stays
+    // out of the command log: it's setup in development builds, not the user's work.
     impl Builder<'_> {
         fn git(&self, args: &[&str]) {
             let date = format!("{} +0000", self.clock);
