@@ -2421,3 +2421,129 @@ fn the_command_log_keeps_receipts_for_staging_and_committing() {
     assert!(disk.iter().filter(|e| e.kind == "git").all(|e| e.class == Some(cmdlog::Class::Write)));
     assert!(disk.iter().any(|e| e.kind == "action" && e.undo_id == commit.undo_id));
 }
+
+// ---------------------------------------------------------------------------
+// GitHub and GitLab (from fixtures: tests never reach the network)
+
+/// A forge from fixtures with github.com signed in as `user` (`None`: signed out;
+/// `installed: false`: no gh at all), and acme/shop's pull requests.
+fn fixture_forge(user: Option<&str>, installed: bool) -> std::sync::Arc<dyn crate::forge::Forges> {
+    use crate::forge::fake::{FakeData, FakeForges, FakeHost, FakeRepo};
+    use crate::forge::*;
+    let mut data = FakeData::default();
+    data.hosts.insert("github.com".into(), FakeHost { kind: ForgeKind::GitHub, user: user.map(String::from), installed });
+    let pr = PullRequest {
+        number: 7,
+        title: "Add search".into(),
+        state: PrState::Open,
+        author: "sam".into(),
+        head_branch: "feature/search".into(),
+        base_branch: "main".into(),
+        head_repo: None,
+        url: "https://github.com/acme/shop/pull/7".into(),
+        review: ReviewDecision::Approved,
+        requested_reviewers: vec![],
+        checks: CheckSummary::from_states([(CheckState::Passing, 3)]),
+        mergeable: Mergeable::Clean,
+        updated: 1_794_303_012,
+    };
+    let info = RepoInfo { default_branch: "main".into(), merge_methods: vec![MergeMethod::Squash], web_url: "https://github.com/acme/shop".into() };
+    data.repos.insert("github.com/acme/shop".into(), FakeRepo { info: Some(info), pulls: vec![pr] });
+    std::sync::Arc::new(FakeForges::new(data))
+}
+
+/// A repository whose origin is on GitHub (never fetched: the URL is only read).
+fn github_repo(parent: &Path) -> PathBuf {
+    let r = new_repo(parent, "shop");
+    commit(&r, "a.txt", "one\n", "Start");
+    git_ok(&r, &["branch", "feature/search"]);
+    git_ok(&r, &["remote", "add", "origin", "git@github.com:acme/shop.git"]);
+    r
+}
+
+fn app_with_forge(s: &Scratch, r: &Path, open: bool, forges: std::sync::Arc<dyn crate::forge::Forges>) -> Harness<'static, HeadwayApp> {
+    let mut ws = Workspace::new("Office");
+    ws.repos = vec![r.to_path_buf()];
+    if open {
+        ws.open_tabs = vec![r.to_path_buf()];
+        ws.active_tab = Some(0);
+    }
+    let cfg = Config::for_test(vec![ws], s.root.join("settings.json"));
+    let mut h = Harness::builder()
+        .with_size(egui::vec2(1600.0, 1000.0))
+        .with_step_dt(1.0 / 60.0)
+        .with_context_setup(|ctx| ctx.add_font_provider(std::sync::Arc::new(egui_system_font_provider::SystemFontProvider::new())))
+        .build_eframe(move |cc| {
+            let mut app = HeadwayApp::with_config(cc.egui_ctx.clone(), cfg, false, None);
+            app.set_forges(forges);
+            app
+        });
+    settle(&mut h);
+    h
+}
+
+#[test]
+fn opening_a_github_repository_shows_who_is_signed_in_and_loads_its_pull_requests() {
+    let s = scratch("forge-signed-in");
+    let r = github_repo(&s.root);
+    let mut h = app_with_forge(&s, &r, true, fixture_forge(Some("alex"), true));
+
+    // Nothing on screen until asked: the line lives in the ⋯ menu.
+    assert!(!shows(&h, "GitHub · signed in as alex via gh"));
+    click(&mut h, "Repository menu");
+    assert!(shows(&h, "GitHub · signed in as alex via gh"));
+
+    // The pull requests of the repository's branches are in the cache, keyed by project.
+    let key = crate::forge::RepoKey { host: "github.com".into(), path: "acme/shop".into() };
+    let entry = h.state().forge_cache().repo(&key).expect("refreshed when the tab opened");
+    assert_eq!(entry.prs["feature/search"][0].number, 7);
+    assert!(entry.prs["main"].is_empty());
+    assert_eq!(entry.info.as_ref().unwrap().default_branch, "main");
+}
+
+#[test]
+fn without_gh_the_menu_says_how_to_get_it_and_nothing_else_changes() {
+    let s = scratch("forge-missing");
+    let r = github_repo(&s.root);
+    let mut h = app_with_forge(&s, &r, true, fixture_forge(None, false));
+    click(&mut h, "Repository menu");
+    assert!(shows(&h, "Install the GitHub CLI (gh) to see pull requests"));
+    assert!(shows(&h, "cli.github.com"), "with a link to get it");
+    let key = crate::forge::RepoKey { host: "github.com".into(), path: "acme/shop".into() };
+    assert!(h.state().forge_cache().repo(&key).unwrap().fetched.is_none(), "no pull requests asked for");
+    // Git works as before.
+    key_esc_and_commit(&mut h, &r);
+}
+
+#[test]
+fn signed_out_shows_the_sign_in_command_on_the_overview_card() {
+    let s = scratch("forge-signed-out");
+    let r = github_repo(&s.root);
+    let mut h = app_with_forge(&s, &r, false, fixture_forge(None, true));
+    h.get_all_by_label("⋯").next().expect("the card's menu").click();
+    settle(&mut h);
+    assert!(shows(&h, "Run gh auth login --hostname github.com in a terminal to see pull requests"));
+    assert!(shows(&h, "Copy command"));
+}
+
+#[test]
+fn repositories_on_other_hosts_show_no_forge_line() {
+    let s = scratch("forge-elsewhere");
+    let r = new_repo(&s.root, "shop");
+    commit(&r, "a.txt", "one\n", "Start");
+    git_ok(&r, &["remote", "add", "origin", "https://code.example.com/acme/shop.git"]);
+    let mut h = app_with_forge(&s, &r, true, fixture_forge(Some("alex"), true));
+    click(&mut h, "Repository menu");
+    assert!(shows(&h, "Copy folder path"));
+    assert!(!shows_containing(&h, "signed in"));
+    assert!(!shows_containing(&h, "auth login"));
+}
+
+/// Close the menu, then commit something: the app carries on as usual.
+fn key_esc_and_commit(h: &mut Harness<'static, HeadwayApp>, r: &Path) {
+    key(h, egui::Key::Escape);
+    write(r, "a.txt", "one\ntwo\n");
+    git_ok(r, &["commit", "-qam", "Two"]);
+    ctrl(h, egui::Key::R);
+    assert!(shows(h, "Two"));
+}

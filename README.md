@@ -22,6 +22,7 @@ Headway is a desktop Git client for Linux, macOS and Windows. It groups the repo
 - **Commits** — commit, amend, and edit the message of any earlier commit; later commits and every branch, tag and worktree pointing at them move along in one step.
 - **Undo** — Ctrl/Cmd+Z takes back commits, amends, resets, merges, rebases, checkouts, branch deletes, stash drops and discarded files, hunks or lines, and says why when it isn't safe. A **reflog** view finds lost commits and gets you back to them.
 - **Branches, tags, remotes, stashes, worktrees and submodules** — all in the sidebar, with the usual actions on a right-click.
+- **GitHub and GitLab** — uses the `gh` and `glab` you're already signed in to (GitHub Enterprise and self-managed GitLab included), so Headway never handles a token; each repository's ⋯ menu says who you're signed in as, or how to connect.
 - **Command log** — a record on your computer of every git command Headway runs and why, for when something needs explaining ([Troubleshooting](#troubleshooting)).
 
 ## Install
@@ -94,6 +95,12 @@ cargo run -- --reset-sample web-shop
 ```
 
 Release builds leave the samples out entirely and start with an empty workspace.
+
+The sample projects never reach GitHub: `web-shop` has a github.com origin, and its pull requests (open with passing checks, a draft, failing with changes requested, and merged) come from fixtures, which are also saved to `samples/fake-forge/`. To use fixtures for every repository, point `HEADWAY_FAKE_FORGE` at a folder with a `forge.json` (see `src/forge/fake.rs`):
+
+```bash
+HEADWAY_FAKE_FORGE=~/.local/share/headway/samples/fake-forge cargo run
+```
 
 Settings and workspaces are saved to `workspaces.json` in your config folder (`~/.config/headway` on Linux). The undo log is kept per repository in `undo/` under your data folder (`~/.local/share/headway/undo` on Linux).
 

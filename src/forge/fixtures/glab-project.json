@@ -1,0 +1,1 @@
+{"id": 1234, "path_with_namespace": "group/sub/shop", "default_branch": "main", "web_url": "https://gitlab.example.org/group/sub/shop", "merge_method": "ff", "squash_option": "default_off", "visibility": "private"}

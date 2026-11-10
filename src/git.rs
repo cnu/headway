@@ -85,6 +85,112 @@ fn spawn_recorded(repo: &Path, args: &[&str], stdin: bool) -> GitResult<(std::pr
     }
 }
 
+// ---------------------------------------------------------------------------
+// gh and glab: the GitHub and GitLab CLIs (see crate::forge)
+
+/// A command-line tool Headway talks to a forge through.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub enum Tool {
+    Gh,
+    Glab,
+}
+
+impl Tool {
+    pub fn program(self) -> &'static str {
+        match self {
+            Tool::Gh => "gh",
+            Tool::Glab => "glab",
+        }
+    }
+}
+
+/// Environment every gh and glab command gets: never a prompt, no colours, no
+/// update checks, the same locale as git.
+pub const TOOL_ENV: &[(&str, &str)] = &[
+    ("GH_PROMPT_DISABLED", "1"),
+    ("GH_NO_UPDATE_NOTIFIER", "1"),
+    ("GH_SPINNER_DISABLED", "1"),
+    ("NO_PROMPT", "1"),
+    ("GLAB_CHECK_UPDATE", "false"),
+    ("GLAB_SEND_TELEMETRY", "false"),
+    ("NO_COLOR", "1"),
+    ("CLICOLOR", "0"),
+    ("LC_ALL", "C"),
+];
+
+/// How long a gh or glab command may take before it's stopped.
+pub const TOOL_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(20);
+
+/// What a gh or glab command did. `code`: `None` when it was stopped (timeout).
+#[derive(Debug, Default)]
+pub struct ToolOutput {
+    pub code: Option<i32>,
+    pub stdout: Vec<u8>,
+    pub stderr: Vec<u8>,
+}
+
+/// Only [`exec_tool`] may use this, so every gh and glab command is in the
+/// command log (a test checks).
+fn tool_cmd(tool: Tool, dir: Option<&Path>) -> Command {
+    let mut cmd = Command::new(tool.program());
+    if let Some(d) = dir.filter(|d| d.is_dir()) {
+        cmd.current_dir(d);
+    }
+    cmd.envs(TOOL_ENV.iter().copied()).stdin(Stdio::null()).stdout(Stdio::piped()).stderr(Stdio::piped());
+    cmd
+}
+
+/// Run gh or glab to the end (or until `timeout`, when it's killed) and record it
+/// in the command log as a "forge" command. `writes`: it changes something on the
+/// server. Asking either tool for its token is refused: Headway never handles them.
+pub fn exec_tool(tool: Tool, dir: Option<&Path>, args: &[&str], writes: bool, timeout: std::time::Duration) -> std::io::Result<ToolOutput> {
+    if args.windows(2).any(|w| w[0] == "auth" && w[1] == "token") || args.contains(&"--show-token") {
+        return Err(std::io::Error::new(std::io::ErrorKind::PermissionDenied, "Headway never reads tokens"));
+    }
+    let class = if writes { cmdlog::Class::Write } else { cmdlog::Class::Read };
+    let call = cmdlog::Call::start_forge(dir, tool.program(), args, &[], class);
+    let mut cmd = tool_cmd(tool, dir);
+    cmd.args(args);
+    let mut child = match cmd.spawn() {
+        Ok(c) => c,
+        Err(e) => {
+            call.failed(&e);
+            return Err(e);
+        }
+    };
+    // Read both pipes on their own threads so a full pipe can't stall the tool.
+    let pipe = |r: Option<Box<dyn Read + Send>>| {
+        std::thread::spawn(move || {
+            let mut buf = Vec::new();
+            if let Some(mut r) = r {
+                let _ = r.read_to_end(&mut buf);
+            }
+            buf
+        })
+    };
+    let out = pipe(child.stdout.take().map(|p| Box::new(p) as Box<dyn Read + Send>));
+    let err = pipe(child.stderr.take().map(|p| Box::new(p) as Box<dyn Read + Send>));
+    let deadline = std::time::Instant::now() + timeout;
+    let code = loop {
+        match child.try_wait() {
+            Ok(Some(status)) => break status.code(),
+            Ok(None) if std::time::Instant::now() < deadline => std::thread::sleep(std::time::Duration::from_millis(15)),
+            Ok(None) => {
+                let _ = child.kill();
+                let _ = child.wait();
+                break None;
+            }
+            Err(e) => {
+                call.failed(&e);
+                return Err(e);
+            }
+        }
+    };
+    let res = ToolOutput { code, stdout: out.join().unwrap_or_default(), stderr: err.join().unwrap_or_default() };
+    call.finish(code, cmdlog::Out::Bytes(&res.stdout), &res.stderr);
+    Ok(res)
+}
+
 /// Run git and return stdout. Non-zero exit becomes an error with stderr.
 pub fn run(repo: &Path, args: &[&str]) -> GitResult<String> {
     let out = exec(repo, args, &[], None).map_err(|e| format!("Could not start git: {e}"))?;
@@ -3078,6 +3184,65 @@ pub fn tracked_files(repo: &Path) -> GitResult<Vec<String>> {
 mod tests {
     use super::*;
 
+    /// Every program Headway starts must be in the command log. In all of `src/`,
+    /// only these may create a process: git's and gh/glab's command builders, the
+    /// session's `git --version`, and the development-only sample builder. And no
+    /// source asks gh or glab for a token.
+    #[test]
+    fn only_the_recorders_start_programs() {
+        let allowed = [("git.rs", "base_cmd"), ("git.rs", "tool_cmd"), ("cmdlog.rs", "git_version"), ("samples.rs", "git"), ("samples.rs", "rev")];
+        let mut files = Vec::new();
+        let mut dirs = vec![PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("src")];
+        while let Some(d) = dirs.pop() {
+            for e in std::fs::read_dir(&d).unwrap().flatten() {
+                let p = e.path();
+                if p.is_dir() {
+                    dirs.push(p);
+                } else if p.extension().is_some_and(|x| x == "rs") {
+                    files.push(p);
+                }
+            }
+        }
+        assert!(files.iter().any(|f| f.ends_with("forge/github.rs")), "the forge module is scanned too");
+        for f in files {
+            let name = f.file_name().unwrap().to_string_lossy().into_owned();
+            let src = std::fs::read_to_string(&f).unwrap();
+            // Tests may build stand-in processes of their own.
+            let src = src.split("#[cfg(test)]\nmod tests {").next().unwrap();
+            let mut func = "";
+            for (n, line) in src.lines().enumerate() {
+                let t = line.trim_start();
+                if t.starts_with("//") {
+                    continue;
+                }
+                for prefix in ["fn ", "pub fn ", "pub(crate) fn ", "pub(super) fn "] {
+                    if let Some(rest) = t.strip_prefix(prefix) {
+                        func = rest.split(['(', '<']).next().unwrap_or("");
+                    }
+                }
+                let spawns = ["Command::new(", "process::Command", "Command::new ("].iter().any(|p| line.contains(p)) && !t.starts_with("use ");
+                if spawns {
+                    assert!(allowed.contains(&(name.as_str(), func)), "{name}:{}: {func} starts a program; go through git::run or git::exec_tool so it's in the command log", n + 1);
+                }
+                for tool in ["\"gh\"", "\"glab\""] {
+                    if line.contains(tool) && !(name == "git.rs" && func == "program") {
+                        assert!(!spawns, "{name}:{}: start {tool} with git::exec_tool", n + 1);
+                    }
+                }
+                let lower = line.to_ascii_lowercase();
+                assert!(!(lower.contains("\"auth\", \"token\"") || lower.contains("auth token\"") || lower.contains("--show-token\"")) || name == "git.rs", "{name}:{}: Headway never reads gh or glab tokens", n + 1);
+            }
+        }
+    }
+
+    #[test]
+    fn asking_for_a_token_is_refused_before_anything_starts() {
+        for args in [&["auth", "token"][..], &["auth", "status", "--show-token"], &["--hostname", "h", "auth", "token"]] {
+            let e = exec_tool(Tool::Gh, None, args, false, TOOL_TIMEOUT).unwrap_err();
+            assert_eq!(e.kind(), std::io::ErrorKind::PermissionDenied, "{args:?}");
+        }
+    }
+
     /// Every git command must be in the command log: only the recorder may use
     /// `base_cmd`, and only `base_cmd` may start git.
     #[test]
@@ -3097,8 +3262,11 @@ mod tests {
                 uses += 1;
                 assert!(["base_cmd", "exec", "spawn_recorded"].contains(&func), "git.rs:{}: {func} uses base_cmd directly; go through exec() or spawn_recorded() so the command is logged", n + 1);
             }
+            if line.contains("tool_cmd(") {
+                assert!(["tool_cmd", "exec_tool"].contains(&func), "git.rs:{}: {func} uses tool_cmd directly; go through exec_tool() so the command is logged", n + 1);
+            }
             if line.contains("Command::new(") {
-                assert_eq!(func, "base_cmd", "git.rs:{}: start git with base_cmd", n + 1);
+                assert!(["base_cmd", "tool_cmd"].contains(&func), "git.rs:{}: start git with base_cmd", n + 1);
             }
         }
         assert_eq!(uses, 3, "the definition and the two recorders");

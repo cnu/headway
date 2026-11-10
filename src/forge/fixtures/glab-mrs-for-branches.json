@@ -1,0 +1,67 @@
+{
+ "data": {
+  "project": {
+   "mergeRequests": {
+    "nodes": [
+     {
+      "iid": "41", "title": "Add product search", "state": "opened", "draft": false,
+      "webUrl": "https://gitlab.example.org/group/sub/shop/-/merge_requests/41",
+      "updatedAt": "2026-11-09T10:15:00.000Z", "sourceBranch": "feature/search", "targetBranch": "main",
+      "author": {"username": "author-1"},
+      "sourceProject": {"fullPath": "group/sub/shop"}, "targetProject": {"fullPath": "group/sub/shop"},
+      "approved": true, "detailedMergeStatus": "MERGEABLE",
+      "reviewers": {"nodes": [{"username": "reviewer-1"}]},
+      "headPipeline": {"status": "SUCCESS", "jobs": {"nodes": [
+       {"status": "SUCCESS", "allowFailure": false}, {"status": "SUCCESS", "allowFailure": false},
+       {"status": "SUCCESS", "allowFailure": false}, {"status": "FAILED", "allowFailure": true}
+      ]}}
+     },
+     {
+      "iid": "40", "title": "Draft: Dark mode", "state": "opened", "draft": true,
+      "webUrl": "https://gitlab.example.org/group/sub/shop/-/merge_requests/40",
+      "updatedAt": "2026-11-08T08:00:00.000+01:00", "sourceBranch": "wip/dark-mode", "targetBranch": "main",
+      "author": {"username": "contributor-2"},
+      "sourceProject": {"fullPath": "contributor-2/shop"}, "targetProject": {"fullPath": "group/sub/shop"},
+      "approved": false, "detailedMergeStatus": "DRAFT_STATUS",
+      "reviewers": {"nodes": []},
+      "headPipeline": {"status": "RUNNING", "jobs": {"nodes": [
+       {"status": "SUCCESS", "allowFailure": false}, {"status": "RUNNING", "allowFailure": false}, {"status": "CREATED", "allowFailure": false}
+      ]}}
+     },
+     {
+      "iid": "39", "title": "Fix tax rounding", "state": "opened", "draft": false,
+      "webUrl": "https://gitlab.example.org/group/sub/shop/-/merge_requests/39",
+      "updatedAt": "2026-11-07T16:30:00.000Z", "sourceBranch": "fix/rounding", "targetBranch": "main",
+      "author": {"username": "author-1"},
+      "sourceProject": {"fullPath": "group/sub/shop"}, "targetProject": {"fullPath": "group/sub/shop"},
+      "approved": false, "detailedMergeStatus": "REQUESTED_CHANGES",
+      "reviewers": {"nodes": [{"username": "reviewer-1"}, {"username": "reviewer-2"}]},
+      "headPipeline": {"status": "FAILED", "jobs": {"nodes": [
+       {"status": "SUCCESS", "allowFailure": false}, {"status": "FAILED", "allowFailure": false}, {"status": "SKIPPED", "allowFailure": false}
+      ]}}
+     },
+     {
+      "iid": "12", "title": "Older attempt", "state": "closed", "draft": false,
+      "webUrl": "https://gitlab.example.org/group/sub/shop/-/merge_requests/12",
+      "updatedAt": "2026-09-01T09:00:00.000Z", "sourceBranch": "old/merged", "targetBranch": "main",
+      "author": {"username": "author-1"},
+      "sourceProject": {"fullPath": "group/sub/shop"}, "targetProject": {"fullPath": "group/sub/shop"},
+      "approved": false, "detailedMergeStatus": "NOT_OPEN",
+      "reviewers": {"nodes": []}, "headPipeline": null
+     },
+     {
+      "iid": "38", "title": "Cart quantities", "state": "merged", "draft": false,
+      "webUrl": "https://gitlab.example.org/group/sub/shop/-/merge_requests/38",
+      "updatedAt": "2026-11-03T17:45:00.000Z", "sourceBranch": "old/merged", "targetBranch": "main",
+      "author": {"username": "author-1"},
+      "sourceProject": {"fullPath": "group/sub/shop"}, "targetProject": {"fullPath": "group/sub/shop"},
+      "approved": true, "detailedMergeStatus": "NOT_OPEN",
+      "reviewers": {"nodes": []},
+      "headPipeline": {"status": "SUCCESS", "jobs": {"nodes": []}}
+     },
+     null
+    ]
+   }
+  }
+ }
+}

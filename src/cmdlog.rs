@@ -36,7 +36,13 @@ const STDOUT_MAX: usize = 4 * 1024;
 const PATCH_MAX: usize = 256 * 1024;
 /// Config keys whose values are never written down.
 const SECRET_KEYS: [&str; 6] = ["extraheader", "token", "password", "auth", "credential", "secret"];
-const TOKEN_PREFIXES: [&str; 6] = ["github_pat_", "ghp_", "gho_", "ghu_", "ghs_", "glpat-"];
+/// GitHub's and GitLab's token formats (personal, OAuth, app, refresh, deploy, runner, trigger…).
+const TOKEN_PREFIXES: &[&str] = &[
+    "github_pat_", "ghp_", "gho_", "ghu_", "ghs_", "ghr_", "glpat-", "gloas-", "gldt-", "glrt-", "glptt-", "glcbt-", "glimt-", "glft-", "glsoat-", "glffct-", "glagent-",
+];
+/// Words a secret follows in headers, JSON and CLI output ("Authorization: Bearer x",
+/// `"token": "x"`). Compared ignoring case; the value after them is hidden.
+const SECRET_LEADS: &[&str] = &["authorization: bearer ", "authorization: token ", "authorization: basic ", "authorization: ", "private-token: ", "bearer ", "\"token\": \"", "\"token\":\"", "\"access_token\": \"", "\"access_token\":\"", "oauth_token: "];
 
 // ---------------------------------------------------------------------------
 // Configuration
@@ -168,7 +174,34 @@ pub fn classify(args: &[&str]) -> Class {
 /// Take credentials out of text: the user part of http(s) addresses, and
 /// token-shaped strings. Everything else (messages, branches, paths) is kept.
 pub fn redact(s: &str) -> String {
-    redact_tokens(&redact_urls(s))
+    redact_leads(&redact_tokens(&redact_urls(s)))
+}
+
+/// Hide the value after each of [`SECRET_LEADS`]: up to the next space, quote or line end.
+fn redact_leads(s: &str) -> String {
+    let lower = s.to_ascii_lowercase();
+    let mut out = String::with_capacity(s.len());
+    let mut i = 0;
+    while i < s.len() {
+        let boundary = i == 0 || !lower.as_bytes()[i - 1].is_ascii_alphanumeric();
+        if boundary && let Some(lead) = SECRET_LEADS.iter().find(|l| lower[i..].starts_with(*l)) {
+            let start = i + lead.len();
+            let len = s[start..].find(|c: char| c.is_whitespace() || matches!(c, '"' | '\'' | ',' | '}')).unwrap_or(s.len() - start);
+            out.push_str(&s[i..start]);
+            // Short values ("bearer of bad news") aren't secrets.
+            if len >= 8 && !s[start..start + len].starts_with("***") {
+                out.push_str("***");
+            } else {
+                out.push_str(&s[start..start + len]);
+            }
+            i = start + len;
+            continue;
+        }
+        let ch = s[i..].chars().next().unwrap_or(' ');
+        out.push(ch);
+        i += ch.len_utf8();
+    }
+    out
 }
 
 fn redact_urls(s: &str) -> String {
@@ -323,7 +356,7 @@ pub struct RefChange {
 pub struct Entry {
     pub v: u32,
     pub ts: String,
-    /// "git", "action", "session" or "panic".
+    /// "git", "forge" (gh or glab), "action", "session" or "panic".
     pub kind: String,
     pub session: String,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -486,7 +519,7 @@ impl Logger {
         if !self.active() {
             return;
         }
-        let to_disk = entry.kind != "git" || entry.class != Some(Class::Read) || self.cfg.mode == Mode::Verbose;
+        let to_disk = !matches!(entry.kind.as_str(), "git" | "forge") || entry.class != Some(Class::Read) || self.cfg.mode == Mode::Verbose;
         if to_disk && let Ok(line) = serde_json::to_string(&entry) {
             let flush = entry.class != Some(Class::Read);
             let day = entry.ts.get(..10).map_or_else(|| day_of(SystemTime::now()), str::to_string);
@@ -815,6 +848,37 @@ impl Call {
         Call(Some(Box::new((logger, Instant::now(), e))))
     }
 
+    /// A `gh` or `glab` command, from start to exit: like git's, with the program
+    /// first in `argv`. `class`: whether it only reads (the caller knows).
+    pub fn start_forge(repo: Option<&Path>, program: &str, args: &[&str], env: &[(&str, &str)], class: Class) -> Call {
+        let Some(logger) = current() else { return Call(None) };
+        let (action, quiet) = LOCAL.with(|l| {
+            let mut l = l.borrow_mut();
+            if class == Class::Write && !l.quiet {
+                l.writes += 1;
+            }
+            (l.action.clone(), l.quiet)
+        });
+        if quiet {
+            return Call(None);
+        }
+        let argv: Vec<&str> = std::iter::once(program).chain(args.iter().copied()).collect();
+        let e = Entry {
+            v: SCHEMA,
+            ts: timestamp(SystemTime::now()),
+            kind: "forge".into(),
+            session: logger.session.clone(),
+            action_id: action.as_ref().and_then(|a| a.id),
+            action: Some(action.map_or_else(|| "refresh".to_string(), |a| redact(&a.label))),
+            repo: repo.map(tilde),
+            class: Some(class),
+            argv: Some(redact_argv(&argv)),
+            env: (!env.is_empty()).then(|| env.iter().map(|(k, v)| redact_config(&format!("{k}={}", redact(v)))).collect()),
+            ..Default::default()
+        };
+        Call(Some(Box::new((logger, Instant::now(), e))))
+    }
+
     /// For a reader that stays open: record that it started, asked for `objects` things.
     pub fn started(&mut self, objects: usize) {
         if let Some(b) = self.0.as_mut() {
@@ -851,6 +915,20 @@ impl Call {
         e.error = Some(err.to_string());
         logger.record(e);
     }
+}
+
+/// A one-line "forge" note that isn't a command ("github.com rate limited until …").
+pub fn forge_note(repo: Option<&Path>, message: &str) {
+    let Some(logger) = current() else { return };
+    logger.record(Entry {
+        v: SCHEMA,
+        ts: timestamp(SystemTime::now()),
+        kind: "forge".into(),
+        session: logger.session.clone(),
+        repo: repo.map(tilde),
+        message: Some(redact(message)),
+        ..Default::default()
+    });
 }
 
 // ---------------------------------------------------------------------------
@@ -1209,13 +1287,58 @@ mod tests {
         assert_eq!(redact_argv(&["-c", "credential.helper=store", "-c", "my.Password=x"]), ["-c", "credential.helper=***", "-c", "my.Password=***"]);
         assert_eq!(redact_argv(&["clone", "https://u:p@h/r", "r"]), ["clone", "https://***@h/r", "r"]);
         // Token-shaped strings anywhere.
-        for t in ["ghp_", "gho_", "ghu_", "ghs_", "github_pat_", "glpat-"] {
+        for t in TOKEN_PREFIXES {
             let token = format!("{t}A1b2C3d4E5f6G7h8J9k0");
             assert_eq!(redact(&format!("remote: bad token {token}.\n")), "remote: bad token ***.\n", "{t}");
         }
         // Too short, or part of a word: left alone. So are messages, branches and paths.
         assert_eq!(redact("see ghp_short and xghp_A1b2C3d4E5f6G7h8J9k0"), "see ghp_short and xghp_A1b2C3d4E5f6G7h8J9k0");
         assert_eq!(redact_argv(&["commit", "-m", "Fix the login page", "--", "src/auth.rs"]), ["commit", "-m", "Fix the login page", "--", "src/auth.rs"]);
+    }
+
+    #[test]
+    fn gh_and_glab_secrets_are_taken_out() {
+        // Header-shaped and JSON-shaped secrets, whatever the token looks like.
+        assert_eq!(redact("> Authorization: Bearer abcdef0123456789\n"), "> Authorization: Bearer ***\n");
+        assert_eq!(redact("authorization: token 0123456789abcdef"), "authorization: token ***");
+        assert_eq!(redact("PRIVATE-TOKEN: zzzzzzzzzzzzzzzzzzzz"), "PRIVATE-TOKEN: ***");
+        assert_eq!(redact(r#"{"token": "s3cr3t-value-here", "user": "ana"}"#), r#"{"token": "***", "user": "ana"}"#);
+        assert_eq!(redact(r#"{"access_token":"abcdefgh12345678"}"#), r#"{"access_token":"***"}"#);
+        // gh's own masked output and ordinary words stay as they are.
+        assert_eq!(redact("  - Token: gho_************************************"), "  - Token: gho_************************************");
+        assert_eq!(redact("a bearer of bad news"), "a bearer of bad news");
+        assert_eq!(redact(r#"{"login": "ana", "tokens": 3}"#), r#"{"login": "ana", "tokens": 3}"#);
+    }
+
+    #[test]
+    fn gh_and_glab_commands_are_recorded_as_forge_commands() {
+        let log = TestLog::new("forge", Mode::Normal);
+        let repo = std::env::temp_dir().join("headway-forge-cmd");
+        {
+            let _n = named("forge refresh");
+            Call::start_forge(Some(&repo), "gh", &["api", "graphql", "-H", "Authorization: bearer abcdefghijklmnop", "--hostname", "github.com"], &[], Class::Read)
+                .finish(Some(0), Out::Bytes(br#"{"data":{"token":"abcdefghijklmnop"}}"#), b"");
+            // Built from pieces so secret scanners don't take the fake token for a real one.
+            let fake = concat!("glpat", "-A1b2C3d4E5f6G7h8J9k0");
+            Call::start_forge(Some(&repo), "glab", &["mr", "merge", "3"], &[], Class::Write)
+                .finish(Some(1), Out::Bytes(format!("{fake} leaked").as_bytes()), format!("error: {fake}").as_bytes());
+        }
+        forge_note(Some(&repo), "github.com: rate limited; not asking again for 15 min");
+        let recent = log.recent(&repo);
+        assert_eq!(recent.len(), 3, "{recent:#?}");
+        let gh = &recent[0];
+        assert_eq!((gh.kind.as_str(), gh.class, gh.action.as_deref()), ("forge", Some(Class::Read), Some("forge refresh")));
+        assert_eq!(gh.argv.as_ref().unwrap()[..5], ["gh", "api", "graphql", "-H", "Authorization: bearer ***"]);
+        assert_eq!(gh.stdout, None, "reads keep only the size of what they printed");
+        let glab = &recent[1];
+        assert_eq!(glab.stdout.as_deref(), Some("*** leaked"));
+        assert_eq!(glab.stderr.as_deref(), Some("error: ***"));
+        assert_eq!(recent[2].message.as_deref(), Some("github.com: rate limited; not asking again for 15 min"));
+        // Like git's: reads (the regular refreshes) stay in memory unless verbose;
+        // changes and notes go to disk.
+        let disk: Vec<Entry> = log.on_disk().into_iter().filter(|e| e.kind == "forge").collect();
+        assert_eq!(disk.len(), 2);
+        assert!(disk.iter().all(|e| e.class != Some(Class::Read)));
     }
 
     #[test]

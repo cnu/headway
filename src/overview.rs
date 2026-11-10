@@ -15,6 +15,7 @@ pub fn show(
     ui: &mut Ui,
     ws: &Workspace,
     summaries: &HashMap<PathBuf, Result<Summary, String>>,
+    forges: &HashMap<PathBuf, crate::forge::StatusLine>,
     busy: &[(u64, PathBuf, String)],
     actions: &mut Vec<Action>,
 ) {
@@ -96,7 +97,7 @@ pub fn show(
                     for (i, path) in chunk.iter().enumerate() {
                         let idx = ws.repos.iter().position(|r| r == *path).unwrap_or(row_i * cols + i);
                         let is_busy = busy.iter().any(|b| &b.1 == *path);
-                        let natural = card(ui, idx, path, summaries.get(*path), card_w, row_h, is_busy, actions);
+                        let natural = card(ui, idx, path, summaries.get(*path), forges.get(*path), card_w, row_h, is_busy, actions);
                         tallest = tallest.max(natural);
                     }
                 });
@@ -130,11 +131,13 @@ fn empty_state(ui: &mut Ui, actions: &mut Vec<Action>) {
     });
 }
 
+#[allow(clippy::too_many_arguments)]
 fn card(
     ui: &mut Ui,
     idx: usize,
     path: &PathBuf,
     summary: Option<&Result<Summary, String>>,
+    forge: Option<&crate::forge::StatusLine>,
     width: f32,
     row_h: f32,
     busy: bool,
@@ -212,6 +215,10 @@ fn card(
                         if ui.button("Remove from workspace").clicked() {
                             actions.push(Action::RemoveRepo(path.clone()));
                             ui.close();
+                        }
+                        if let Some(line) = forge {
+                            ui.separator();
+                            crate::views::forge_status(ui, line, actions);
                         }
                     });
                 });
@@ -459,6 +466,7 @@ mod tests {
             worktrees: vec![],
             submodules: (0, 0),
             undo: None,
+            forge: None,
         })
     }
 
@@ -517,7 +525,7 @@ mod tests {
             };
             let mut actions = Vec::new();
             let (ws, summaries) = (&self.ws, &self.summaries);
-            let mut output = self.ctx.run_ui(input, |ui| show(ui, ws, summaries, &[], &mut actions));
+            let mut output = self.ctx.run_ui(input, |ui| show(ui, ws, summaries, &HashMap::new(), &[], &mut actions));
             output.textures_delta.clear(); // no screen to upload to
             let mut out = Opened::default();
             for a in actions {

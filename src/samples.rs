@@ -178,6 +178,16 @@ mod imp {
         b.commit(SAM, "Document how to run the shop", 30);
         b.write("src/cart.js", "export function total(items) {\n  return items.reduce((s, i) => s + i.price * (i.qty ?? 1), 0);\n}\n\nexport function count(items) {\n  return items.length;\n}\n");
         b.commit(JO, "Count quantities in cart total", 20);
+        // Branches with pull requests on the sample's (pretend) GitHub: a draft, and
+        // one with failing checks and changes requested. See `web_shop_forge`.
+        b.git(&["checkout", "-q", "-b", "feature/reviews"]);
+        b.write("src/reviews.js", "export function average(reviews) {\n  return reviews.reduce((s, r) => s + r.stars, 0) / reviews.length;\n}\n");
+        b.commit(SAM, "Show product reviews (work in progress)", 4);
+        b.git(&["checkout", "-q", "main"]);
+        b.git(&["checkout", "-q", "-b", "fix/tax-rounding"]);
+        b.write("src/cart.js", "export function total(items) {\n  const sum = items.reduce((s, i) => s + i.price * (i.qty ?? 1), 0);\n  return Math.round(sum * 100) / 100;\n}\n\nexport function count(items) {\n  return items.length;\n}\n");
+        b.commit(ALEX, "Round cart totals to cents", 5);
+        b.git(&["checkout", "-q", "main"]);
         // A commit thrown away with a hard reset: only the reflog still finds it.
         b.write("src/banner.js", "export const banner = 'Free shipping on orders over $50';\n");
         b.commit(ALEX, "Try a free shipping banner", 3);
@@ -188,6 +198,90 @@ mod imp {
         b.write("src/wishlist.js", "export const wishlist = [];\n");
         b.write("src/style.css", "body {\n  font-family: system-ui, sans-serif;\n  margin: 0;\n  color: #1d1d1f;\n}\n\nh1 {\n  font-size: 2rem;\n}\n");
         b.git(&["add", "src/style.css"]);
+        // A GitHub origin that has everything except the last commit on main. It
+        // isn't real: fetching fails, and pull requests come from fixtures.
+        b.git(&["remote", "add", "origin", WEB_SHOP_ORIGIN]);
+        let behind = b.rev("main~1");
+        b.git(&["update-ref", "refs/remotes/origin/main", &behind]);
+        for branch in ["feature/checkout", "feature/search", "feature/reviews", "fix/tax-rounding"] {
+            let tip = b.rev(branch);
+            b.git(&["update-ref", &format!("refs/remotes/origin/{branch}"), &tip]);
+            b.git(&["config", &format!("branch.{branch}.remote"), "origin"]);
+            b.git(&["config", &format!("branch.{branch}.merge"), &format!("refs/heads/{branch}")]);
+        }
+        b.git(&["config", "branch.main.remote", "origin"]);
+        b.git(&["config", "branch.main.merge", "refs/heads/main"]);
+        write_fake_forge();
+    }
+
+    pub const WEB_SHOP_ORIGIN: &str = "https://github.com/headway-samples/web-shop.git";
+
+    /// Where the sample projects live, and the forge fixtures they use (development
+    /// builds talk to these instead of GitHub for anything in the samples folder).
+    pub fn fake_forge() -> Option<(PathBuf, crate::forge::fake::FakeData)> {
+        Some((samples_dir(), web_shop_forge(now())))
+    }
+
+    /// The web-shop's pull requests: open with passing checks, a draft, failing
+    /// checks with changes requested, and a merged one whose branch is still here.
+    pub fn web_shop_forge(now: i64) -> crate::forge::fake::FakeData {
+        use crate::forge::fake::{FakeData, FakeHost, FakeRepo};
+        use crate::forge::*;
+        let pr = |number: u64, title: &str, state: PrState, author: &str, branch: &str, hours_ago: i64| PullRequest {
+            number,
+            title: title.into(),
+            state,
+            author: author.into(),
+            head_branch: branch.into(),
+            base_branch: "main".into(),
+            head_repo: None,
+            url: format!("https://github.com/headway-samples/web-shop/pull/{number}"),
+            review: ReviewDecision::None,
+            requested_reviewers: vec![],
+            checks: CheckSummary::default(),
+            mergeable: Mergeable::Unknown,
+            updated: now - hours_ago * 3600,
+        };
+        let pulls = vec![
+            PullRequest {
+                review: ReviewDecision::Approved,
+                checks: CheckSummary::from_states([(CheckState::Passing, 4)]),
+                mergeable: Mergeable::Clean,
+                ..pr(12, "Add product search", PrState::Open, "alex-rivera", "feature/search", 3)
+            },
+            PullRequest {
+                requested_reviewers: vec!["jo-lindqvist".into()],
+                checks: CheckSummary::from_states([(CheckState::Passing, 2), (CheckState::Pending, 2)]),
+                mergeable: Mergeable::Blocked,
+                ..pr(14, "Show product reviews", PrState::Draft, "sam-okafor", "feature/reviews", 1)
+            },
+            PullRequest {
+                review: ReviewDecision::ChangesRequested,
+                requested_reviewers: vec!["sam-okafor".into()],
+                checks: CheckSummary::from_states([(CheckState::Passing, 2), (CheckState::Failing, 1), (CheckState::None, 1)]),
+                mergeable: Mergeable::Blocked,
+                ..pr(13, "Round cart totals to cents", PrState::Open, "alex-rivera", "fix/tax-rounding", 2)
+            },
+            PullRequest {
+                review: ReviewDecision::Approved,
+                checks: CheckSummary::from_states([(CheckState::Passing, 4)]),
+                ..pr(9, "Checkout flow with coupon codes", PrState::Merged, "sam-okafor", "feature/checkout", 24 * 12)
+            },
+        ];
+        let info = RepoInfo { default_branch: "main".into(), merge_methods: vec![MergeMethod::Merge, MergeMethod::Squash, MergeMethod::Rebase], web_url: "https://github.com/headway-samples/web-shop".into() };
+        let mut data = FakeData::default();
+        data.hosts.insert("github.com".into(), FakeHost { kind: ForgeKind::GitHub, user: Some("alex-rivera".into()), installed: true });
+        data.repos.insert("github.com/headway-samples/web-shop".into(), FakeRepo { info: Some(info), pulls });
+        data
+    }
+
+    /// Save the fixtures as `<samples>/fake-forge/forge.json`, for
+    /// `HEADWAY_FAKE_FORGE` (screenshots, trying the whole app on fixtures).
+    fn write_fake_forge() {
+        let dir = samples_dir().join("fake-forge");
+        if let Ok(json) = serde_json::to_string_pretty(&web_shop_forge(now())) {
+            let _ = std::fs::create_dir_all(&dir).and_then(|_| std::fs::write(dir.join("forge.json"), json));
+        }
     }
 
     /// The API server, written by several people over time, with `indent` spaces per level.
@@ -375,6 +469,33 @@ mod imp {
         }
 
         #[test]
+        fn web_shop_has_a_github_origin_and_branches_for_each_kind_of_pull_request() {
+            use crate::{forge, git};
+            let dir = std::env::temp_dir().join(format!("headway-sample-web-shop-forge-{}", std::process::id()));
+            let _ = std::fs::remove_dir_all(&dir);
+            build_one(&dir, build_web_shop);
+            let remotes = forge::pick_remotes(&git::remote_urls(&dir).unwrap()).unwrap();
+            assert_eq!(remotes.key().to_string(), "github.com/headway-samples/web-shop");
+            let (branches, _) = git::branches(&dir).unwrap();
+            let data = web_shop_forge(now());
+            let pulls = &data.repos["github.com/headway-samples/web-shop"].pulls;
+            for pr in pulls {
+                assert!(branches.iter().any(|b| !b.remote && b.name == pr.head_branch), "{} is a local branch", pr.head_branch);
+            }
+            let states: Vec<forge::PrState> = pulls.iter().map(|p| p.state).collect();
+            for s in [forge::PrState::Open, forge::PrState::Draft, forge::PrState::Merged] {
+                assert!(states.contains(&s), "{s:?}");
+            }
+            assert!(pulls.iter().any(|p| p.checks.state == forge::CheckState::Failing && p.review == forge::ReviewDecision::ChangesRequested));
+            assert!(pulls.iter().any(|p| p.state == forge::PrState::Open && p.checks.state == forge::CheckState::Passing));
+            // The merged one's branch is in main already.
+            let merged = git::run(&dir, &["branch", "--merged", "main", "--format=%(refname:short)"]).unwrap();
+            assert!(merged.lines().any(|l| l == "feature/checkout"), "{merged}");
+            assert_eq!(git::status(&dir).unwrap().head.ahead, 1, "main is one ahead of its pretend origin");
+            let _ = std::fs::remove_dir_all(&dir);
+        }
+
+        #[test]
         fn api_server_has_a_moved_file_and_a_reformat_blame_skips() {
             use crate::git::{self, BlameOptions};
             let dir = std::env::temp_dir().join(format!("headway-sample-api-{}", std::process::id()));
@@ -474,5 +595,9 @@ mod imp {
 
     pub fn reset_sample(path: &Path) -> Result<(), String> {
         Err(format!("{} isn't one of Headway's sample projects", path.display()))
+    }
+
+    pub fn fake_forge() -> Option<(std::path::PathBuf, crate::forge::fake::FakeData)> {
+        None
     }
 }

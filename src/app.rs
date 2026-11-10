@@ -7,6 +7,7 @@ use crate::theme::{self, *};
 use crate::workspace::{Config, Workspace};
 use crate::fileview::{self, FileView, Mode};
 use crate::resolver::Resolver;
+use crate::forge::{self, cache::Reason};
 use crate::{cmdlog, diffmodel, highlight, overview, preview, views};
 use egui::{Align, Color32, CornerRadius, Id, Layout, Margin, RichText, Sense, Stroke, Ui};
 use std::collections::HashMap;
@@ -121,6 +122,8 @@ pub struct Summary {
     pub submodules: (usize, usize),
     /// What Undo would take back: (entry id, what was done).
     pub undo: Option<(u64, String)>,
+    /// Where its pull requests are (GitHub or GitLab), from its remotes.
+    pub forge: Option<forge::RepoRemotes>,
 }
 
 /// A worktree shown inside its main repository's card.
@@ -153,7 +156,9 @@ fn load_summary(path: &Path) -> Result<Summary, String> {
             refs: vec![],
         })
     });
-    let has_remote = git::remotes(path).map(|r| !r.is_empty()).unwrap_or(false);
+    let remote_urls = git::remote_urls(path).unwrap_or_default();
+    let has_remote = !remote_urls.is_empty();
+    let forge = forge::pick_remotes(&remote_urls);
     let linked_worktree = path.join(".git").is_file();
     let canon = |p: &Path| p.canonicalize().unwrap_or_else(|_| p.to_path_buf());
     let all = git::worktrees(path).unwrap_or_default();
@@ -189,7 +194,7 @@ fn load_summary(path: &Path) -> Result<Summary, String> {
     let subs = git::submodules(path).unwrap_or_default();
     let submodules = (subs.len(), subs.iter().filter(|s| s.state == git::SubState::NotSetUp).count());
     let undo = crate::oplog::latest(path).map(|e| (e.id, e.what));
-    Ok(Summary { status, last, has_remote, linked_worktree, canonical: canon(path), main_repo, worktrees, submodules, undo })
+    Ok(Summary { status, last, has_remote, linked_worktree, canonical: canon(path), main_repo, worktrees, submodules, undo, forge })
 }
 
 // ---------------------------------------------------------------------------
@@ -586,6 +591,8 @@ pub struct RepoView {
     pub detail_sel: LineSel,
     /// A dialog is open over the window (keys belong to it).
     pub modal: bool,
+    /// The GitHub or GitLab connection, for the ⋯ menu (set by the app each frame).
+    pub forge: Option<forge::StatusLine>,
 }
 
 impl RepoView {
@@ -622,6 +629,7 @@ impl RepoView {
             file_gen: 0,
             detail_sel: LineSel::default(),
             modal: false,
+            forge: None,
         }
     }
 
@@ -693,6 +701,8 @@ enum Msg {
     /// `undo`: the operation log entry the action left, if it can be undone.
     OpDone { id: u64, repo: PathBuf, label: String, result: Result<String, String>, kind: OpKind, undo: Option<u64> },
     Cloned(u64, Result<PathBuf, String>),
+    /// A GitHub or GitLab refresh finished.
+    Forge(forge::cache::JobResult),
 }
 
 #[derive(Clone, Copy, PartialEq)]
@@ -909,6 +919,15 @@ pub struct HeadwayApp {
     followups: HashMap<u64, FollowUp>,
     /// Layout preferences changed and still need saving (waits for the mouse to be released).
     view_dirty: bool,
+    /// GitHub and GitLab: how to reach them, and what they said last.
+    forges: Arc<dyn forge::Forges>,
+    forge_cache: forge::cache::ForgeCache,
+    /// Each repository's forge remotes and the branches to ask about (current first).
+    forge_repos: HashMap<PathBuf, (forge::RepoRemotes, Vec<String>)>,
+    /// Tabs just opened, refreshed once their first load is in.
+    forge_opened: std::collections::HashSet<PathBuf>,
+    /// When the poll timer last looked (seconds of app time).
+    forge_polled: f64,
 }
 
 impl HeadwayApp {
@@ -941,6 +960,11 @@ impl HeadwayApp {
             picking: false,
             followups: HashMap::new(),
             view_dirty: false,
+            forges: if cfg!(test) { Arc::new(forge::NoForges) } else { forge::default_forges() },
+            forge_cache: Default::default(),
+            forge_repos: HashMap::new(),
+            forge_opened: Default::default(),
+            forge_polled: f64::NEG_INFINITY,
             shot: screenshot.map(|path| Shot {
                 path,
                 requested: false,
@@ -1010,6 +1034,7 @@ impl HeadwayApp {
     fn ensure_tab(&mut self, path: &Path) {
         if !self.tabs.contains_key(path) {
             self.tabs.insert(path.to_path_buf(), RepoView::new(path.to_path_buf()));
+            self.forge_opened.insert(path.to_path_buf());
             self.reload_repo(path);
         }
     }
@@ -1400,6 +1425,72 @@ impl HeadwayApp {
         id
     }
 
+    // -----------------------------------------------------------------------
+    // GitHub and GitLab
+
+    /// Talk to GitHub and GitLab through these (tests use fixtures).
+    #[cfg(test)]
+    pub fn set_forges(&mut self, forges: Arc<dyn forge::Forges>) {
+        self.forges = forges;
+    }
+
+    /// The forge cache (tests look inside).
+    #[cfg(test)]
+    pub fn forge_cache(&self) -> &forge::cache::ForgeCache {
+        &self.forge_cache
+    }
+
+    /// Remember where a repository's pull requests are, and which branches to ask
+    /// about: the current one first, then the other local branches when known.
+    fn forge_learn(&mut self, path: &Path, remotes: Option<forge::RepoRemotes>, current: Option<&str>, others: &[String]) {
+        let Some(remotes) = remotes else {
+            self.forge_repos.remove(path);
+            return;
+        };
+        let mut branches: Vec<String> = current.into_iter().map(String::from).collect();
+        let known = self.forge_repos.get(path).map(|(_, b)| b.clone()).unwrap_or_default();
+        let rest = if others.is_empty() { &known[..] } else { others };
+        for b in rest {
+            if !branches.contains(b) {
+                branches.push(b.clone());
+            }
+        }
+        self.forge_repos.insert(path.to_path_buf(), (remotes, branches));
+    }
+
+    /// Ask for a refresh of a repository's pull requests (the cache decides if it's due).
+    fn forge_refresh(&mut self, path: &Path, reason: Reason) {
+        if let Some((remotes, branches)) = self.forge_repos.get(path) {
+            self.forge_cache.request(&remotes.key(), path, branches, reason, std::time::Instant::now());
+            self.forge_pump();
+        }
+    }
+
+    /// Start the forge jobs that may run now, on workers like git's.
+    fn forge_pump(&mut self) {
+        for job in self.forge_cache.next_jobs(std::time::Instant::now()) {
+            let forges = self.forges.clone();
+            self.spawn(move || {
+                let _name = cmdlog::named("forge refresh");
+                Msg::Forge(forge::cache::run_job(forges.as_ref(), &job))
+            });
+        }
+    }
+
+    /// The repositories on screen: the open tab, or every card of the overview.
+    fn visible_repos(&self) -> Vec<PathBuf> {
+        match self.active_path() {
+            Some(p) => vec![p],
+            None => self.cfg.ws().repos.clone(),
+        }
+    }
+
+    /// What the ⋯ menu says about GitHub or GitLab for this repository.
+    pub fn forge_line(&self, path: &Path) -> Option<forge::StatusLine> {
+        let (remotes, _) = self.forge_repos.get(path)?;
+        forge::status_line(&self.forge_cache, &remotes.pr_url.host)
+    }
+
     /// Drop a folder from every workspace and close its tabs (it was deleted).
     fn forget_repo(&mut self, path: &Path) {
         for w in &mut self.cfg.workspaces {
@@ -1438,7 +1529,23 @@ impl HeadwayApp {
                 Msg::Highlighted => {}
                 Msg::Repo(path, res) => self.on_repo_loaded(path, res),
                 Msg::Summary(path, res) => {
-                    self.summaries.insert(path, res);
+                    let learned = res.as_ref().ok().map(|s| (s.forge.clone(), s.status.head.branch.clone()));
+                    self.summaries.insert(path.clone(), res);
+                    if let Some((remotes, current)) = learned {
+                        self.forge_learn(&path, remotes, current.as_deref(), &[]);
+                        // A card on screen gets its first look now, not at the next poll.
+                        if self.active_path().is_none() && self.cfg.ws().repos.contains(&path) {
+                            self.forge_refresh(&path, Reason::Poll);
+                        }
+                    }
+                }
+                Msg::Forge(res) => {
+                    let wall = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map_or(0, |d| d.as_secs() as i64);
+                    let repo = res.key.as_ref().and_then(|k| self.forge_repos.iter().find(|(_, (r, _))| r.key() == *k).map(|(p, _)| p.clone()));
+                    if let Some(note) = self.forge_cache.finish(res, std::time::Instant::now(), wall) {
+                        cmdlog::forge_note(repo.as_deref(), &note);
+                    }
+                    self.forge_pump();
                 }
                 Msg::Detail(path, hash, res) => {
                     if let Some(rv) = self.tabs.get_mut(&path) {
@@ -1623,6 +1730,9 @@ impl HeadwayApp {
                         self.reload_repo(&repo);
                     }
                     self.reload_summary(&repo);
+                    if touches_remote(&label) {
+                        self.forge_refresh(&repo, Reason::AfterGit);
+                    }
                 }
                 Msg::Cloned(id, res) => {
                     self.busy.retain(|b| b.0 != id);
@@ -1736,6 +1846,16 @@ impl HeadwayApp {
         }
         if !want_conflicts.is_empty() {
             self.load_conflicts(&path, want_conflicts);
+        }
+        let loaded = self.tabs.get(&path).and_then(|rv| rv.data.as_ref()).map(|d| {
+            let locals: Vec<String> = d.branches.iter().filter(|b| !b.remote).map(|b| b.name.clone()).collect();
+            (forge::pick_remotes(&d.remote_urls), d.status.head.branch.clone(), locals)
+        });
+        if let Some((remotes, current, locals)) = loaded {
+            self.forge_learn(&path, remotes, current.as_deref(), &locals);
+            if self.forge_opened.remove(&path) {
+                self.forge_refresh(&path, Reason::Opened);
+            }
         }
     }
 
@@ -2764,8 +2884,22 @@ impl eframe::App for HeadwayApp {
                 self.reload_repo(&p);
             }
             self.refresh_overview();
+            for p in self.visible_repos() {
+                self.forge_refresh(&p, Reason::Focus);
+            }
         }
         self.focused = focused;
+        // While the window has focus, keep what's on screen fresh (the cache says how often).
+        let now = ctx.input(|i| i.time);
+        if focused && now - self.forge_polled >= 5.0 {
+            self.forge_polled = now;
+            for p in self.visible_repos() {
+                self.forge_refresh(&p, Reason::Poll);
+            }
+        }
+        if focused && !self.forge_repos.is_empty() {
+            ctx.request_repaint_after(std::time::Duration::from_secs(30));
+        }
 
         let mut actions = Vec::new();
 
@@ -2804,12 +2938,15 @@ impl eframe::App for HeadwayApp {
             match self.active_path() {
                 None => {
                     let ws = self.cfg.ws().clone();
-                    overview::show(ui, &ws, &self.summaries, &self.busy, &mut actions);
+                    let lines: HashMap<PathBuf, forge::StatusLine> = ws.repos.iter().filter_map(|r| Some((r.clone(), self.forge_line(r)?))).collect();
+                    overview::show(ui, &ws, &self.summaries, &lines, &self.busy, &mut actions);
                 }
                 Some(p) => {
                     let ws = self.cfg.ws().clone();
                     let busy: Vec<String> = self.busy.iter().filter(|b| b.1 == p).map(|b| b.2.clone()).collect();
+                    let line = self.forge_line(&p);
                     if let Some(rv) = self.tabs.get_mut(&p) {
+                        rv.forge = line;
                         rv.modal = self.dialog.is_some();
                         let before = self.cfg.view;
                         views::repo(ui, rv, &ws, &self.summaries, &busy, &mut self.cfg.view, &mut actions);
@@ -2947,6 +3084,12 @@ fn first_file(st: &Status) -> Option<FileSel> {
 
 /// Turn common git errors into plain language.
 /// The message shown when a git action fails (the command log keeps the same text).
+/// A fetch, pull or push (by the action's name: "Fetch", "Pull web-shop", "Push tag v1"),
+/// after which the forge may know something new.
+fn touches_remote(label: &str) -> bool {
+    matches!(label.split_whitespace().next(), Some("Fetch" | "Pull" | "Push"))
+}
+
 fn failure_text(label: &str, kind: OpKind, e: &str) -> String {
     match kind {
         // Undo explains itself; git's hints would only confuse.
@@ -3263,6 +3406,16 @@ Binary files a/img and b/img differ
         }
         for bad in ["", "   ", "has space", "a..b", "-start", "end/", "x.lock", "a~1", "a^", "a:b", "what?", "st*r", "[x", "back\\slash"] {
             assert!(!valid_ref_name(bad), "{bad}");
+        }
+    }
+
+    #[test]
+    fn fetch_pull_and_push_refresh_pull_requests() {
+        for label in ["Fetch", "Fetch web-shop", "Pull", "Pull web-shop", "Push", "Push tag v1.0", "Fetch origin"] {
+            assert!(touches_remote(label), "{label}");
+        }
+        for label in ["Stage", "Commit", "Pushy branch", "Restore stash", ""] {
+            assert!(!touches_remote(label), "{label}");
         }
     }
 

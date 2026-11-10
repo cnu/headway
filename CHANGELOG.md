@@ -9,6 +9,17 @@ workflow uses that version's section as the GitHub release notes.
 
 ## [Unreleased]
 
+### Added
+
+- **GitHub and GitLab connection**: Headway finds out which repositories are on
+  GitHub or GitLab (GitHub Enterprise and self-managed GitLab too) and talks to
+  them through the `gh` and `glab` you're already signed in to, so it never
+  asks for or stores a token. Each repository's ⋯ menu says who you're signed
+  in as, or exactly what to install or run to connect. Pull request status
+  stays up to date in the background and is the groundwork for the pull
+  request features coming in 0.3.0. Every `gh` and `glab` call is in the
+  command log, with tokens taken out. Without either CLI, nothing changes.
+
 ## [0.2.0] - 2026-11-05
 
 ### Added

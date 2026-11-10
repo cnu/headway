@@ -7,6 +7,7 @@ mod app;
 mod cmdlog;
 mod diffmodel;
 mod fileview;
+mod forge;
 mod git;
 mod graph;
 mod highlight;

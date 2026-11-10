@@ -113,6 +113,7 @@ pub fn repo(
 
 fn toolbar(ui: &mut Ui, rv: &mut RepoView, busy: &[String], sidebar_open: &mut bool, actions: &mut Vec<Action>) {
     let path = rv.path.clone();
+    let forge = rv.forge.clone();
     let search_id = egui::Id::unique(("search", &path));
     if !rv.modal && ui.input(|i| i.modifiers.command && i.key_pressed(egui::Key::F)) {
         ui.memory_mut(|m| m.request_focus(search_id));
@@ -186,7 +187,7 @@ fn toolbar(ui: &mut Ui, rv: &mut RepoView, busy: &[String], sidebar_open: &mut b
         }
 
         ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-            let menu = ui.menu_button(RichText::new("⋯").size(15.0).color(DIM), |ui| repo_menu(ui, &path, data, actions));
+            let menu = ui.menu_button(RichText::new("⋯").size(15.0).color(DIM), |ui| repo_menu(ui, &path, data, forge.as_ref(), actions));
             name_it(&menu.response, egui::Role::Button, "Repository menu");
             if !busy.is_empty() {
                 ui.add(egui::Spinner::new().size(14.0).color(ACCENT)).on_hover_text(busy.join("\n"));
@@ -211,7 +212,7 @@ fn toolbar(ui: &mut Ui, rv: &mut RepoView, busy: &[String], sidebar_open: &mut b
 }
 
 /// The ⋯ menu at the right of the toolbar.
-fn repo_menu(ui: &mut Ui, path: &Path, data: &RepoData, actions: &mut Vec<Action>) {
+fn repo_menu(ui: &mut Ui, path: &Path, data: &RepoData, forge: Option<&crate::forge::StatusLine>, actions: &mut Vec<Action>) {
     ui.set_min_width(240.0);
     let undo_key = ui.ctx().format_shortcut(&egui::KeyboardShortcut::new(egui::Modifiers::COMMAND, egui::Key::Z));
     let text = match &data.undo {
@@ -241,6 +242,25 @@ fn repo_menu(ui: &mut Ui, path: &Path, data: &RepoData, actions: &mut Vec<Action
     ui.separator();
     if ui.button("Copy folder path").clicked() {
         actions.push(Action::Copy(path.display().to_string()));
+        ui.close();
+    }
+    if let Some(line) = forge {
+        ui.separator();
+        forge_status(ui, line, actions);
+    }
+}
+
+/// The ⋯ menus' line about GitHub or GitLab: who's signed in, or how to fix it
+/// (a link to install the CLI, or the sign-in command to copy).
+pub fn forge_status(ui: &mut Ui, line: &crate::forge::StatusLine, actions: &mut Vec<Action>) {
+    ui.add(egui::Label::new(RichText::new(line.text()).small().color(DIM)).wrap());
+    if let Some(url) = line.link() {
+        ui.hyperlink_to(RichText::new(url.trim_start_matches("https://")).small(), url);
+    }
+    if let Some(cmd) = line.command()
+        && ui.button("Copy command").on_hover_text(&cmd).clicked()
+    {
+        actions.push(Action::Copy(cmd));
         ui.close();
     }
 }
