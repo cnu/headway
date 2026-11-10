@@ -402,7 +402,13 @@ pub struct Branch {
     pub is_head: bool,
     pub remote: bool,
     pub upstream: Option<String>,
+    /// The upstream as its two parts, from the branch's settings (kept when the
+    /// remote branch is gone): the remote's name, and the branch name on it.
+    pub upstream_remote: Option<String>,
+    pub upstream_branch: Option<String>,
     pub track: String,
+    /// The commit it points at.
+    pub tip: String,
 }
 
 #[derive(Clone, Debug)]
@@ -590,7 +596,7 @@ pub fn branches(repo: &Path) -> GitResult<(Vec<Branch>, Vec<String>)> {
         repo,
         &[
             "for-each-ref",
-            "--format=%(refname)%1f%(HEAD)%1f%(upstream:short)%1f%(upstream:track,nobracket)",
+            "--format=%(refname)%1f%(HEAD)%1f%(upstream:short)%1f%(upstream:track,nobracket)%1f%(upstream:remotename)%1f%(upstream:remoteref)%1f%(objectname)",
             "refs/heads",
             "refs/remotes",
             "refs/tags",
@@ -604,12 +610,19 @@ pub fn branches(repo: &Path) -> GitResult<(Vec<Branch>, Vec<String>)> {
             continue;
         }
         if let Some(n) = f[0].strip_prefix("refs/heads/") {
+            let field = |i: usize| f.get(i).filter(|s| !s.is_empty()).map(|s| s.to_string());
+            // A local upstream ("." as the remote) isn't on any server.
+            let upstream_remote = field(4).filter(|r| r != ".");
+            let upstream_branch = upstream_remote.as_ref().and(field(5)).map(|r| r.strip_prefix("refs/heads/").unwrap_or(&r).to_string());
             branches.push(Branch {
                 name: n.to_string(),
                 is_head: f[1] == "*",
                 remote: false,
                 upstream: (!f[2].is_empty()).then(|| f[2].to_string()),
+                upstream_remote,
+                upstream_branch,
                 track: f[3].to_string(),
+                tip: f.get(6).unwrap_or(&"").to_string(),
             });
         } else if let Some(n) = f[0].strip_prefix("refs/remotes/") {
             if n.ends_with("/HEAD") {
@@ -620,7 +633,10 @@ pub fn branches(repo: &Path) -> GitResult<(Vec<Branch>, Vec<String>)> {
                 is_head: false,
                 remote: true,
                 upstream: None,
+                upstream_remote: None,
+                upstream_branch: None,
                 track: String::new(),
+                tip: f.get(6).unwrap_or(&"").to_string(),
             });
         } else if let Some(n) = f[0].strip_prefix("refs/tags/") {
             tags.push(n.to_string());
@@ -3281,6 +3297,38 @@ mod tests {
         run(&dir, &["config", "user.email", "t@example.com"]).unwrap();
         run(&dir, &["config", "commit.gpgsign", "false"]).unwrap();
         dir
+    }
+
+    #[test]
+    fn branches_know_their_upstream_remote_and_branch_even_when_gone() {
+        let server = temp_repo("upstream-parts-server");
+        commit_file(&server, "a.txt", "1\n");
+        run(&server, &["branch", "fix-login"]).unwrap();
+        run(&server, &["branch", "gone-soon"]).unwrap();
+        let dir = temp_repo("upstream-parts");
+        let url = server.display().to_string();
+        // A remote name with a slash: "team/origin/fix-login" can't be split by eye.
+        run(&dir, &["remote", "add", "team/origin", &url]).unwrap();
+        run(&dir, &["fetch", "-q", "team/origin"]).unwrap();
+        run(&dir, &["checkout", "-q", "-b", "fix", "--track", "team/origin/fix-login"]).unwrap();
+        run(&dir, &["branch", "--track", "old", "team/origin/gone-soon"]).unwrap();
+        run(&dir, &["branch", "local-only"]).unwrap();
+        run(&dir, &["branch", "--track", "on-fix", "fix"]).unwrap();
+        run(&server, &["branch", "-D", "gone-soon"]).unwrap();
+        run(&dir, &["fetch", "-q", "--prune", "team/origin"]).unwrap();
+
+        let (all, _) = branches(&dir).unwrap();
+        let find = |n: &str| all.iter().find(|b| !b.remote && b.name == n).unwrap().clone();
+        let fix = find("fix");
+        assert_eq!((fix.upstream_remote.as_deref(), fix.upstream_branch.as_deref()), (Some("team/origin"), Some("fix-login")));
+        let old = find("old");
+        assert_eq!(old.track, "gone");
+        assert_eq!((old.upstream_remote.as_deref(), old.upstream_branch.as_deref()), (Some("team/origin"), Some("gone-soon")), "kept from the settings");
+        assert_eq!((find("local-only").upstream_remote, find("local-only").upstream_branch), (None, None));
+        assert_eq!(find("on-fix").upstream_remote, None, "tracking a local branch isn't a remote upstream");
+        assert_eq!(fix.tip, run(&dir, &["rev-parse", "fix"]).unwrap().trim());
+        let _ = std::fs::remove_dir_all(&dir);
+        let _ = std::fs::remove_dir_all(&server);
     }
 
     #[test]

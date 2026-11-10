@@ -60,7 +60,7 @@ pub fn mrs_query(branches: &[String]) -> String {
     let names: Vec<String> = branches.iter().map(|b| serde_json::to_string(b).unwrap_or_default()).collect();
     format!(
         "query($path: ID!) {{ project(fullPath: $path) {{ mergeRequests(sourceBranches: [{}], first: 100, sort: UPDATED_DESC) {{ nodes {{ \
-iid title state draft webUrl updatedAt sourceBranch targetBranch author {{ username }} sourceProject {{ fullPath }} targetProject {{ fullPath }} \
+iid title state draft webUrl updatedAt sourceBranch targetBranch diffHeadSha author {{ username }} sourceProject {{ fullPath }} targetProject {{ fullPath }} \
 approved detailedMergeStatus reviewers {{ nodes {{ username }} }} headPipeline {{ status jobs(first: 100) {{ nodes {{ status allowFailure }} }} }} }} }} }} }}",
         names.join(", ")
     )
@@ -131,6 +131,8 @@ struct MrNode {
     updated_at: String,
     source_branch: String,
     target_branch: String,
+    #[serde(default)]
+    diff_head_sha: Option<String>,
     author: Option<Username>,
     source_project: Option<FullPath>,
     target_project: Option<FullPath>,
@@ -237,6 +239,7 @@ fn mr_from(n: &MrNode) -> PullRequest {
         checks,
         mergeable,
         updated: parse_time(&n.updated_at).unwrap_or(0),
+        head_oid: n.diff_head_sha.clone(),
     }
 }
 
@@ -272,6 +275,8 @@ mod tests {
         let merged = &prs.by_branch["old/merged"];
         assert_eq!(merged.iter().map(|p| (p.number, p.state)).collect::<Vec<_>>(), [(38, PrState::Merged), (12, PrState::Closed)], "newest first");
         assert_eq!(merged[0].updated, parse_time("2026-11-03T17:45:00.000Z").unwrap());
+        assert_eq!(merged[0].head_oid.as_deref(), Some("3f2a9c1d0e8b7a6f5e4d3c2b1a0f9e8d7c6b5a49"));
+        assert_eq!(open.head_oid, None);
     }
 
     #[test]

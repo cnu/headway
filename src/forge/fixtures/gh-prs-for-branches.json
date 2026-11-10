@@ -1,8 +1,8 @@
 {
  "data": {
   "rateLimit": {
-   "remaining": 4973,
-   "resetAt": "2026-11-10T19:08:05Z"
+   "remaining": 4964,
+   "resetAt": "2026-11-10T20:09:08Z"
   },
   "repository": {
    "b0": {
@@ -15,6 +15,7 @@
       "url": "https://github.com/cli/cli/pull/15010",
       "updatedAt": "2026-11-10T14:22:31Z",
       "headRefName": "dependabot/go_modules/golang.org/x/sys-0.50.0",
+      "headRefOid": "b557a2327d684e3e400c59b8d875229074d0d742",
       "baseRefName": "trunk",
       "isCrossRepository": false,
       "author": {
@@ -144,6 +145,7 @@
       "url": "https://github.com/cli/cli/pull/15009",
       "updatedAt": "2026-11-10T15:45:40Z",
       "headRefName": "copilot/fix-gh-auth-status-errors",
+      "headRefOid": "942c1f88e95df8a026170ca90add8b074ee80416",
       "baseRefName": "trunk",
       "isCrossRepository": false,
       "author": {
@@ -270,6 +272,7 @@
       "url": "https://github.com/cli/cli/pull/15003",
       "updatedAt": "2026-11-09T23:24:33Z",
       "headRefName": "patch-1",
+      "headRefOid": "38aef55a786788888bd90ddaeaac0bf6b0b98bb1",
       "baseRefName": "trunk",
       "isCrossRepository": true,
       "author": {
@@ -395,6 +398,7 @@
       "url": "https://github.com/cli/cli/pull/14942",
       "updatedAt": "2026-11-05T04:03:37Z",
       "headRefName": "patch-1",
+      "headRefOid": "fc83ac5921690e6e568894941f3745919bef175c",
       "baseRefName": "trunk",
       "isCrossRepository": true,
       "author": {
@@ -511,6 +515,7 @@
       "url": "https://github.com/cli/cli/pull/14873",
       "updatedAt": "2026-10-30T11:52:12Z",
       "headRefName": "patch-1",
+      "headRefOid": "197651966a7f620714d9233d0d746f57ffc4bd20",
       "baseRefName": "trunk",
       "isCrossRepository": true,
       "author": {
@@ -636,6 +641,7 @@
       "url": "https://github.com/cli/cli/pull/14664",
       "updatedAt": "2026-10-13T17:01:17Z",
       "headRefName": "patch-1",
+      "headRefOid": "6e98cb514c62be4afe1d57ea4a5938556db64804",
       "baseRefName": "trunk",
       "isCrossRepository": true,
       "author": {
@@ -756,6 +762,7 @@
       "url": "https://github.com/cli/cli/pull/14575",
       "updatedAt": "2026-10-02T05:06:00Z",
       "headRefName": "patch-1",
+      "headRefOid": "7d3129d6cc8d223b712ca4ef4dcc2091fad2ccbe",
       "baseRefName": "trunk",
       "isCrossRepository": true,
       "author": {
@@ -885,6 +892,7 @@
       "url": "https://github.com/cli/cli/pull/14920",
       "updatedAt": "2026-11-05T19:40:45Z",
       "headRefName": "williammartin-multiaccount-draft-01-account",
+      "headRefOid": "2cbd5515878542a5125ec412045d2b3e365659b6",
       "baseRefName": "trunk",
       "isCrossRepository": false,
       "author": {
@@ -1005,6 +1013,7 @@
       "url": "https://github.com/cli/cli/pull/15004",
       "updatedAt": "2026-11-10T03:21:04Z",
       "headRefName": "fix-pr-view-rollup-panic",
+      "headRefOid": "b2e86213f3e98d0d2c7425e52795514d965e7aba",
       "baseRefName": "trunk",
       "isCrossRepository": true,
       "author": {

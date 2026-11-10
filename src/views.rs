@@ -3,6 +3,7 @@
 use crate::app::{Action, DiffClick, DiffDoc, Dialog, FileOpen, FileSel, FlatRow, FollowUp, LineKey, LineSel, OpKind, Record, RepoData, RepoView, Selection, Summary};
 use crate::git::{self, Change, FileChange, LineKind, RefKind};
 use crate::graph::Target;
+use crate::forge::status::PrStatus;
 use crate::{highlight, preview};
 use crate::theme::{self, *};
 use crate::workspace::{DiffPrefs, ViewPrefs, Workspace};
@@ -159,6 +160,9 @@ fn toolbar(ui: &mut Ui, rv: &mut RepoView, busy: &[String], sidebar_open: &mut b
             });
         let branch_label = format!("Current branch: {current}");
         switcher.response.widget_info(|| egui::WidgetInfo::labeled(egui::Role::ComboBox, true, &branch_label));
+        if let Some(st) = head.branch.as_ref().and_then(|b| rv.prs.get(b)) {
+            pr_badge(ui, st, false);
+        }
         ui.add_space(6.0);
 
         let has_remote = !data.remotes.is_empty();
@@ -248,6 +252,100 @@ fn repo_menu(ui: &mut Ui, path: &Path, data: &RepoData, forge: Option<&crate::fo
         ui.separator();
         forge_status(ui, line, actions);
     }
+}
+
+// ---------------------------------------------------------------------------
+// Pull request badges
+
+/// Open a pull request. Every badge goes through here (in the browser for now).
+pub fn open_pr(ctx: &egui::Context, pr: &crate::forge::PullRequest) {
+    ctx.open_url(egui::OpenUrl::new_tab(&pr.url));
+}
+
+const BADGE_FONT: f32 = 11.5;
+
+/// How wide [`paint_pr_badge`] draws this badge.
+pub fn pr_badge_width(p: &egui::Painter, st: &PrStatus) -> f32 {
+    let w = p.layout_no_wrap(st.badge(), theme::prop(BADGE_FONT), TEXT).size().x + 12.0;
+    match st.check_mark() {
+        Some(m) => w + p.layout_no_wrap(m.to_string(), theme::prop(BADGE_FONT), TEXT).size().x + 5.0,
+        None => w,
+    }
+}
+
+/// Paint a pull request badge (state shape, number, and the check mark while
+/// it's open) with its left edge at `x`, centred on `y`. Returns where it is.
+pub fn paint_pr_badge(p: &egui::Painter, x: f32, y: f32, st: &PrStatus, dark: bool) -> Rect {
+    let fg = theme::pr_color(st.pr.state, dark);
+    let rect = Rect::from_min_size(pos2(x, y - 9.0), vec2(pr_badge_width(p, st), 18.0));
+    p.rect(rect, 9.0, fg.gamma_multiply(0.16), Stroke::new(1.0, fg.gamma_multiply(0.55)), egui::StrokeKind::Inside);
+    let g = p.layout_no_wrap(st.badge(), theme::prop(BADGE_FONT), fg);
+    let gw = g.size().x;
+    p.galley(pos2(x + 6.0, y - g.size().y / 2.0), g, fg);
+    if let Some(m) = st.check_mark() {
+        let c = theme::check_color(st.pr.checks.state, dark);
+        let gm = p.layout_no_wrap(m.to_string(), theme::prop(BADGE_FONT), c);
+        p.galley(pos2(x + 6.0 + gw + 5.0, y - gm.size().y / 2.0), gm, c);
+    }
+    rect
+}
+
+/// The click area over a painted badge: named for screen readers (and tests),
+/// the pull request's details on hover, opens it on click.
+pub fn pr_badge_area(ui: &Ui, rect: Rect, id: egui::Id, st: &PrStatus) -> egui::Response {
+    let r = ui.interact(rect, id, Sense::click());
+    let label = match st.check_mark() {
+        Some(m) => format!("{} {m}", st.badge()),
+        None => st.badge(),
+    };
+    r.widget_info(|| egui::WidgetInfo::labeled(egui::Role::Link, true, &label));
+    if r.clicked() {
+        open_pr(ui.ctx(), &st.pr);
+    }
+    r.on_hover_cursor(egui::CursorIcon::PointingHand).on_hover_text(st.tooltip(theme::relative))
+}
+
+/// A badge as a button, with words: "○ #13 · checks failing · changes requested".
+/// `loud`: a failing check fills it red (overview cards, where it must stand out).
+pub fn pr_badge(ui: &mut Ui, st: &PrStatus, loud: bool) -> egui::Response {
+    let dark = ui.visuals().dark_mode;
+    let failing = !st.finished() && st.pr.checks.state == crate::forge::CheckState::Failing;
+    let shape = st.badge().chars().next().unwrap_or('#');
+    let mark = st.check_mark().map(|m| format!("{m} ")).unwrap_or_default();
+    let text = format!("{shape} {mark}{}", st.summary());
+    let (fg, fill) = if failing && loud {
+        (Color32::WHITE, theme::check_color(st.pr.checks.state, dark).gamma_multiply(0.85))
+    } else if failing {
+        let c = theme::check_color(st.pr.checks.state, dark);
+        (c, c.gamma_multiply(0.16))
+    } else {
+        let c = theme::pr_color(st.pr.state, dark);
+        (c, c.gamma_multiply(0.16))
+    };
+    let r = ui
+        .add(egui::Button::new(RichText::new(text).size(12.0).color(fg)).fill(fill).corner_radius(9.0))
+        .on_hover_cursor(egui::CursorIcon::PointingHand)
+        .on_hover_text(st.tooltip(theme::relative));
+    if r.clicked() {
+        open_pr(ui.ctx(), &st.pr);
+    }
+    r
+}
+
+/// Delete a branch whose pull request is done with, undoably. A merged branch
+/// still at the commit that was merged loses nothing, even when GitHub squashed
+/// or rebased it (so `git branch -d` would refuse): that one is deleted with -D.
+fn delete_finished_branch(path: &Path, name: &str, st: &PrStatus) -> Action {
+    let merged = st.pr.state == crate::forge::PrState::Merged;
+    let n = st.pr.number;
+    let (flag, body) = if merged && st.tip_matches {
+        ("-D", format!("Delete the branch “{name}”? Its pull request #{n} was merged, and the branch hasn't changed since."))
+    } else if merged {
+        ("-d", format!("Delete the branch “{name}”? Its pull request #{n} was merged. It has commits since then, so git keeps it if they aren't merged anywhere."))
+    } else {
+        ("-d", format!("Delete the branch “{name}”? Its pull request #{n} was closed without merging. git keeps it if its commits aren't merged anywhere."))
+    };
+    Action::confirm("Delete branch", body, "Delete", true, Action::args(path, format!("Delete {name}"), &["branch", flag, name]).undoable(git::Undoable::Refs, format!("delete branch {name}")))
 }
 
 /// The ⋯ menus' line about GitHub or GitLab: who's signed in, or how to fix it
@@ -351,7 +449,7 @@ fn section(ui: &mut Ui, id: &str, title: &str, count: usize, open: bool, add: im
 }
 
 fn side_row(ui: &mut Ui, icon: &str, icon_color: Color32, text: &str, right: Option<(String, Color32)>, strong: bool) -> egui::Response {
-    side_row_ex(ui, icon, icon_color, text, right, strong, None).0
+    side_row_ex(ui, icon, icon_color, text, right, strong, None, None).0
 }
 
 /// Give a hand-drawn control a name (for screen readers and tests).
@@ -370,6 +468,7 @@ struct Eye {
 
 /// A sidebar row, optionally with an eye toggle at the right. Returns the row and
 /// whether the eye was clicked.
+#[allow(clippy::too_many_arguments)]
 fn side_row_ex(
     ui: &mut Ui,
     icon: &str,
@@ -378,7 +477,25 @@ fn side_row_ex(
     right: Option<(String, Color32)>,
     strong: bool,
     eye: Option<Eye>,
+    pr: Option<&PrStatus>,
 ) -> (egui::Response, bool) {
+    let (resp, eye_clicked, _) = side_row_pr(ui, icon, icon_color, text, right, strong, eye, pr);
+    (resp, eye_clicked)
+}
+
+/// [`side_row_ex`], also giving the pull request badge's own response (so the
+/// row's menu can open from it too).
+#[allow(clippy::too_many_arguments)]
+fn side_row_pr(
+    ui: &mut Ui,
+    icon: &str,
+    icon_color: Color32,
+    text: &str,
+    right: Option<(String, Color32)>,
+    strong: bool,
+    eye: Option<Eye>,
+    pr: Option<&PrStatus>,
+) -> (egui::Response, bool, Option<egui::Response>) {
     let w = ui.available_width();
     let (rect, resp) = ui.allocate_exact_size(vec2(w, 23.0), Sense::click());
     name_it(&resp, egui::Role::Button, text);
@@ -402,6 +519,17 @@ fn side_row_ex(
     // Space after the icon, shared by the name and the right-hand note. The name keeps
     // its full width when it fits; the note never takes more than what's left, and
     // always at least ~40% so it stays readable. Both are cut with "…" if needed.
+    // The eye sits at the row's right end, whatever else is in the row.
+    let eye_x = rect.right() + eye_w / 2.0;
+    let mut pr_rect = None;
+    let rect = match pr {
+        Some(st) => {
+            let w = pr_badge_width(p, st);
+            pr_rect = Some(paint_pr_badge(p, rect.right() - w - 4.0, y, st, ui.visuals().dark_mode));
+            Rect::from_min_max(rect.min, pos2(rect.right() - w - 8.0, rect.bottom()))
+        }
+        None => rect,
+    };
     let space = (rect.width() - 30.0).max(20.0);
     let mut right_w = 0.0;
     if let Some((rt, rc)) = right {
@@ -416,10 +544,14 @@ fn side_row_ex(
     if strong {
         p.rect_filled(Rect::from_min_size(rect.left_top() + vec2(0.0, 4.0), vec2(2.0, 15.0)), 1.0, ACCENT);
     }
+    let badge = match (pr, pr_rect) {
+        (Some(st), Some(br)) => Some(pr_badge_area(ui, br, resp.id.with("pr"), st)),
+        _ => None,
+    };
     let mut eye_clicked = false;
     if let Some(e) = eye {
         // Its own click area, added after the row so it sits on top.
-        let er = Rect::from_center_size(pos2(rect.right() + eye_w / 2.0, y), vec2(20.0, 20.0));
+        let er = Rect::from_center_size(pos2(eye_x, y), vec2(20.0, 20.0));
         let eresp = ui.interact(er, resp.id.with("eye"), if e.enabled { Sense::click() } else { Sense::hover() });
         let eye_label = format!("{} {text}", if e.hidden { "Show" } else { "Hide" });
         // The current branch's eye can't be used; say so to screen readers too.
@@ -444,7 +576,7 @@ fn side_row_ex(
         };
         eye_clicked = eresp.on_hover_text(tip).clicked() && e.enabled;
     }
-    (resp, eye_clicked)
+    (resp, eye_clicked, badge)
 }
 
 /// A small triangle: pointing down when `open`, right when folded.
@@ -527,9 +659,21 @@ fn sidebar(
         resp.on_hover_text("Everywhere HEAD and your branches have been, to find lost commits");
         ui.add_space(4.0);
 
-        let locals: Vec<_> = data.branches.iter().filter(|b| !b.remote).collect();
+        let merged = |b: &&git::Branch| rv.prs.get(&b.name).is_some_and(|s| s.pr.state == crate::forge::PrState::Merged);
+        let locals: Vec<_> = data.branches.iter().filter(|b| !b.remote).filter(|b| !rv.merged_only || merged(b)).collect();
         let elsewhere = branches_in_other_worktrees(data);
-        section(ui, "branches", "BRANCHES", locals.len(), true, |ui| {
+        let prs = &rv.prs;
+        let title = if rv.merged_only { "MERGED BRANCHES" } else { "BRANCHES" };
+        section(ui, "branches", title, locals.len(), true, |ui| {
+            if rv.merged_only {
+                let text = if locals.is_empty() { "No merged branches left · Show all" } else { "Merged branches only · Show all" };
+                if side_row(ui, "✓", theme::pr_color(crate::forge::PrState::Merged, ui.visuals().dark_mode), text, None, false)
+                    .on_hover_text("Branches whose pull request was merged. Click to list every branch again.")
+                    .clicked()
+                {
+                    actions.push(Action::ShowAllBranchesInSidebar);
+                }
+            }
             for b in &locals {
                 let other = elsewhere.get(b.name.as_str()).map(|p| p.to_path_buf());
                 let right = (!b.track.is_empty() && b.track != "gone").then(|| {
@@ -543,7 +687,8 @@ fn sidebar(
                 };
                 let full_ref = format!("refs/heads/{}", b.name);
                 let eye = Eye { hidden: data.hidden.contains(&full_ref), enabled: !b.is_head };
-                let (resp, eye_clicked) = side_row_ex(ui, icon, icon_color, &b.name, right, b.is_head, Some(eye));
+                let pr = prs.get(&b.name);
+                let (resp, eye_clicked, badge) = side_row_pr(ui, icon, icon_color, &b.name, right, b.is_head, Some(eye), pr);
                 if eye_clicked {
                     actions.push(Action::ToggleHidden(full_ref));
                 }
@@ -564,7 +709,12 @@ fn sidebar(
                     Some(p) => format!("\nChecked out in the worktree at {}\nDouble-click to open it", p.display()),
                     None => "\nDouble-click to switch to it".to_string(),
                 };
-                resp.on_hover_text(tip).context_menu(|ui| {
+                // The branch's menu opens from its badge too.
+                let menu_area = match badge {
+                    Some(b) => resp.on_hover_text(tip).union(b),
+                    None => resp.on_hover_text(tip),
+                };
+                menu_area.context_menu(|ui| {
                     if let Some(p) = &other {
                         if ui.button("Open its worktree").clicked() {
                             actions.push(Action::OpenWorktree(p.clone()));
@@ -606,6 +756,12 @@ fn sidebar(
                     ui.separator();
                     if ui.button("Copy name").clicked() {
                         actions.push(Action::Copy(name.clone()));
+                    }
+                    if let Some(st) = pr.filter(|s| s.finished())
+                        && !b.is_head
+                        && ui.button(format!("Delete branch ({} in #{})", if st.pr.state == crate::forge::PrState::Merged { "merged" } else { "closed" }, st.pr.number)).clicked()
+                    {
+                        actions.push(delete_finished_branch(&path, &name, st));
                     }
                     if ui.add_enabled(!b.is_head, egui::Button::new(RichText::new("Delete…").color(DANGER))).clicked() {
                         actions.push(Action::confirm(
@@ -829,7 +985,7 @@ fn sidebar(
                             let short = &b.name[r.len() + 1..];
                             let full_ref = format!("refs/remotes/{}", b.name);
                             let eye = Eye { hidden: data.hidden.contains(&full_ref), enabled: true };
-                            let (resp, eye_clicked) = side_row_ex(ui, "⎇", DIM, short, None, false, Some(eye));
+                            let (resp, eye_clicked) = side_row_ex(ui, "⎇", DIM, short, None, false, Some(eye), None);
                             if eye_clicked {
                                 actions.push(Action::ToggleHidden(full_ref));
                             }
@@ -987,6 +1143,7 @@ const LANE_W: f32 = 14.0;
 
 fn commit_list(ui: &mut Ui, rv: &mut RepoView, actions: &mut Vec<Action>) {
     rv.refilter();
+    let prs = &rv.prs;
     let Some(data) = &rv.data else { return };
     let path = rv.path.clone();
     let searching = !rv.search.trim().is_empty();
@@ -1159,6 +1316,7 @@ fn commit_list(ui: &mut Ui, rv: &mut RepoView, actions: &mut Vec<Action>) {
                 // Labels and summary (on the first line of a two-line row).
                 let mid = if two_line { rect.top() + 14.0 } else { mid };
                 let mut tx = rect.left() + graph_w + 6.0;
+                let mut badges: Vec<(Rect, &PrStatus)> = Vec::new();
                 for rl in &c.refs {
                     let (fill, fg, icon) = match rl.kind {
                         RefKind::Head => (ACCENT_DIM, ACCENT, "✔ "),
@@ -1175,6 +1333,15 @@ fn commit_list(ui: &mut Ui, rv: &mut RepoView, actions: &mut Vec<Action>) {
                     p.rect_filled(br, 9.0, fill);
                     p.galley(pos2(tx + 6.0, mid - g.size().y / 2.0), g, fg);
                     tx += w + 5.0;
+                    // The branch's pull request, right after its label.
+                    if let Some(st) = matches!(rl.kind, RefKind::Head | RefKind::Local).then(|| prs.get(&rl.name)).flatten() {
+                        let bw = pr_badge_width(&p, st);
+                        if tx + bw > rect.right() - cols_w - 80.0 {
+                            break;
+                        }
+                        badges.push((paint_pr_badge(&p, tx, mid, st, ui.visuals().dark_mode), st));
+                        tx += bw + 5.0;
+                    }
                 }
                 let max_w = (rect.right() - cols_w - tx - 12.0).max(20.0);
                 let g = trunc(&p, &c.summary, theme::prop(13.5), TEXT, max_w);
@@ -1211,6 +1378,10 @@ fn commit_list(ui: &mut Ui, rv: &mut RepoView, actions: &mut Vec<Action>) {
                     }
                 }
 
+                // Badges have their own click areas, on top of the row's.
+                for (i, (br, st)) in badges.iter().enumerate() {
+                    pr_badge_area(ui, *br, resp.id.with(("pr", i)), st);
+                }
                 if resp.clicked() {
                     actions.push(Action::SelectCommit(c.hash.clone()));
                 }
@@ -2942,6 +3113,7 @@ pub fn diff_view(
 #[cfg(test)]
 mod tests {
     use super::*;
+
     use crate::git::parse_patch;
 
     /// Rows: 0 hunk header, 1 " a", 2 "-b", 3 "+B", 4 " c", 5 "+d", 6 "+e", 7 hunk header, 8 "-x".

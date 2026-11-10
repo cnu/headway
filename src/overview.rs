@@ -15,7 +15,7 @@ pub fn show(
     ui: &mut Ui,
     ws: &Workspace,
     summaries: &HashMap<PathBuf, Result<Summary, String>>,
-    forges: &HashMap<PathBuf, crate::forge::StatusLine>,
+    forges: &HashMap<PathBuf, crate::app::ForgeCard>,
     busy: &[(u64, PathBuf, String)],
     actions: &mut Vec<Action>,
 ) {
@@ -137,7 +137,7 @@ fn card(
     idx: usize,
     path: &PathBuf,
     summary: Option<&Result<Summary, String>>,
-    forge: Option<&crate::forge::StatusLine>,
+    forge: Option<&crate::app::ForgeCard>,
     width: f32,
     row_h: f32,
     busy: bool,
@@ -216,7 +216,7 @@ fn card(
                             actions.push(Action::RemoveRepo(path.clone()));
                             ui.close();
                         }
-                        if let Some(line) = forge {
+                        if let Some(line) = forge.and_then(|f| f.line.as_ref()) {
                             ui.separator();
                             crate::views::forge_status(ui, line, actions);
                         }
@@ -243,6 +243,10 @@ fn card(
                             st.head.oid.as_deref().map(|o| format!("detached at {}", &o[..7.min(o.len())])).unwrap_or_else(|| "no commits".into())
                         });
                         pill(ui, &format!("⎇ {branch}"), BLUE);
+                        // Its pull request, filled red when a check fails so it stands out.
+                        if let Some(st) = forge.and_then(|f| f.current.as_ref()) {
+                            crate::views::pr_badge(ui, st, true);
+                        }
                         if s.linked_worktree {
                             pill(ui, "⧉ worktree", BLUE);
                         }
@@ -268,6 +272,14 @@ fn card(
                             pill(ui, &format!("◫ {subs} submodule{}", if subs == 1 { "" } else { "s" }), DIM);
                         }
                     });
+                    if let Some(n) = forge.map(|f| f.merged).filter(|n| *n > 0) {
+                        ui.add_space(4.0);
+                        let text = format!("✓ {n} merged branch{}", if n == 1 { "" } else { "es" });
+                        let color = theme::pr_color(crate::forge::PrState::Merged, ui.visuals().dark_mode);
+                        if ui.add(egui::Label::new(RichText::new(text).small().color(color)).sense(Sense::click())).on_hover_text("Their pull requests were merged. Click to see them, and delete the ones you're done with.").on_hover_cursor(egui::CursorIcon::PointingHand).clicked() {
+                            actions.push(Action::ShowMergedBranches(path.clone()));
+                        }
+                    }
                     ui.add_space(6.0);
                     if let Some(c) = &s.last {
                         ui.add(egui::Label::new(RichText::new(&c.summary).color(TEXT)).truncate());
@@ -466,7 +478,8 @@ mod tests {
             worktrees: vec![],
             submodules: (0, 0),
             undo: None,
-            forge: None,
+            remote_urls: vec![],
+            branches: vec![],
         })
     }
 

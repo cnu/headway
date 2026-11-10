@@ -19,6 +19,7 @@ pub mod cache;
 pub mod fake;
 pub mod github;
 pub mod gitlab;
+pub mod status;
 
 use crate::git::{self, Tool, ToolOutput};
 use serde::{Deserialize, Serialize};
@@ -317,6 +318,9 @@ pub struct PullRequest {
     pub mergeable: Mergeable,
     /// Unix seconds.
     pub updated: i64,
+    /// The commit the pull request's branch was at (for a merged one: what was merged).
+    #[serde(default)]
+    pub head_oid: Option<String>,
 }
 
 /// One check (a GitHub check run or status, a GitLab job).

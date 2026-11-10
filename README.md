@@ -22,7 +22,7 @@ Headway is a desktop Git client for Linux, macOS and Windows. It groups the repo
 - **Commits** — commit, amend, and edit the message of any earlier commit; later commits and every branch, tag and worktree pointing at them move along in one step.
 - **Undo** — Ctrl/Cmd+Z takes back commits, amends, resets, merges, rebases, checkouts, branch deletes, stash drops and discarded files, hunks or lines, and says why when it isn't safe. A **reflog** view finds lost commits and gets you back to them.
 - **Branches, tags, remotes, stashes, worktrees and submodules** — all in the sidebar, with the usual actions on a right-click.
-- **GitHub and GitLab** — uses the `gh` and `glab` you're already signed in to (GitHub Enterprise and self-managed GitLab included), so Headway never handles a token; each repository's ⋯ menu says who you're signed in as, or how to connect.
+- **GitHub and GitLab** — pull request and check status on your branches, in the history, the toolbar and the overview (a failing check stands out), with reviews and check counts on hover and a click to open it. Branches whose pull request was merged say so and can be deleted in one step. It all goes through the `gh` and `glab` you're already signed in to (GitHub Enterprise and self-managed GitLab included), so Headway never handles a token; each repository's ⋯ menu says who you're signed in as, or how to connect.
 - **Command log** — a record on your computer of every git command Headway runs and why, for when something needs explaining ([Troubleshooting](#troubleshooting)).
 
 ## Install

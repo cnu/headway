@@ -60,6 +60,37 @@ pub fn syntax(tok: crate::highlight::Tok, dark: bool) -> Color32 {
     }
 }
 
+/// A pull request's colour by state: open green, draft grey, merged purple,
+/// closed red. Badges also differ by shape and words, never by colour alone.
+pub fn pr_color(state: crate::forge::PrState, dark: bool) -> Color32 {
+    use crate::forge::PrState::*;
+    match (state, dark) {
+        (Open, true) => ACCENT,
+        (Draft, true) => DIM,
+        (Merged, true) => PURPLE,
+        (Closed, true) => Color32::from_rgb(214, 120, 120),
+        (Open, false) => Color32::from_rgb(26, 127, 55),
+        (Draft, false) => Color32::from_rgb(87, 96, 106),
+        (Merged, false) => Color32::from_rgb(130, 80, 223),
+        (Closed, false) => Color32::from_rgb(190, 40, 50),
+    }
+}
+
+/// A check mark's colour: passing green, failing red, running amber.
+pub fn check_color(state: crate::forge::CheckState, dark: bool) -> Color32 {
+    use crate::forge::CheckState::*;
+    match (state, dark) {
+        (Passing, true) => ACCENT,
+        (Failing, true) => DANGER,
+        (Pending, true) => WARN,
+        (None, true) => DIM,
+        (Passing, false) => Color32::from_rgb(26, 127, 55),
+        (Failing, false) => Color32::from_rgb(190, 40, 50),
+        (Pending, false) => Color32::from_rgb(154, 103, 0),
+        (None, false) => Color32::from_rgb(87, 96, 106),
+    }
+}
+
 pub const LANES: [Color32; 8] = [
     Color32::from_rgb(78, 196, 141),
     Color32::from_rgb(102, 163, 238),
@@ -238,6 +269,32 @@ mod tests {
         assert_eq!(date(1_798_761_600), "2027-01-01");
         assert_eq!(date(-86_400), "1969-12-31");
         assert_eq!(date_time(951_782_400 + 13 * 3600 + 5 * 60), "2000-02-29 13:05 UTC");
+    }
+
+    /// WCAG contrast between two colours (1 to 21).
+    fn contrast(a: Color32, b: Color32) -> f32 {
+        let lum = |c: Color32| {
+            let ch = |v: u8| {
+                let v = v as f32 / 255.0;
+                if v <= 0.03928 { v / 12.92 } else { ((v + 0.055) / 1.055).powf(2.4) }
+            };
+            0.2126 * ch(c.r()) + 0.7152 * ch(c.g()) + 0.0722 * ch(c.b())
+        };
+        let (x, y) = (lum(a), lum(b));
+        (x.max(y) + 0.05) / (x.min(y) + 0.05)
+    }
+
+    #[test]
+    fn pull_request_colours_read_on_dark_and_light_backgrounds() {
+        use crate::forge::{CheckState, PrState};
+        for (bg, dark) in [(PANEL, true), (SIDEBAR, true), (RAISED, true), (Color32::WHITE, false), (Color32::from_rgb(246, 248, 250), false)] {
+            for s in [PrState::Open, PrState::Draft, PrState::Merged, PrState::Closed] {
+                assert!(contrast(pr_color(s, dark), bg) >= 3.0, "{s:?} on {bg:?}: {}", contrast(pr_color(s, dark), bg));
+            }
+            for s in [CheckState::Passing, CheckState::Failing, CheckState::Pending] {
+                assert!(contrast(check_color(s, dark), bg) >= 3.0, "{s:?} on {bg:?}");
+            }
+        }
     }
 
     #[test]

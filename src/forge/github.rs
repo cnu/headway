@@ -105,7 +105,7 @@ pub fn prs_query(n: usize) -> String {
         .collect();
     format!(
         "query($owner: String!, $name: String!{vars}) {{ rateLimit {{ remaining resetAt }} repository(owner: $owner, name: $name) {{{fields} }} }} \
-fragment pr on PullRequest {{ number title state isDraft url updatedAt headRefName baseRefName isCrossRepository \
+fragment pr on PullRequest {{ number title state isDraft url updatedAt headRefName headRefOid baseRefName isCrossRepository \
 author {{ login }} headRepository {{ nameWithOwner }} reviewDecision mergeable mergeStateStatus \
 reviewRequests(first: 20) {{ nodes {{ requestedReviewer {{ ... on User {{ login }} ... on Team {{ slug }} ... on Bot {{ login }} }} }} }} \
 commits(last: 1) {{ nodes {{ commit {{ statusCheckRollup {{ state contexts {{ checkRunCountsByState {{ state count }} statusContextCountsByState {{ state count }} }} }} }} }} }} }}"
@@ -179,6 +179,8 @@ struct PrNode {
     url: String,
     updated_at: String,
     head_ref_name: String,
+    #[serde(default)]
+    head_ref_oid: Option<String>,
     base_ref_name: String,
     #[serde(default)]
     is_cross_repository: bool,
@@ -310,6 +312,7 @@ fn pr_from(n: &PrNode) -> PullRequest {
         checks,
         mergeable,
         updated: parse_time(&n.updated_at).unwrap_or(0),
+        head_oid: n.head_ref_oid.clone(),
     }
 }
 
@@ -338,6 +341,7 @@ mod tests {
             assert!(pr.number > 0 && !pr.title.is_empty() && pr.url.starts_with("https://github.com/"), "{pr:?}");
             assert!(pr.updated > 1_600_000_000, "{pr:?}");
             assert!(branches.contains(&pr.head_branch));
+            assert_eq!(pr.head_oid.as_ref().map(|o| o.len()), Some(40), "the commit it was at");
         }
         assert!(all.iter().any(|p| p.state == PrState::Merged), "the recording has a merged one");
         assert!(all.iter().any(|p| p.checks.passing > 0), "and one with checks");

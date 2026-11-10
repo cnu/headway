@@ -19,6 +19,17 @@ workflow uses that version's section as the GitHub release notes.
   stays up to date in the background and is the groundwork for the pull
   request features coming in 0.3.0. Every `gh` and `glab` call is in the
   command log, with tokens taken out. Without either CLI, nothing changes.
+- **Pull request and check status**: branches with a pull request on GitHub or
+  GitLab carry its number and state (open, draft, merged or closed, each with
+  its own shape) and a check mark (passing, failing or running) in the
+  sidebar and the history; the toolbar says it in words ("#13 · checks failing
+  · changes requested"), and the overview card shows the current branch's,
+  filled red when a check fails. Hover for the title, author, reviews, check
+  counts and how fresh it is; click to open it on GitHub or GitLab. Branches
+  are matched by their upstream, forks included.
+- **Merged branches**: a branch whose pull request was merged says so, and its
+  menu offers "Delete branch (merged in #123)", undoable as always. The
+  overview counts them per repository; click the count to see just those.
 
 ## [0.2.0] - 2026-11-05
 

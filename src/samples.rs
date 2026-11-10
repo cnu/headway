@@ -129,6 +129,14 @@ mod imp {
         make(&mut b);
     }
 
+    /// Build a sample project in another folder (tests).
+    #[cfg(test)]
+    pub fn build_sample_at(dir: &Path, name: &str) {
+        let (_, make) = SAMPLES.iter().find(|(n, _)| *n == name).copied().expect("a sample's name");
+        let _ = std::fs::remove_dir_all(dir);
+        build_one(dir, make);
+    }
+
     /// Which sample project this folder is, if it's one of Headway's samples.
     pub fn sample_name(path: &Path) -> Option<&'static str> {
         let root = samples_dir();
@@ -211,7 +219,10 @@ mod imp {
         }
         b.git(&["config", "branch.main.remote", "origin"]);
         b.git(&["config", "branch.main.merge", "refs/heads/main"]);
-        write_fake_forge();
+        // Not for copies built elsewhere (tests).
+        if b.dir.starts_with(samples_dir()) {
+            write_fake_forge();
+        }
     }
 
     pub const WEB_SHOP_ORIGIN: &str = "https://github.com/headway-samples/web-shop.git";
@@ -241,6 +252,7 @@ mod imp {
             checks: CheckSummary::default(),
             mergeable: Mergeable::Unknown,
             updated: now - hours_ago * 3600,
+            head_oid: None,
         };
         let pulls = vec![
             PullRequest {

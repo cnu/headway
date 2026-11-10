@@ -71,6 +71,8 @@ pub struct RepoEntry {
     /// Pull requests per branch, as of `fetched`.
     pub prs: HashMap<String, Vec<PullRequest>>,
     pub fetched: Option<Instant>,
+    /// The same moment as Unix seconds, to say how old the data is.
+    pub fetched_at: i64,
     /// The last refresh failed with this (the data above is older).
     pub error: Option<ForgeError>,
     /// When a refresh was last asked for (whether or not it worked).
@@ -115,7 +117,6 @@ impl ForgeCache {
         self.hosts.get(host)
     }
 
-    #[allow(dead_code)] // Tests now; the pull request views next.
     pub fn repo(&self, key: &RepoKey) -> Option<&RepoEntry> {
         self.repos.get(key)
     }
@@ -235,6 +236,7 @@ impl ForgeCache {
             Some(Ok(p)) => {
                 entry.prs = p.by_branch.clone();
                 entry.fetched = Some(now);
+                entry.fetched_at = wall_now;
                 entry.error = None;
                 slow_down = p.slow_down_until;
             }
@@ -339,6 +341,7 @@ mod tests {
             checks: CheckSummary::default(),
             mergeable: Mergeable::Unknown,
             updated: n as i64,
+            head_oid: None,
         };
         let mut data = fake::FakeData::default();
         data.hosts.insert("github.com".into(), fake::FakeHost { kind: ForgeKind::GitHub, user: Some("alex".into()), installed: true });

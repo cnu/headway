@@ -2446,6 +2446,7 @@ fn fixture_forge(user: Option<&str>, installed: bool) -> std::sync::Arc<dyn crat
         checks: CheckSummary::from_states([(CheckState::Passing, 3)]),
         mergeable: Mergeable::Clean,
         updated: 1_794_303_012,
+        head_oid: None,
     };
     let info = RepoInfo { default_branch: "main".into(), merge_methods: vec![MergeMethod::Squash], web_url: "https://github.com/acme/shop".into() };
     data.repos.insert("github.com/acme/shop".into(), FakeRepo { info: Some(info), pulls: vec![pr] });
@@ -2458,6 +2459,9 @@ fn github_repo(parent: &Path) -> PathBuf {
     commit(&r, "a.txt", "one\n", "Start");
     git_ok(&r, &["branch", "feature/search"]);
     git_ok(&r, &["remote", "add", "origin", "git@github.com:acme/shop.git"]);
+    // Pushed once (only the settings: nothing is fetched in tests).
+    git_ok(&r, &["config", "branch.feature/search.remote", "origin"]);
+    git_ok(&r, &["config", "branch.feature/search.merge", "refs/heads/feature/search"]);
     r
 }
 
@@ -2497,7 +2501,9 @@ fn opening_a_github_repository_shows_who_is_signed_in_and_loads_its_pull_request
     let key = crate::forge::RepoKey { host: "github.com".into(), path: "acme/shop".into() };
     let entry = h.state().forge_cache().repo(&key).expect("refreshed when the tab opened");
     assert_eq!(entry.prs["feature/search"][0].number, 7);
-    assert!(entry.prs["main"].is_empty());
+    assert!(entry.prs["main"].is_empty(), "the current branch is asked about too");
+    assert_eq!(entry.prs.len(), 2);
+    assert!(shows(&h, "○ #7 ✔"), "its badge in the sidebar");
     assert_eq!(entry.info.as_ref().unwrap().default_branch, "main");
 }
 
@@ -2546,4 +2552,87 @@ fn key_esc_and_commit(h: &mut Harness<'static, HeadwayApp>, r: &Path) {
     git_ok(r, &["commit", "-qam", "Two"]);
     ctrl(h, egui::Key::R);
     assert!(shows(h, "Two"));
+}
+
+// ---------------------------------------------------------------------------
+// Pull request and check status
+
+/// The web-shop sample, built in the scratch folder, with its pull requests
+/// from the sample fixtures; `branch` checked out.
+fn web_shop(s: &Scratch, branch: &str) -> PathBuf {
+    let r = s.root.join("web-shop");
+    crate::samples::build_sample_at(&r, "web-shop");
+    git_ok(&r, &["stash", "-q", "--include-untracked"]);
+    git_ok(&r, &["checkout", "-q", branch]);
+    r
+}
+
+fn web_shop_forge() -> std::sync::Arc<dyn crate::forge::Forges> {
+    let now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_secs() as i64;
+    std::sync::Arc::new(crate::forge::fake::FakeForges::new(crate::samples::web_shop_forge(now)))
+}
+
+#[test]
+fn the_web_shop_card_shows_the_failing_check_and_its_merged_branch() {
+    let s = scratch("pr-status-web-shop");
+    let r = web_shop(&s, "fix/tax-rounding");
+    let mut h = app_with_forge(&s, &r, false, web_shop_forge());
+
+    // The card: the current branch's pull request, filled red for the failing check.
+    assert!(shows(&h, "○ ✖ #13 · checks failing · changes requested"), "the failing check on the card");
+    assert!(shows(&h, "✓ 1 merged branch"));
+
+    // Clicking the count opens the repository with only the merged branch listed.
+    // (Remote branches, listed under REMOTES by the same short names, stay.)
+    let rows = |h: &Harness<'static, HeadwayApp>, name: &str| h.get_all_by_label(&format!("Hide {name}")).count();
+    click(&mut h, "✓ 1 merged branch");
+    assert!(shows(&h, "Merged branches only · Show all"));
+    assert_eq!((rows(&h, "feature/checkout"), rows(&h, "feature/search"), rows(&h, "main")), (2, 1, 1), "only the merged branch is left");
+    assert!(shows(&h, "✓ #9 merged"), "the merged badge on the branch");
+    click(&mut h, "Merged branches only · Show all");
+    assert_eq!((rows(&h, "feature/search"), rows(&h, "main")), (2, 2));
+
+    // Badges on the other branches: open with checks passing, a draft still running.
+    assert!(shows_containing(&h, "○ #12 ✔"));
+    assert!(shows_containing(&h, "◌ #14 draft ●"));
+    // The toolbar says it in words too, and a click opens it on GitHub.
+    h.get_by_label("○ ✖ #13 · checks failing · changes requested").click();
+    h.step();
+    let opened: Vec<String> = h.output().platform_output.commands.iter().filter_map(|c| match c {
+        egui::OutputCommand::OpenUrl(u) => Some(u.url.clone()),
+        _ => None,
+    }).collect();
+    assert_eq!(opened, ["https://github.com/headway-samples/web-shop/pull/13"]);
+    settle(&mut h);
+}
+
+#[test]
+fn a_merged_branch_can_be_deleted_from_its_menu_and_undone() {
+    let s = scratch("pr-status-delete");
+    let r = web_shop(&s, "main");
+    let mut h = app_with_forge(&s, &r, true, web_shop_forge());
+    right_click(&mut h, "feature/checkout");
+    click(&mut h, "Delete branch (merged in #9)");
+    click(&mut h, "Delete");
+    let gone = git::run(&r, &["rev-parse", "--verify", "-q", "refs/heads/feature/checkout"]);
+    assert!(gone.is_err(), "deleted");
+    ctrl(&mut h, egui::Key::Z);
+    settle(&mut h);
+    assert!(git::run(&r, &["rev-parse", "--verify", "-q", "refs/heads/feature/checkout"]).is_ok(), "and back with Undo");
+}
+
+#[test]
+fn no_badges_when_the_forge_is_unavailable() {
+    let s = scratch("pr-status-unavailable");
+    let r = web_shop(&s, "fix/tax-rounding");
+    for forges in [fixture_forge(None, true), fixture_forge(None, false), std::sync::Arc::new(crate::forge::NoForges) as _] {
+        let mut h = app_with_forge(&s, &r, true, forges);
+        assert!(shows(&h, "fix/tax-rounding"));
+        for badge in ["#13", "#12", "#9", "merged"] {
+            assert!(!shows_containing(&h, badge), "{badge}");
+        }
+        click(&mut h, "⌂  Overview");
+        assert!(!shows_containing(&h, "merged branch"));
+        assert!(!shows_containing(&h, "checks failing"));
+    }
 }
