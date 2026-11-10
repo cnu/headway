@@ -30,6 +30,12 @@ workflow uses that version's section as the GitHub release notes.
 - **Merged branches**: a branch whose pull request was merged says so, and its
   menu offers "Delete branch (merged in #123)", undoable as always. The
   overview counts them per repository; click the count to see just those.
+- `headway --version` (or `-V`) prints the version, and `--help` lists every
+  option with what it does.
+
+### Removed
+
+- `--screenshot` is only in development builds now.
 
 ## [0.2.0] - 2026-11-05
 

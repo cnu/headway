@@ -1720,6 +1720,40 @@ fn undo_from_the_menu_and_with_the_shortcut() {
 }
 
 #[test]
+fn ctrl_z_takes_back_a_merge_and_a_rebase_from_the_branch_menu() {
+    let s = scratch("undo-merge-rebase");
+    let r = new_repo(&s.root, "shop");
+    commit(&r, "a.txt", "1\n", "Start shop");
+    git_ok(&r, &["checkout", "-q", "-b", "topic"]);
+    commit(&r, "t.txt", "t\n", "Topic work");
+    git_ok(&r, &["checkout", "-q", "main"]);
+    commit(&r, "m.txt", "m\n", "Main work");
+    let main = git_ok(&r, &["rev-parse", "main"]);
+    let mut h = app(&s, &[&r], true);
+
+    right_click(&mut h, "topic");
+    click(&mut h, "Merge topic into main");
+    click_last(&mut h, "Merge");
+    assert!(head_subject(&r).starts_with("Merge branch 'topic'"));
+    assert!(r.join("t.txt").exists());
+    ctrl(&mut h, egui::Key::Z);
+    assert_eq!(git_ok(&r, &["rev-parse", "main"]), main);
+    assert!(!r.join("t.txt").exists(), "the merged-in file is gone again");
+    assert!(shows(&h, "Undid merge topic"));
+
+    right_click(&mut h, "topic");
+    click(&mut h, "Rebase main onto topic");
+    click_last(&mut h, "Rebase");
+    assert_eq!(subjects(&r, "main")[..2], ["Main work", "Topic work"]);
+    assert_ne!(git_ok(&r, &["rev-parse", "main"]), main, "Main work was rewritten");
+    ctrl(&mut h, egui::Key::Z);
+    assert_eq!(git_ok(&r, &["rev-parse", "main"]), main, "the original commit is back");
+    assert_eq!(branch(&r), "main");
+    assert!(!r.join("t.txt").exists());
+    assert!(shows(&h, "Undid rebase onto topic"));
+}
+
+#[test]
 fn ctrl_z_right_after_committing_takes_the_commit_back() {
     let s = scratch("undo-commit-key");
     let r = new_repo(&s.root, "shop");

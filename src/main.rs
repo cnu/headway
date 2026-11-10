@@ -23,16 +23,24 @@ mod workspace;
 use std::path::PathBuf;
 
 fn main() -> eframe::Result {
-    let mut screenshot = None;
+    // Only development builds can set this (--screenshot); release builds always start normally.
+    #[cfg_attr(not(debug_assertions), allow(unused_mut))]
+    let mut screenshot: Option<PathBuf> = None;
     let mut export: Option<PathBuf> = None;
     let mut days = 2;
     let all: Vec<String> = std::env::args().skip(1).collect();
-    if all.iter().any(|a| matches!(a.as_str(), "--help" | "-h" | "--log-path" | "--export-log")) {
+    if all.iter().any(|a| matches!(a.as_str(), "--help" | "-h" | "--version" | "-V" | "--log-path" | "--export-log")) {
         attach_console();
     }
     let mut args = all.into_iter();
     while let Some(a) = args.next() {
         match a.as_str() {
+            "--version" | "-V" => {
+                println!("headway {}", env!("CARGO_PKG_VERSION"));
+                return Ok(());
+            }
+            // Development builds only: save a picture of the window once it has loaded, then quit.
+            #[cfg(debug_assertions)]
             "--screenshot" => screenshot = args.next().map(PathBuf::from),
             "--log-path" => {
                 println!("{}", cmdlog::log_path().display());
@@ -62,13 +70,18 @@ fn main() -> eframe::Result {
                 return Ok(());
             }
             "--help" | "-h" => {
-                if cfg!(debug_assertions) {
-                    println!("headway [--screenshot <file.png>] [--reset-sample web-shop|api-server|design-tokens|price-rules|diff-showcase]");
-                } else {
-                    println!("headway [--screenshot <file.png>]");
-                }
+                println!("headway                                  open Headway");
+                println!("headway --version, -V                    print the version");
+                println!("headway --help, -h                       show this help");
                 println!("headway --log-path                       print the command log folder");
                 println!("headway --export-log <file> [--days N]   save the last N days (default 2) of the command log to attach to a bug report");
+                if cfg!(debug_assertions) {
+                    println!();
+                    println!("Development builds only:");
+                    println!("headway --screenshot <file.png>          save a picture of the window once it has loaded, then quit");
+                    println!("headway --reset-sample <name>            rebuild a sample project: web-shop|api-server|design-tokens|price-rules|diff-showcase");
+                    println!("HEADWAY_FAKE_FORGE=<folder>              answer GitHub and GitLab questions from <folder>/forge.json instead of gh and glab");
+                }
                 println!();
                 println!("HEADWAY_LOG=normal|verbose|off sets how much is logged; HEADWAY_LOG_DIR=<folder> moves the log.");
                 return Ok(());

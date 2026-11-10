@@ -5256,6 +5256,137 @@ index 4444444..0000000
         let _ = std::fs::remove_dir_all(&dir);
     }
 
+    fn parents(dir: &Path, rev: &str) -> usize {
+        run(dir, &["rev-list", "--parents", "-n", "1", rev]).unwrap().split_whitespace().count() - 1
+    }
+
+    fn read(dir: &Path, file: &str) -> Option<String> {
+        std::fs::read_to_string(dir.join(file)).ok()
+    }
+
+    #[test]
+    fn undo_a_merge_takes_away_the_merge_commit_and_its_files() {
+        let dir = temp_repo("undo-merge");
+        commit_file(&dir, "a.txt", "1\n");
+        run(&dir, &["checkout", "-q", "-b", "feature"]).unwrap();
+        commit_file(&dir, "b.txt", "from feature\n");
+        let feature = head(&dir);
+        run(&dir, &["checkout", "-q", "main"]).unwrap();
+        commit_file(&dir, "c.txt", "from main\n");
+        let before = head(&dir);
+        // Work in progress the merge leaves alone, and so must the undo.
+        std::fs::write(dir.join("a.txt"), "1 and unstaged\n").unwrap();
+        std::fs::write(dir.join("notes.txt"), "untracked\n").unwrap();
+
+        let e = recorded(&dir, Undoable::Tree { save_work: false }, || {
+            run(&dir, &["merge", "--no-edit", "feature"]).unwrap();
+        });
+        assert_eq!(parents(&dir, "HEAD"), 2, "a real merge commit");
+        assert_eq!(read(&dir, "b.txt").as_deref(), Some("from feature\n"));
+
+        undo(&dir, &e).unwrap();
+        assert_eq!(head(&dir), before);
+        assert_eq!(run(&dir, &["symbolic-ref", "HEAD"]).unwrap().trim(), "refs/heads/main");
+        assert_eq!(read(&dir, "b.txt"), None, "the merged-in file is gone again");
+        assert_eq!(read(&dir, "a.txt").as_deref(), Some("1 and unstaged\n"));
+        assert_eq!(read(&dir, "notes.txt").as_deref(), Some("untracked\n"));
+        assert!(status(&dir).unwrap().staged.is_empty());
+        assert_eq!(run(&dir, &["rev-parse", "feature"]).unwrap().trim(), feature, "the merged branch doesn't move");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn undo_a_rebase_brings_back_the_original_commits() {
+        let dir = temp_repo("undo-rebase");
+        commit_file(&dir, "a.txt", "1\n");
+        run(&dir, &["checkout", "-q", "-b", "feature"]).unwrap();
+        commit_file(&dir, "b.txt", "one\n");
+        commit_file(&dir, "b.txt", "two\n");
+        let original = head(&dir);
+        run(&dir, &["checkout", "-q", "main"]).unwrap();
+        commit_file(&dir, "c.txt", "main\n");
+        let main = head(&dir);
+        run(&dir, &["checkout", "-q", "feature"]).unwrap();
+
+        let e = recorded(&dir, Undoable::Tree { save_work: false }, || {
+            run(&dir, &["rebase", "main"]).unwrap();
+        });
+        let rebased = head(&dir);
+        assert_ne!(rebased, original, "both commits were rewritten");
+        assert_eq!(run(&dir, &["rev-parse", "HEAD~2"]).unwrap().trim(), main);
+        assert_eq!(read(&dir, "c.txt").as_deref(), Some("main\n"));
+
+        undo(&dir, &e).unwrap();
+        assert_eq!(head(&dir), original, "feature points at the commits from before the rebase");
+        assert_eq!(run(&dir, &["symbolic-ref", "HEAD"]).unwrap().trim(), "refs/heads/feature");
+        assert_eq!(read(&dir, "c.txt"), None);
+        assert_eq!(read(&dir, "b.txt").as_deref(), Some("two\n"));
+        assert_eq!(run(&dir, &["rev-parse", "main"]).unwrap().trim(), main, "the branch rebased onto doesn't move");
+        assert!(status(&dir).unwrap().staged.is_empty());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn undo_a_pull_takes_back_what_it_brought_in() {
+        let up = temp_repo("undo-pull-up");
+        commit_file(&up, "a.txt", "1\n");
+        let dir = std::env::temp_dir().join(format!("headway-test-undo-pull-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        run(&up, &["clone", "-q", &up.display().to_string(), &dir.display().to_string()]).unwrap();
+        run(&dir, &["config", "user.name", "Test"]).unwrap();
+        run(&dir, &["config", "user.email", "t@example.com"]).unwrap();
+        let before = head(&dir);
+        commit_file(&up, "a.txt", "2\n");
+        let pulled = head(&up);
+
+        let e = recorded(&dir, Undoable::Tree { save_work: false }, || {
+            run(&dir, &["pull", "-q", "--ff-only"]).unwrap();
+        });
+        assert_eq!(head(&dir), pulled);
+
+        // The pulled commit is on the remote already, so taking it back from main is fine.
+        undo(&dir, &e).unwrap();
+        assert_eq!(head(&dir), before);
+        assert_eq!(read(&dir, "a.txt").as_deref(), Some("1\n"));
+        assert!(status(&dir).unwrap().staged.is_empty());
+        // And pulling again brings it straight back.
+        run(&dir, &["pull", "-q", "--ff-only"]).unwrap();
+        assert_eq!(head(&dir), pulled);
+        let _ = std::fs::remove_dir_all(&dir);
+        let _ = std::fs::remove_dir_all(&up);
+    }
+
+    #[test]
+    fn undo_a_cherry_pick_and_a_revert() {
+        let dir = temp_repo("undo-pick-revert");
+        commit_file(&dir, "a.txt", "1\n");
+        run(&dir, &["checkout", "-q", "-b", "other"]).unwrap();
+        commit_file(&dir, "b.txt", "picked\n");
+        let pick = head(&dir);
+        run(&dir, &["checkout", "-q", "main"]).unwrap();
+        let start = head(&dir);
+
+        let e = recorded(&dir, Undoable::Tree { save_work: false }, || {
+            run(&dir, &["cherry-pick", &pick]).unwrap();
+        });
+        assert_eq!(read(&dir, "b.txt").as_deref(), Some("picked\n"));
+        undo(&dir, &e).unwrap();
+        assert_eq!(head(&dir), start);
+        assert_eq!(read(&dir, "b.txt"), None);
+
+        commit_file(&dir, "a.txt", "2\n");
+        let changed = head(&dir);
+        let e = recorded(&dir, Undoable::Tree { save_work: false }, || {
+            run(&dir, &["revert", "--no-edit", "HEAD"]).unwrap();
+        });
+        assert_eq!(read(&dir, "a.txt").as_deref(), Some("1\n"));
+        undo(&dir, &e).unwrap();
+        assert_eq!(head(&dir), changed, "the revert commit is gone");
+        assert_eq!(read(&dir, "a.txt").as_deref(), Some("2\n"));
+        assert!(status(&dir).unwrap().staged.is_empty());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     #[test]
     fn nothing_changed_means_nothing_to_undo() {
         let dir = temp_repo("undo-nothing");
