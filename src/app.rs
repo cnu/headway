@@ -134,6 +134,45 @@ struct ForgeRepo {
     branches: Vec<forge::status::LocalBranch>,
 }
 
+/// The sidebar's pull request section (set by the app each frame).
+#[derive(Clone, Debug)]
+pub struct PrSection {
+    pub kind: forge::ForgeKind,
+    /// `None` until the first answer.
+    pub lists: Option<Arc<forge::PrLists>>,
+    /// When the lists were read (Unix seconds).
+    pub as_of: i64,
+    /// The project's page on the forge (to list them all there).
+    pub web_url: Option<String>,
+    /// The last refresh failed (the lists are older).
+    pub error: Option<String>,
+}
+
+/// The filter tabs of the pull request section.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum PrTab {
+    Mine,
+    Review,
+    Open,
+}
+
+/// What to do with a pull request from the sidebar (the app works out the rest).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum PrAction {
+    Checkout,
+    Worktree,
+    ShowCommits,
+    AddForkRemote,
+}
+
+/// A pull request's commits, marked in the history.
+#[derive(Clone, Debug, PartialEq)]
+pub struct PrHighlight {
+    pub number: u64,
+    pub head: String,
+    pub commits: std::collections::HashSet<String>,
+}
+
 /// What a repository's overview card shows about GitHub or GitLab.
 #[derive(Clone, Debug, Default)]
 pub struct ForgeCard {
@@ -537,7 +576,7 @@ impl DiffDoc {
 // ---------------------------------------------------------------------------
 // One open repository tab
 
-#[derive(Clone, PartialEq)]
+#[derive(Clone, Debug, PartialEq)]
 pub enum Selection {
     WorkingDir,
     Commit(String),
@@ -616,6 +655,18 @@ pub struct RepoView {
     pub prs: HashMap<String, forge::status::PrStatus>,
     /// The sidebar lists only branches whose pull request was merged.
     pub merged_only: bool,
+    /// The pull request section, while the forge can be used (set by the app each frame).
+    pub pr_section: Option<PrSection>,
+    /// The filter picked by hand (`None`: the first one with something in it).
+    pub pr_tab: Option<PrTab>,
+    /// The pull request row last clicked or moved to with the keyboard.
+    pub pr_selected: Option<u64>,
+    /// A pull request row has keyboard focus (the arrows are its, not the history's).
+    pub pr_keys: bool,
+    /// A pull request's commits, marked in the history.
+    pub pr_highlight: Option<PrHighlight>,
+    /// Select this commit once the history has it (it was just fetched).
+    pr_reveal: Option<String>,
 }
 
 impl RepoView {
@@ -655,6 +706,12 @@ impl RepoView {
             forge: None,
             prs: HashMap::new(),
             merged_only: false,
+            pr_section: None,
+            pr_tab: None,
+            pr_selected: None,
+            pr_keys: false,
+            pr_highlight: None,
+            pr_reveal: None,
         }
     }
 
@@ -723,6 +780,9 @@ enum Msg {
     LastMessage(PathBuf, String),
     /// A commit's full message, read to open the "Edit commit message" dialog.
     EditMessage { repo: PathBuf, hash: String, message: Result<String, String> },
+    /// A pull request's head and its commits, for "Show commits" (`fetched`: the
+    /// head had to be fetched, so the history needs reloading first).
+    PrCommits { repo: PathBuf, number: u64, result: Result<(String, Vec<String>, bool), String> },
     /// `undo`: the operation log entry the action left, if it can be undone.
     OpDone { id: u64, repo: PathBuf, label: String, result: Result<String, String>, kind: OpKind, undo: Option<u64> },
     Cloned(u64, Result<PathBuf, String>),
@@ -799,6 +859,10 @@ pub enum Action {
     ShowMergedBranches(PathBuf),
     /// Show every branch in the open repository's sidebar again.
     ShowAllBranchesInSidebar,
+    /// Do something with one of the open repository's pull requests.
+    Pr { repo: PathBuf, number: u64, what: PrAction },
+    /// Stop marking a pull request's commits in the history.
+    ClearPrHighlight,
     /// How diffs are shown changed: show the open ones that way, reading them
     /// again (`reload`) when what they contain changes.
     DiffPrefsChanged { reload: bool },
@@ -1487,6 +1551,11 @@ impl HeadwayApp {
     fn forge_refresh(&mut self, path: &Path, reason: Reason) {
         if let Some(r) = self.forge_repos.get(path) {
             let names = forge::status::query_branches(&r.branches, &r.remotes, &r.urls);
+            let key = r.remotes.key();
+            // The lists are for the sidebar: only while some tab of this project is open.
+            let in_tab = self.tabs.keys().any(|t| self.forge_repos.get(t).is_some_and(|o| o.remotes.key() == key));
+            self.forge_cache.want_lists(&key, in_tab);
+            let r = &self.forge_repos[path];
             self.forge_cache.request(&r.remotes.key(), path, &names, reason, std::time::Instant::now());
             self.forge_pump();
         }
@@ -1534,6 +1603,98 @@ impl HeadwayApp {
         let prs = self.pr_statuses(path);
         let current = self.forge_repos.get(path).and_then(|r| r.branches.iter().find(|b| b.current)).and_then(|b| prs.get(&b.name).cloned());
         ForgeCard { line: self.forge_line(path), merged: forge::status::merged_branches(&prs).len(), current }
+    }
+
+    /// The sidebar's pull request section: `None` (not shown at all) unless the
+    /// forge's CLI is signed in.
+    pub fn pr_section(&self, path: &Path) -> Option<PrSection> {
+        let r = self.forge_repos.get(path)?;
+        let host = self.forge_cache.host(&r.remotes.pr_url.host)?;
+        let kind = host.kind.filter(|_| matches!(host.connection, forge::cache::Connection::SignedIn(_)))?;
+        let entry = self.forge_cache.repo(&r.remotes.key());
+        Some(PrSection {
+            kind,
+            lists: entry.and_then(|e| e.lists.clone()),
+            as_of: entry.map_or(0, |e| e.lists_at),
+            web_url: entry.and_then(|e| e.info.as_ref()).map(|i| i.web_url.clone()),
+            error: entry.and_then(|e| e.error.as_ref()).map(|e| e.to_string()),
+        })
+    }
+
+    /// One of a repository's listed pull requests, with how to fetch it.
+    fn find_pr(&self, path: &Path, number: u64) -> Option<(forge::PullRequest, git::PrSource, &ForgeRepo)> {
+        let r = self.forge_repos.get(path)?;
+        let section = self.pr_section(path)?;
+        let lists = section.lists?;
+        let pr = lists.mine.iter().chain(&lists.review_requested).chain(&lists.open).find(|p| p.number == number)?.clone();
+        let src = forge::status::pr_source(&pr, section.kind, &r.remotes, &r.urls);
+        Some((pr, src, r))
+    }
+
+    fn pr_action(&mut self, repo: PathBuf, number: u64, what: PrAction) {
+        let Some((pr, src, r)) = self.find_pr(&repo, number) else {
+            self.toast(format!("#{number} isn't in the list any more. It may have been merged or closed."), true);
+            return;
+        };
+        let fork = forge::status::fork_remote(&pr, &r.remotes, &r.urls);
+        let base = format!("{}/{}", r.remotes.pr_remote, pr.base_branch);
+        let remote_names: Vec<String> = r.urls.iter().map(|(n, _)| n.clone()).collect();
+        match what {
+            PrAction::Checkout => {
+                let hint = fork.as_ref().map(|(name, _)| {
+                    let owner = pr.head_repo.as_deref().and_then(|f| f.split('/').next()).unwrap_or(name);
+                    format!("To pull {owner}'s later commits from their fork, add it as a remote from the pull request's menu.")
+                });
+                let a = Action::git(&repo, format!("Check out #{number}"), move |p| {
+                    let note = git::checkout_pr(p, &src)?;
+                    Ok([note, hint.unwrap_or_default()].into_iter().filter(|s| !s.is_empty()).collect::<Vec<_>>().join("\n"))
+                })
+                .undoable(git::Undoable::Tree { save_work: false }, format!("check out #{number}"));
+                self.do_action(a);
+            }
+            PrAction::Worktree => {
+                let target = git::pr_worktree_path(&repo, number);
+                let t = target.clone();
+                self.do_action(Action::GitThen {
+                    repo: repo.clone(),
+                    label: format!("Check out #{number} in a new worktree"),
+                    op: Box::new(move |r| git::checkout_pr_worktree(r, &src, &t)),
+                    then: FollowUp::Open(target),
+                });
+            }
+            PrAction::AddForkRemote => {
+                if let Some((name, url)) = fork {
+                    self.do_action(Action::Dialog(Dialog::AddRemote { repo, name, url, fetch: true, taken: remote_names }));
+                }
+            }
+            PrAction::ShowCommits => {
+                let known = pr.head_oid.clone();
+                let r2 = repo.clone();
+                self.spawn(move || {
+                    let _name = cmdlog::named("show pull request commits");
+                    let result = (|| {
+                        let have = known.filter(|o| git::run(&r2, &["cat-file", "-e", &format!("{o}^{{commit}}")]).is_ok());
+                        let (head, fetched) = match have {
+                            Some(h) => (h, false),
+                            None => (git::fetch_pr_for_history(&r2, &src)?, true),
+                        };
+                        let commits = git::pr_commits(&r2, &head, &base, 500)?;
+                        Ok((head, commits, fetched))
+                    })();
+                    Msg::PrCommits { repo: r2, number, result }
+                });
+            }
+        }
+    }
+
+    /// Select a commit in the history and scroll to it (clearing the search).
+    fn reveal_commit(&mut self, path: &Path, hash: &str) -> bool {
+        let Some(rv) = self.tabs.get_mut(path) else { return false };
+        let Some(i) = rv.data.as_ref().and_then(|d| d.commits.iter().position(|c| c.hash == hash)) else { return false };
+        rv.search.clear();
+        rv.list_scroll_to = Some(i);
+        self.do_action(Action::SelectCommit(hash.to_string()));
+        true
     }
 
     /// Drop a folder from every workspace and close its tabs (it was deleted).
@@ -1780,6 +1941,20 @@ impl HeadwayApp {
                         self.forge_refresh(&repo, Reason::AfterGit);
                     }
                 }
+                Msg::PrCommits { repo, number, result } => match result {
+                    Ok((head, commits, fetched)) => {
+                        if let Some(rv) = self.tabs.get_mut(&repo) {
+                            rv.pr_highlight = Some(PrHighlight { number, head: head.clone(), commits: commits.into_iter().collect() });
+                            rv.pr_reveal = Some(head.clone());
+                        }
+                        if fetched {
+                            self.reload_repo(&repo);
+                        } else {
+                            self.finish_reveal(&repo);
+                        }
+                    }
+                    Err(e) => self.toast(format!("Couldn't show the commits of #{number}:\n{e}"), true),
+                },
                 Msg::Cloned(id, res) => {
                     self.busy.retain(|b| b.0 != id);
                     match res {
@@ -1893,12 +2068,21 @@ impl HeadwayApp {
         if !want_conflicts.is_empty() {
             self.load_conflicts(&path, want_conflicts);
         }
+        self.finish_reveal(&path);
         let loaded = self.tabs.get(&path).and_then(|rv| rv.data.as_ref()).map(|d| (d.remote_urls.clone(), d.branches.clone()));
         if let Some((urls, branches)) = loaded {
             self.forge_learn(&path, &urls, &branches);
             if self.forge_opened.remove(&path) {
                 self.forge_refresh(&path, Reason::Opened);
             }
+        }
+    }
+
+    /// Select the pull request head waiting to be shown, if the history has it.
+    fn finish_reveal(&mut self, path: &Path) {
+        let Some(head) = self.tabs.get_mut(path).and_then(|rv| rv.pr_reveal.take()) else { return };
+        if !self.reveal_commit(path, &head) {
+            self.toast(format!("Commit {} isn't in the history shown. It may be on a hidden branch, or further back than the history loaded.", &head[..head.len().min(8)]), true);
         }
     }
 
@@ -1928,6 +2112,12 @@ impl HeadwayApp {
                 self.view_dirty = true;
                 if let Some(rv) = self.tabs.get_mut(&path) {
                     rv.merged_only = true;
+                }
+            }
+            Action::Pr { repo, number, what } => self.pr_action(repo, number, what),
+            Action::ClearPrHighlight => {
+                if let Some(rv) = active.and_then(|p| self.tabs.get_mut(&p)) {
+                    rv.pr_highlight = None;
                 }
             }
             Action::ShowAllBranchesInSidebar => {
@@ -3002,9 +3192,11 @@ impl eframe::App for HeadwayApp {
                     let busy: Vec<String> = self.busy.iter().filter(|b| b.1 == p).map(|b| b.2.clone()).collect();
                     let line = self.forge_line(&p);
                     let prs = self.pr_statuses(&p);
+                    let section = self.pr_section(&p);
                     if let Some(rv) = self.tabs.get_mut(&p) {
                         rv.forge = line;
                         rv.prs = prs;
+                        rv.pr_section = section;
                         rv.modal = self.dialog.is_some();
                         let before = self.cfg.view;
                         views::repo(ui, rv, &ws, &self.summaries, &busy, &mut self.cfg.view, &mut actions);

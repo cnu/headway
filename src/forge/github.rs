@@ -94,6 +94,38 @@ impl Forge for GitHub {
         }
         Ok(all)
     }
+
+    fn pr_lists(&self, repo: &RepoKey, _me: &str, limit: usize) -> ForgeResult<PrLists> {
+        let url = RemoteUrl { host: repo.host.clone(), path: repo.path.clone() };
+        let mine = search_terms(repo, "author:@me");
+        let review = search_terms(repo, "review-requested:@me");
+        let vars = [("owner".to_string(), url.owner()), ("name".into(), url.name()), ("mine".into(), mine.as_str()), ("review".into(), review.as_str())];
+        let data: ListsData = self.graphql(&lists_query(limit), &vars)?;
+        parse_lists(data)
+    }
+}
+
+/// Everything the app reads about a pull request.
+const PR_FRAGMENT: &str = "fragment pr on PullRequest { number title state isDraft url updatedAt headRefName headRefOid baseRefName isCrossRepository \
+author { login } headRepository { nameWithOwner } reviewDecision mergeable mergeStateStatus \
+reviewRequests(first: 20) { nodes { requestedReviewer { ... on User { login } ... on Team { slug } ... on Bot { login } } } } \
+commits(last: 1) { nodes { commit { statusCheckRollup { state contexts { checkRunCountsByState { state count } statusContextCountsByState { state count } } } } } } }";
+
+/// One query for the sidebar's three lists: two searches (by me, asking me for a
+/// review) and the repository's open pull requests, `limit` each.
+pub fn lists_query(limit: usize) -> String {
+    let n = limit.clamp(1, 100);
+    format!(
+        "query($owner: String!, $name: String!, $mine: String!, $review: String!) {{ rateLimit {{ remaining resetAt }} \
+mine: search(query: $mine, type: ISSUE, first: {n}) {{ nodes {{ ...pr }} }} \
+review: search(query: $review, type: ISSUE, first: {n}) {{ nodes {{ ...pr }} }} \
+repository(owner: $owner, name: $name) {{ pullRequests(states: OPEN, first: {n}, orderBy: {{field: UPDATED_AT, direction: DESC}}) {{ totalCount nodes {{ ...pr }} }} }} }} {PR_FRAGMENT}"
+    )
+}
+
+/// The search terms for a list: open pull requests in `owner/name`, plus `who`.
+pub fn search_terms(repo: &RepoKey, who: &str) -> String {
+    format!("repo:{} is:pr is:open {who} sort:updated-desc", repo.path)
 }
 
 /// One query for `n` branches: an aliased `pullRequests(headRefName:)` per branch
@@ -103,13 +135,7 @@ pub fn prs_query(n: usize) -> String {
     let fields: String = (0..n)
         .map(|i| format!(" b{i}: pullRequests(headRefName: $h{i}, first: 5, orderBy: {{field: UPDATED_AT, direction: DESC}}) {{ nodes {{ ...pr }} }}"))
         .collect();
-    format!(
-        "query($owner: String!, $name: String!{vars}) {{ rateLimit {{ remaining resetAt }} repository(owner: $owner, name: $name) {{{fields} }} }} \
-fragment pr on PullRequest {{ number title state isDraft url updatedAt headRefName headRefOid baseRefName isCrossRepository \
-author {{ login }} headRepository {{ nameWithOwner }} reviewDecision mergeable mergeStateStatus \
-reviewRequests(first: 20) {{ nodes {{ requestedReviewer {{ ... on User {{ login }} ... on Team {{ slug }} ... on Bot {{ login }} }} }} }} \
-commits(last: 1) {{ nodes {{ commit {{ statusCheckRollup {{ state contexts {{ checkRunCountsByState {{ state count }} statusContextCountsByState {{ state count }} }} }} }} }} }} }}"
-    )
+    format!("query($owner: String!, $name: String!{vars}) {{ rateLimit {{ remaining resetAt }} repository(owner: $owner, name: $name) {{{fields} }} }} {PR_FRAGMENT}")
 }
 
 // ---- Parsing (public to the tests, which feed recorded answers)
@@ -153,6 +179,30 @@ pub fn parse_repo_info(data: RepoData) -> ForgeResult<RepoInfo> {
 pub struct PrsData {
     rate_limit: Option<RateLimit>,
     repository: Option<HashMap<String, Connection<PrNode>>>,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ListsData {
+    rate_limit: Option<RateLimit>,
+    mine: Option<Connection<PrNode>>,
+    review: Option<Connection<PrNode>>,
+    repository: Option<ListsRepo>,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct ListsRepo {
+    pull_requests: Counted<PrNode>,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct Counted<T> {
+    #[serde(default)]
+    total_count: usize,
+    #[serde(default = "Vec::new")]
+    nodes: Vec<Option<T>>,
 }
 
 #[derive(Deserialize)]
@@ -269,6 +319,18 @@ pub fn parse_prs(data: PrsData, branches: &[String]) -> ForgeResult<BranchPrs> {
     Ok(BranchPrs { by_branch, slow_down_until })
 }
 
+pub fn parse_lists(data: ListsData) -> ForgeResult<PrLists> {
+    let repo = data.repository.ok_or(ForgeError::NotFound)?;
+    let read = |c: Option<Connection<PrNode>>| c.map(|c| c.nodes.iter().flatten().map(pr_from).collect()).unwrap_or_default();
+    Ok(PrLists {
+        mine: read(data.mine),
+        review_requested: read(data.review),
+        open: repo.pull_requests.nodes.iter().flatten().map(pr_from).collect(),
+        open_total: repo.pull_requests.total_count,
+        slow_down_until: data.rate_limit.filter(|r| r.remaining < LOW_RATE).and_then(|r| parse_time(&r.reset_at)),
+    })
+}
+
 fn pr_from(n: &PrNode) -> PullRequest {
     let state = match n.state.as_str() {
         "MERGED" => PrState::Merged,
@@ -347,6 +409,32 @@ mod tests {
         assert!(all.iter().any(|p| p.checks.passing > 0), "and one with checks");
         assert!(all.iter().any(|p| p.head_repo.is_some()), "and one from a fork");
         assert!(prs.by_branch.values().any(|v| v.is_empty()), "and a branch without one");
+    }
+
+    #[test]
+    fn recorded_lists_are_read() {
+        let reply: GraphQl<ListsData> = serde_json::from_str(include_str!("fixtures/gh-pr-lists.json")).unwrap();
+        let lists = parse_lists(graphql_result(reply).unwrap()).unwrap();
+        assert_eq!(lists.open.len(), 5);
+        assert_eq!(lists.open_total, 59, "more than the page holds");
+        assert!(lists.open.iter().any(|p| p.state == PrState::Draft) && lists.open.iter().any(|p| p.head_repo.is_some()));
+        assert_eq!(lists.mine[0].author, "octo-user");
+        assert!(lists.review_requested[0].requested_reviewers.contains(&"octo-user".to_string()));
+        assert_eq!(lists.slow_down_until, None);
+    }
+
+    #[test]
+    fn one_query_lists_all_three_with_the_search_terms_as_variables() {
+        let cli = Arc::new(StubCli::default().on(Tool::Gh, &["api", "graphql"], Answer::Ok(include_str!("fixtures/gh-pr-lists.json"))));
+        let forge = GitHub { cli: cli.clone(), host: "github.com".into(), dir: None };
+        forge.pr_lists(&key(), "octo-user", 50).unwrap();
+        let calls = cli.calls();
+        assert_eq!(calls.len(), 1);
+        let args = &calls[0].1;
+        assert!(args.contains(&"mine=repo:cli/cli is:pr is:open author:@me sort:updated-desc".to_string()), "{args:?}");
+        assert!(args.contains(&"review=repo:cli/cli is:pr is:open review-requested:@me sort:updated-desc".to_string()));
+        let query = args.iter().find(|a| a.starts_with("query=")).unwrap();
+        assert!(query.contains("first: 50") && query.contains("totalCount") && query.contains("states: OPEN"));
     }
 
     #[test]

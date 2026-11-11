@@ -77,8 +77,18 @@ pub struct RepoEntry {
     pub error: Option<ForgeError>,
     /// When a refresh was last asked for (whether or not it worked).
     asked: Option<Instant>,
+    /// The sidebar's lists (asked for only while the repository is open in a tab),
+    /// as of `lists_at` (Unix seconds).
+    pub lists: Option<Arc<PrLists>>,
+    pub lists_at: i64,
     /// Queued or running.
     busy: bool,
+    /// The app wants the lists too (see [`ForgeCache::want_lists`]).
+    lists_wanted: bool,
+    /// The running job leaves the lists out.
+    running_without_lists: bool,
+    /// Asked for again while a job without the lists was running: queue this next.
+    again: Option<(PathBuf, Vec<String>)>,
 }
 
 /// One refresh of one repository: whatever is still unknown about its host, then
@@ -93,6 +103,9 @@ pub struct Job {
     pub detect: bool,
     pub whoami: bool,
     pub info: bool,
+    /// Read the sidebar's lists too, as this user (filled in when signed in).
+    pub lists: bool,
+    pub me: Option<String>,
 }
 
 #[derive(Debug, Default)]
@@ -102,6 +115,7 @@ pub struct JobResult {
     pub user: Option<ForgeResult<String>>,
     pub info: Option<ForgeResult<RepoInfo>>,
     pub prs: Option<ForgeResult<BranchPrs>>,
+    pub lists: Option<ForgeResult<PrLists>>,
 }
 
 #[derive(Default)]
@@ -126,6 +140,12 @@ impl ForgeCache {
         self.running.len()
     }
 
+    /// Whether refreshes of `key` should read its pull request lists too (it's
+    /// open in a tab). Overview cards only need their branches.
+    pub fn want_lists(&mut self, key: &RepoKey, on: bool) {
+        self.repos.entry(key.clone()).or_default().lists_wanted = on;
+    }
+
     fn backed_off(&self, host: &str, now: Instant) -> bool {
         self.hosts.get(host).and_then(|h| h.backoff_until).is_some_and(|t| now < t)
     }
@@ -143,7 +163,20 @@ impl ForgeCache {
             return false; // Not a forge Headway knows.
         }
         let entry = self.repos.entry(key.clone()).or_default();
+        let wanted = || {
+            let mut w: Vec<String> = Vec::new();
+            for b in branches {
+                if !w.contains(b) && w.len() < MAX_BRANCHES {
+                    w.push(b.clone());
+                }
+            }
+            w
+        };
         if entry.busy {
+            // A card's refresh is running and the tab that just opened wants the lists.
+            if entry.running_without_lists && entry.lists_wanted && (entry.lists.is_none() || matches!(reason, Reason::Opened | Reason::AfterGit | Reason::AfterPrAction)) {
+                entry.again = Some((dir.to_path_buf(), wanted()));
+            }
             return false;
         }
         let since = |d: Duration| entry.asked.is_none_or(|t| now.saturating_duration_since(t) >= d);
@@ -157,13 +190,8 @@ impl ForgeCache {
         }
         entry.asked = Some(now);
         entry.busy = true;
-        let mut wanted: Vec<String> = Vec::new();
-        for b in branches {
-            if !wanted.contains(b) && wanted.len() < MAX_BRANCHES {
-                wanted.push(b.clone());
-            }
-        }
-        self.queue.push_back(Job { key: key.clone(), dir: dir.to_path_buf(), branches: wanted, kind: None, detect: false, whoami: false, info: false });
+        let branches = wanted();
+        self.queue.push_back(Job::new(key, dir, branches));
         true
     }
 
@@ -194,7 +222,14 @@ impl ForgeCache {
             job.kind = h.kind;
             job.detect = !h.detected;
             job.whoami = !matches!(h.connection, Connection::SignedIn(_));
-            job.info = self.repos.get(&job.key).is_none_or(|e| e.info.is_none());
+            job.me = match &h.connection {
+                Connection::SignedIn(u) => Some(u.clone()),
+                _ => None,
+            };
+            let entry = self.repos.entry(job.key.clone()).or_default();
+            job.info = entry.info.is_none();
+            job.lists = entry.lists_wanted;
+            entry.running_without_lists = !job.lists;
             self.running.push(job.key.clone());
             out.push(job);
         }
@@ -228,6 +263,12 @@ impl ForgeCache {
         }
         let entry = self.repos.entry(key.clone()).or_default();
         entry.busy = false;
+        entry.running_without_lists = false;
+        if let Some((dir, branches)) = entry.again.take() {
+            entry.busy = true;
+            self.queue.push_back(Job::new(&key, &dir, branches));
+        }
+        let entry = self.repos.get_mut(&key).expect("just added");
         if let Some(Ok(info)) = &res.info {
             entry.info = Some(info.clone());
         }
@@ -239,6 +280,18 @@ impl ForgeCache {
                 entry.fetched_at = wall_now;
                 entry.error = None;
                 slow_down = p.slow_down_until;
+            }
+            Some(Err(e)) => {
+                entry.error = Some(e.clone());
+                signed_out(e, host);
+            }
+            None => {}
+        }
+        match &res.lists {
+            Some(Ok(l)) => {
+                entry.lists = Some(Arc::new(l.clone()));
+                entry.lists_at = wall_now;
+                slow_down = slow_down.max(l.slow_down_until);
             }
             Some(Err(e)) => {
                 entry.error = Some(e.clone());
@@ -263,6 +316,12 @@ impl ForgeCache {
     }
 }
 
+impl Job {
+    fn new(key: &RepoKey, dir: &Path, branches: Vec<String>) -> Self {
+        Job { key: key.clone(), dir: dir.to_path_buf(), branches, kind: None, detect: false, whoami: false, info: false, lists: false, me: None }
+    }
+}
+
 fn secs_until(t: i64, wall_now: i64) -> Duration {
     Duration::from_secs(t.saturating_sub(wall_now).max(60) as u64)
 }
@@ -281,19 +340,24 @@ pub fn run_job(forges: &dyn Forges, job: &Job) -> JobResult {
     }
     let Some(kind) = kind else { return res };
     let forge = forges.forge(kind, &job.key.host, dir);
+    let mut me = job.me.clone();
     if job.whoami {
         let user = forge.whoami();
-        let failed = user.is_err();
-        res.user = Some(user);
-        if failed {
+        let Ok(u) = &user else {
+            res.user = Some(user);
             return res;
-        }
+        };
+        me = Some(u.clone());
+        res.user = Some(user);
     }
     if job.info {
         res.info = Some(forge.repo_info(&job.key));
     }
     if !job.branches.is_empty() {
         res.prs = Some(forge.prs_for_branches(&job.key, &job.branches));
+    }
+    if let (true, Some(me)) = (job.lists, me) {
+        res.lists = Some(forge.pr_lists(&job.key, &me, LIST_PAGE));
     }
     res
 }
@@ -485,6 +549,29 @@ mod tests {
         drain(&mut c, &f, t);
         assert_eq!(c.host("code.corp").unwrap().kind, None);
         assert!(!c.request(&k, Path::new("/r"), &branches(), Reason::Opened, t + Duration::from_secs(3600)));
+    }
+
+    #[test]
+    fn lists_are_read_only_for_open_tabs_even_if_a_card_refresh_is_running() {
+        let f = fake();
+        let mut c = ForgeCache::default();
+        let t = Instant::now();
+        let k = key("github.com", "a/one");
+        // The overview card asks first: no lists.
+        assert!(c.request(&k, Path::new("/r"), &branches(), Reason::Poll, t));
+        let job = c.next_jobs(t).remove(0);
+        assert!(!job.lists);
+        // The tab opens while that's running: asked again once it's done.
+        c.want_lists(&k, true);
+        assert!(!c.request(&k, Path::new("/r"), &branches(), Reason::Opened, t));
+        c.finish(run_job(&f, &job), t, 7);
+        assert!(c.repo(&k).unwrap().lists.is_none());
+        let again = c.next_jobs(t).remove(0);
+        assert!(again.lists && again.me.as_deref() == Some("alex"));
+        c.finish(run_job(&f, &again), t, 8);
+        let e = c.repo(&k).unwrap();
+        assert_eq!((e.lists.as_ref().unwrap().open.len(), e.lists_at), (1, 8));
+        assert!(c.next_jobs(t).is_empty(), "and only once");
     }
 
     #[test]

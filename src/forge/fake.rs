@@ -121,6 +121,20 @@ impl Forge for FakeForge {
             .collect();
         Ok(BranchPrs { by_branch, slow_down_until: None })
     }
+
+    fn pr_lists(&self, repo: &RepoKey, me: &str, limit: usize) -> ForgeResult<PrLists> {
+        let r = self.repo(repo)?;
+        let mut open: Vec<PullRequest> = r.pulls.iter().filter(|p| matches!(p.state, PrState::Open | PrState::Draft)).cloned().collect();
+        open.sort_by_key(|p| std::cmp::Reverse(p.updated));
+        let pick = |f: &dyn Fn(&PullRequest) -> bool| open.iter().filter(|p| f(p)).take(limit).cloned().collect();
+        Ok(PrLists {
+            mine: pick(&|p| p.author == me),
+            review_requested: pick(&|p| p.requested_reviewers.iter().any(|r| r == me)),
+            open_total: open.len(),
+            open: open.iter().take(limit).cloned().collect(),
+            slow_down_until: None,
+        })
+    }
 }
 
 #[cfg(test)]
@@ -145,6 +159,8 @@ mod tests {
         assert_eq!(prs.by_branch["feature/search"][0].number, 3);
         assert_eq!(prs.by_branch["feature/search"][0].checks.state, CheckState::None, "left-out fields take their defaults");
         assert!(prs.by_branch["main"].is_empty());
+        let lists = gh.pr_lists(&key, "sam", 50).unwrap();
+        assert_eq!((lists.mine.len(), lists.review_requested.len(), lists.open_total), (1, 0, 1));
         assert_eq!(gh.prs_for_branches(&RepoKey { host: "github.com".into(), path: "x/y".into() }, &[]).unwrap_err(), ForgeError::NotFound);
         assert_eq!(forges.forge(ForgeKind::GitLab, "gitlab.com", None).whoami().unwrap_err(), ForgeError::SignedOut { kind: ForgeKind::GitLab, host: "gitlab.com".into() });
         assert_eq!(forges.forge(ForgeKind::GitLab, "git.corp", None).whoami().unwrap_err(), ForgeError::NotInstalled(ForgeKind::GitLab));

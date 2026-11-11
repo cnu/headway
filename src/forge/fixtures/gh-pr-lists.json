@@ -1,0 +1,808 @@
+{
+ "data": {
+  "rateLimit": {
+   "remaining": 4994,
+   "resetAt": "2026-11-11T13:22:23Z"
+  },
+  "mine": {
+   "nodes": [
+    {
+     "number": 15010,
+     "title": "chore(deps): Bump golang.org/x/sys from 0.49.0 to 0.50.0",
+     "state": "OPEN",
+     "isDraft": false,
+     "url": "https://github.com/cli/cli/pull/15010",
+     "updatedAt": "2026-11-10T14:22:31Z",
+     "headRefName": "dependabot/go_modules/golang.org/x/sys-0.50.0",
+     "headRefOid": "b557a2327d684e3e400c59b8d875229074d0d742",
+     "baseRefName": "trunk",
+     "isCrossRepository": false,
+     "author": {
+      "login": "octo-user"
+     },
+     "headRepository": {
+      "nameWithOwner": "cli/cli"
+     },
+     "reviewDecision": "REVIEW_REQUIRED",
+     "mergeable": "MERGEABLE",
+     "mergeStateStatus": "BLOCKED",
+     "reviewRequests": {
+      "nodes": [
+       {
+        "requestedReviewer": null
+       },
+       {
+        "requestedReviewer": {
+         "login": "user-2"
+        }
+       }
+      ]
+     },
+     "commits": {
+      "nodes": [
+       {
+        "commit": {
+         "statusCheckRollup": {
+          "state": "SUCCESS",
+          "contexts": {
+           "checkRunCountsByState": [
+            {
+             "state": "ACTION_REQUIRED",
+             "count": 0
+            },
+            {
+             "state": "CANCELLED",
+             "count": 0
+            },
+            {
+             "state": "COMPLETED",
+             "count": 0
+            },
+            {
+             "state": "FAILURE",
+             "count": 0
+            },
+            {
+             "state": "IN_PROGRESS",
+             "count": 0
+            },
+            {
+             "state": "NEUTRAL",
+             "count": 0
+            },
+            {
+             "state": "PENDING",
+             "count": 0
+            },
+            {
+             "state": "QUEUED",
+             "count": 0
+            },
+            {
+             "state": "SKIPPED",
+             "count": 18
+            },
+            {
+             "state": "STALE",
+             "count": 0
+            },
+            {
+             "state": "STARTUP_FAILURE",
+             "count": 0
+            },
+            {
+             "state": "SUCCESS",
+             "count": 12
+            },
+            {
+             "state": "TIMED_OUT",
+             "count": 0
+            },
+            {
+             "state": "WAITING",
+             "count": 0
+            }
+           ],
+           "statusContextCountsByState": [
+            {
+             "state": "EXPECTED",
+             "count": 0
+            },
+            {
+             "state": "ERROR",
+             "count": 0
+            },
+            {
+             "state": "FAILURE",
+             "count": 0
+            },
+            {
+             "state": "PENDING",
+             "count": 0
+            },
+            {
+             "state": "SUCCESS",
+             "count": 0
+            }
+           ]
+          }
+         }
+        }
+       }
+      ]
+     }
+    }
+   ]
+  },
+  "review": {
+   "nodes": [
+    {
+     "number": 14964,
+     "title": "chore(deps): Bump the codeql-actions group across 1 directory with 3 updates",
+     "state": "OPEN",
+     "isDraft": false,
+     "url": "https://github.com/cli/cli/pull/14964",
+     "updatedAt": "2026-11-10T14:30:28Z",
+     "headRefName": "dependabot/github_actions/codeql-actions-92276e7fb0",
+     "headRefOid": "3a469bff83f385e907cc56ddad8dcc9919b45852",
+     "baseRefName": "trunk",
+     "isCrossRepository": false,
+     "author": {
+      "login": "user-1"
+     },
+     "headRepository": {
+      "nameWithOwner": "cli/cli"
+     },
+     "reviewDecision": "REVIEW_REQUIRED",
+     "mergeable": "MERGEABLE",
+     "mergeStateStatus": "BLOCKED",
+     "reviewRequests": {
+      "nodes": [
+       {
+        "requestedReviewer": null
+       },
+       {
+        "requestedReviewer": {
+         "login": "user-3"
+        }
+       },
+       {
+        "requestedReviewer": {
+         "login": "octo-user"
+        }
+       }
+      ]
+     },
+     "commits": {
+      "nodes": [
+       {
+        "commit": {
+         "statusCheckRollup": {
+          "state": "SUCCESS",
+          "contexts": {
+           "checkRunCountsByState": [
+            {
+             "state": "ACTION_REQUIRED",
+             "count": 0
+            },
+            {
+             "state": "CANCELLED",
+             "count": 0
+            },
+            {
+             "state": "COMPLETED",
+             "count": 0
+            },
+            {
+             "state": "FAILURE",
+             "count": 0
+            },
+            {
+             "state": "IN_PROGRESS",
+             "count": 0
+            },
+            {
+             "state": "NEUTRAL",
+             "count": 0
+            },
+            {
+             "state": "PENDING",
+             "count": 0
+            },
+            {
+             "state": "QUEUED",
+             "count": 0
+            },
+            {
+             "state": "SKIPPED",
+             "count": 7
+            },
+            {
+             "state": "STALE",
+             "count": 0
+            },
+            {
+             "state": "STARTUP_FAILURE",
+             "count": 0
+            },
+            {
+             "state": "SUCCESS",
+             "count": 9
+            },
+            {
+             "state": "TIMED_OUT",
+             "count": 0
+            },
+            {
+             "state": "WAITING",
+             "count": 0
+            }
+           ],
+           "statusContextCountsByState": [
+            {
+             "state": "EXPECTED",
+             "count": 0
+            },
+            {
+             "state": "ERROR",
+             "count": 0
+            },
+            {
+             "state": "FAILURE",
+             "count": 0
+            },
+            {
+             "state": "PENDING",
+             "count": 0
+            },
+            {
+             "state": "SUCCESS",
+             "count": 0
+            }
+           ]
+          }
+         }
+        }
+       }
+      ]
+     }
+    }
+   ]
+  },
+  "repository": {
+   "pullRequests": {
+    "totalCount": 59,
+    "nodes": [
+     {
+      "number": 15010,
+      "title": "chore(deps): Bump golang.org/x/sys from 0.49.0 to 0.50.0",
+      "state": "OPEN",
+      "isDraft": false,
+      "url": "https://github.com/cli/cli/pull/15010",
+      "updatedAt": "2026-11-10T14:22:31Z",
+      "headRefName": "dependabot/go_modules/golang.org/x/sys-0.50.0",
+      "headRefOid": "b557a2327d684e3e400c59b8d875229074d0d742",
+      "baseRefName": "trunk",
+      "isCrossRepository": false,
+      "author": {
+       "login": "user-1"
+      },
+      "headRepository": {
+       "nameWithOwner": "cli/cli"
+      },
+      "reviewDecision": "REVIEW_REQUIRED",
+      "mergeable": "MERGEABLE",
+      "mergeStateStatus": "BLOCKED",
+      "reviewRequests": {
+       "nodes": [
+        {
+         "requestedReviewer": null
+        },
+        {
+         "requestedReviewer": {
+          "login": "user-2"
+         }
+        }
+       ]
+      },
+      "commits": {
+       "nodes": [
+        {
+         "commit": {
+          "statusCheckRollup": {
+           "state": "SUCCESS",
+           "contexts": {
+            "checkRunCountsByState": [
+             {
+              "state": "ACTION_REQUIRED",
+              "count": 0
+             },
+             {
+              "state": "CANCELLED",
+              "count": 0
+             },
+             {
+              "state": "COMPLETED",
+              "count": 0
+             },
+             {
+              "state": "FAILURE",
+              "count": 0
+             },
+             {
+              "state": "IN_PROGRESS",
+              "count": 0
+             },
+             {
+              "state": "NEUTRAL",
+              "count": 0
+             },
+             {
+              "state": "PENDING",
+              "count": 0
+             },
+             {
+              "state": "QUEUED",
+              "count": 0
+             },
+             {
+              "state": "SKIPPED",
+              "count": 18
+             },
+             {
+              "state": "STALE",
+              "count": 0
+             },
+             {
+              "state": "STARTUP_FAILURE",
+              "count": 0
+             },
+             {
+              "state": "SUCCESS",
+              "count": 12
+             },
+             {
+              "state": "TIMED_OUT",
+              "count": 0
+             },
+             {
+              "state": "WAITING",
+              "count": 0
+             }
+            ],
+            "statusContextCountsByState": [
+             {
+              "state": "EXPECTED",
+              "count": 0
+             },
+             {
+              "state": "ERROR",
+              "count": 0
+             },
+             {
+              "state": "FAILURE",
+              "count": 0
+             },
+             {
+              "state": "PENDING",
+              "count": 0
+             },
+             {
+              "state": "SUCCESS",
+              "count": 0
+             }
+            ]
+           }
+          }
+         }
+        }
+       ]
+      }
+     },
+     {
+      "number": 14964,
+      "title": "chore(deps): Bump the codeql-actions group across 1 directory with 3 updates",
+      "state": "OPEN",
+      "isDraft": false,
+      "url": "https://github.com/cli/cli/pull/14964",
+      "updatedAt": "2026-11-10T14:30:28Z",
+      "headRefName": "dependabot/github_actions/codeql-actions-92276e7fb0",
+      "headRefOid": "3a469bff83f385e907cc56ddad8dcc9919b45852",
+      "baseRefName": "trunk",
+      "isCrossRepository": false,
+      "author": {
+       "login": "user-1"
+      },
+      "headRepository": {
+       "nameWithOwner": "cli/cli"
+      },
+      "reviewDecision": "REVIEW_REQUIRED",
+      "mergeable": "MERGEABLE",
+      "mergeStateStatus": "BLOCKED",
+      "reviewRequests": {
+       "nodes": [
+        {
+         "requestedReviewer": null
+        },
+        {
+         "requestedReviewer": {
+          "login": "user-3"
+         }
+        }
+       ]
+      },
+      "commits": {
+       "nodes": [
+        {
+         "commit": {
+          "statusCheckRollup": {
+           "state": "SUCCESS",
+           "contexts": {
+            "checkRunCountsByState": [
+             {
+              "state": "ACTION_REQUIRED",
+              "count": 0
+             },
+             {
+              "state": "CANCELLED",
+              "count": 0
+             },
+             {
+              "state": "COMPLETED",
+              "count": 0
+             },
+             {
+              "state": "FAILURE",
+              "count": 0
+             },
+             {
+              "state": "IN_PROGRESS",
+              "count": 0
+             },
+             {
+              "state": "NEUTRAL",
+              "count": 0
+             },
+             {
+              "state": "PENDING",
+              "count": 0
+             },
+             {
+              "state": "QUEUED",
+              "count": 0
+             },
+             {
+              "state": "SKIPPED",
+              "count": 7
+             },
+             {
+              "state": "STALE",
+              "count": 0
+             },
+             {
+              "state": "STARTUP_FAILURE",
+              "count": 0
+             },
+             {
+              "state": "SUCCESS",
+              "count": 9
+             },
+             {
+              "state": "TIMED_OUT",
+              "count": 0
+             },
+             {
+              "state": "WAITING",
+              "count": 0
+             }
+            ],
+            "statusContextCountsByState": [
+             {
+              "state": "EXPECTED",
+              "count": 0
+             },
+             {
+              "state": "ERROR",
+              "count": 0
+             },
+             {
+              "state": "FAILURE",
+              "count": 0
+             },
+             {
+              "state": "PENDING",
+              "count": 0
+             },
+             {
+              "state": "SUCCESS",
+              "count": 0
+             }
+            ]
+           }
+          }
+         }
+        }
+       ]
+      }
+     },
+     {
+      "number": 15003,
+      "title": "Create READ ME",
+      "state": "OPEN",
+      "isDraft": false,
+      "url": "https://github.com/cli/cli/pull/15003",
+      "updatedAt": "2026-11-09T23:24:33Z",
+      "headRefName": "patch-1",
+      "headRefOid": "38aef55a786788888bd90ddaeaac0bf6b0b98bb1",
+      "baseRefName": "trunk",
+      "isCrossRepository": true,
+      "author": {
+       "login": "user-4"
+      },
+      "headRepository": {
+       "nameWithOwner": "user-4/cli2"
+      },
+      "reviewDecision": "REVIEW_REQUIRED",
+      "mergeable": "MERGEABLE",
+      "mergeStateStatus": "BLOCKED",
+      "reviewRequests": {
+       "nodes": [
+        {
+         "requestedReviewer": null
+        },
+        {
+         "requestedReviewer": {
+          "login": "user-5"
+         }
+        }
+       ]
+      },
+      "commits": {
+       "nodes": [
+        {
+         "commit": {
+          "statusCheckRollup": {
+           "state": "SUCCESS",
+           "contexts": {
+            "checkRunCountsByState": [
+             {
+              "state": "ACTION_REQUIRED",
+              "count": 0
+             },
+             {
+              "state": "CANCELLED",
+              "count": 0
+             },
+             {
+              "state": "COMPLETED",
+              "count": 0
+             },
+             {
+              "state": "FAILURE",
+              "count": 0
+             },
+             {
+              "state": "IN_PROGRESS",
+              "count": 0
+             },
+             {
+              "state": "NEUTRAL",
+              "count": 0
+             },
+             {
+              "state": "PENDING",
+              "count": 0
+             },
+             {
+              "state": "QUEUED",
+              "count": 0
+             },
+             {
+              "state": "SKIPPED",
+              "count": 11
+             },
+             {
+              "state": "STALE",
+              "count": 0
+             },
+             {
+              "state": "STARTUP_FAILURE",
+              "count": 0
+             },
+             {
+              "state": "SUCCESS",
+              "count": 3
+             },
+             {
+              "state": "TIMED_OUT",
+              "count": 0
+             },
+             {
+              "state": "WAITING",
+              "count": 0
+             }
+            ],
+            "statusContextCountsByState": [
+             {
+              "state": "EXPECTED",
+              "count": 0
+             },
+             {
+              "state": "ERROR",
+              "count": 0
+             },
+             {
+              "state": "FAILURE",
+              "count": 0
+             },
+             {
+              "state": "PENDING",
+              "count": 0
+             },
+             {
+              "state": "SUCCESS",
+              "count": 0
+             }
+            ]
+           }
+          }
+         }
+        }
+       ]
+      }
+     },
+     {
+      "number": 13781,
+      "title": "feat(auth): Better multi-account `gh` account usage #13768",
+      "state": "OPEN",
+      "isDraft": true,
+      "url": "https://github.com/cli/cli/pull/13781",
+      "updatedAt": "2026-11-07T07:35:07Z",
+      "headRefName": "feature/context-scoped-accounts",
+      "headRefOid": "2071526f740ff790c11f84d97e6fcad9e6db3451",
+      "baseRefName": "trunk",
+      "isCrossRepository": true,
+      "author": {
+       "login": "user-6"
+      },
+      "headRepository": {
+       "nameWithOwner": "user-6/gh-cli"
+      },
+      "reviewDecision": "REVIEW_REQUIRED",
+      "mergeable": "CONFLICTING",
+      "mergeStateStatus": "DIRTY",
+      "reviewRequests": {
+       "nodes": []
+      },
+      "commits": {
+       "nodes": [
+        {
+         "commit": {
+          "statusCheckRollup": null
+         }
+        }
+       ]
+      }
+     },
+     {
+      "number": 14920,
+      "title": "Add one-command account selection",
+      "state": "OPEN",
+      "isDraft": true,
+      "url": "https://github.com/cli/cli/pull/14920",
+      "updatedAt": "2026-11-05T19:40:45Z",
+      "headRefName": "williammartin-multiaccount-draft-01-account",
+      "headRefOid": "2cbd5515878542a5125ec412045d2b3e365659b6",
+      "baseRefName": "trunk",
+      "isCrossRepository": false,
+      "author": {
+       "login": "user-7"
+      },
+      "headRepository": {
+       "nameWithOwner": "cli/cli"
+      },
+      "reviewDecision": "REVIEW_REQUIRED",
+      "mergeable": "CONFLICTING",
+      "mergeStateStatus": "DIRTY",
+      "reviewRequests": {
+       "nodes": []
+      },
+      "commits": {
+       "nodes": [
+        {
+         "commit": {
+          "statusCheckRollup": {
+           "state": "SUCCESS",
+           "contexts": {
+            "checkRunCountsByState": [
+             {
+              "state": "ACTION_REQUIRED",
+              "count": 0
+             },
+             {
+              "state": "CANCELLED",
+              "count": 0
+             },
+             {
+              "state": "COMPLETED",
+              "count": 0
+             },
+             {
+              "state": "FAILURE",
+              "count": 0
+             },
+             {
+              "state": "IN_PROGRESS",
+              "count": 0
+             },
+             {
+              "state": "NEUTRAL",
+              "count": 0
+             },
+             {
+              "state": "PENDING",
+              "count": 0
+             },
+             {
+              "state": "QUEUED",
+              "count": 0
+             },
+             {
+              "state": "SKIPPED",
+              "count": 13
+             },
+             {
+              "state": "STALE",
+              "count": 0
+             },
+             {
+              "state": "STARTUP_FAILURE",
+              "count": 0
+             },
+             {
+              "state": "SUCCESS",
+              "count": 1
+             },
+             {
+              "state": "TIMED_OUT",
+              "count": 0
+             },
+             {
+              "state": "WAITING",
+              "count": 0
+             }
+            ],
+            "statusContextCountsByState": [
+             {
+              "state": "EXPECTED",
+              "count": 0
+             },
+             {
+              "state": "ERROR",
+              "count": 0
+             },
+             {
+              "state": "FAILURE",
+              "count": 0
+             },
+             {
+              "state": "PENDING",
+              "count": 0
+             },
+             {
+              "state": "SUCCESS",
+              "count": 0
+             }
+            ]
+           }
+          }
+         }
+        }
+       ]
+      }
+     }
+    ]
+   }
+  }
+ }
+}

@@ -31,6 +31,8 @@ impl LocalBranch {
 fn head_of(b: &LocalBranch, remotes: &RepoRemotes, urls: &[(String, String)]) -> Option<(String, Option<String>)> {
     let project = |url: &RemoteUrl| (!url.path.eq_ignore_ascii_case(&remotes.pr_url.path)).then(|| url.path.clone());
     match (&b.upstream_remote, &b.upstream_branch) {
+        // Tracking a pull request's own ref (a fork's, checked out without a remote for it).
+        (Some(_), Some(branch)) if branch.starts_with("refs/") => None,
         (Some(remote), Some(branch)) => {
             let url = urls.iter().find(|(n, _)| n == remote).and_then(|(_, u)| parse_remote_url(u))?;
             (url.host == remotes.pr_url.host).then(|| (branch.clone(), project(&url)))
@@ -191,6 +193,11 @@ impl PrStatus {
 
     /// Everything about it, for a tooltip. `relative`: how long ago a Unix time was.
     pub fn tooltip(&self, relative: impl Fn(i64) -> String) -> String {
+        format!("{}\nClick to open on {}", self.details(relative), self.kind.name())
+    }
+
+    /// [`Self::tooltip`] without saying what a click does.
+    pub fn details(&self, relative: impl Fn(i64) -> String) -> String {
         let pr = &self.pr;
         let what = match pr.state {
             PrState::Open => "Pull request",
@@ -213,7 +220,6 @@ impl PrStatus {
             }
         }
         lines.push(format!("Updated {} · as of {}", relative(pr.updated), relative(self.as_of)));
-        lines.push(format!("Click to open on {}", self.kind.name()));
         lines.join("\n")
     }
 }
@@ -221,6 +227,40 @@ impl PrStatus {
 fn capitalise(s: &str) -> String {
     let mut c = s.chars();
     c.next().map_or_else(String::new, |f| f.to_uppercase().chain(c).collect())
+}
+
+/// The remote for a pull request's head repository: the pull request remote
+/// itself, or one pointing at the fork. `None`: the fork has no remote here.
+pub fn head_remote(pr: &PullRequest, remotes: &RepoRemotes, urls: &[(String, String)]) -> Option<String> {
+    let Some(fork) = &pr.head_repo else { return Some(remotes.pr_remote.clone()) };
+    urls.iter()
+        .find(|(_, u)| parse_remote_url(u).is_some_and(|u| u.host == remotes.pr_url.host && u.path.eq_ignore_ascii_case(fork)))
+        .map(|(n, _)| n.clone())
+}
+
+/// Everything git needs to fetch and check out a pull request.
+pub fn pr_source(pr: &PullRequest, kind: ForgeKind, remotes: &RepoRemotes, urls: &[(String, String)]) -> git::PrSource {
+    git::PrSource {
+        number: pr.number,
+        remote: remotes.pr_remote.clone(),
+        head_ref: kind.pr_head_ref(pr.number),
+        head_branch: pr.head_branch.clone(),
+        head_remote: head_remote(pr, remotes, urls),
+    }
+}
+
+/// For a pull request from a fork with no remote here: a name and address for
+/// one, written like the pull request remote's (https or ssh).
+pub fn fork_remote(pr: &PullRequest, remotes: &RepoRemotes, urls: &[(String, String)]) -> Option<(String, String)> {
+    let fork = pr.head_repo.as_ref().filter(|_| head_remote(pr, remotes, urls).is_none())?;
+    let base = urls.iter().find(|(n, _)| *n == remotes.pr_remote).map(|(_, u)| u.as_str()).unwrap_or("");
+    let url = match base.find(remotes.pr_url.path.as_str()) {
+        Some(i) => format!("{}{fork}{}", &base[..i], &base[i + remotes.pr_url.path.len()..]),
+        None => format!("https://{}/{fork}.git", remotes.pr_url.host),
+    };
+    let owner = fork.split('/').next().unwrap_or(fork).to_ascii_lowercase();
+    let name = if urls.iter().any(|(n, _)| *n == owner) { format!("{owner}-fork") } else { owner };
+    Some((name, url))
 }
 
 #[cfg(test)]
@@ -276,6 +316,29 @@ mod tests {
         // What to ask: upstream names, the current branch's first, once each.
         let all = [branch("a", Some(("origin", "fix-login")), false), branch("b", Some(("origin", "fix-login")), false), branch("wip", None, true), branch("x", None, false)];
         assert_eq!(query_branches(&all, &remotes, &u), ["wip", "fix-login"]);
+    }
+
+    #[test]
+    fn pull_requests_are_fetched_from_their_project_and_tracked_from_their_fork() {
+        let u = urls(&[("origin", "git@github.com:ana/shop.git"), ("upstream", "https://github.com/acme/shop.git")]);
+        let remotes = pick_remotes(&u).unwrap();
+        // From the project itself: fetched and tracked from upstream.
+        let own = pr(12, "fix", PrState::Open, None, 1);
+        let src = pr_source(&own, ForgeKind::GitHub, &remotes, &u);
+        assert_eq!((src.remote.as_str(), src.head_ref.as_str(), src.head_remote.as_deref()), ("upstream", "refs/pull/12/head", Some("upstream")));
+        assert_eq!(fork_remote(&own, &remotes, &u), None);
+        // From my fork (origin): tracked from origin, owner names compare without case.
+        let mine = pr(13, "main", PrState::Open, Some("Ana/Shop"), 1);
+        assert_eq!(pr_source(&mine, ForgeKind::GitLab, &remotes, &u).head_remote.as_deref(), Some("origin"));
+        assert_eq!(pr_source(&mine, ForgeKind::GitLab, &remotes, &u).head_ref, "refs/merge-requests/13/head");
+        // From someone else's fork: no remote yet, so one is offered, written like upstream's.
+        let theirs = pr(14, "main", PrState::Open, Some("bob/shop"), 1);
+        assert_eq!(pr_source(&theirs, ForgeKind::GitHub, &remotes, &u).head_remote, None);
+        assert_eq!(fork_remote(&theirs, &remotes, &u), Some(("bob".into(), "https://github.com/bob/shop.git".into())));
+        let ssh = urls(&[("origin", "git@github.com:acme/shop.git"), ("bob", "git@github.com:other/x.git")]);
+        assert_eq!(fork_remote(&theirs, &pick_remotes(&ssh).unwrap(), &ssh), Some(("bob-fork".into(), "git@github.com:bob/shop.git".into())));
+        // A branch tracking a pull request's ref isn't asked about by name.
+        assert!(query_branches(&[branch("pr/14", Some(("upstream", "refs/pull/14/head")), false)], &remotes, &u).is_empty());
     }
 
     #[test]

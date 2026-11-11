@@ -1,6 +1,6 @@
 //! The repository screen: toolbar, sidebar, history, commit details, staging and diffs.
 
-use crate::app::{Action, DiffClick, DiffDoc, Dialog, FileOpen, FileSel, FlatRow, FollowUp, LineKey, LineSel, OpKind, Record, RepoData, RepoView, Selection, Summary};
+use crate::app::{Action, PrAction, PrTab, DiffClick, DiffDoc, Dialog, FileOpen, FileSel, FlatRow, FollowUp, LineKey, LineSel, OpKind, Record, RepoData, RepoView, Selection, Summary};
 use crate::git::{self, Change, FileChange, LineKind, RefKind};
 use crate::graph::Target;
 use crate::forge::status::PrStatus;
@@ -802,6 +802,8 @@ fn sidebar(
             ui.add_space(4.0);
         }
 
+        pull_requests(ui, &path, &mut rv.pr_tab, &mut rv.pr_selected, &mut rv.pr_keys, rv.pr_section.as_ref(), actions);
+
         let shown: Vec<_> = data.worktrees.iter().filter(|w| !w.bare).collect();
         section(ui, "worktrees", "WORKTREES", shown.len(), shown.len() > 1, |ui| {
             let main_path = shown.iter().find(|w| w.is_main).map(|w| w.path.clone());
@@ -1118,6 +1120,268 @@ fn sidebar(
     });
 }
 
+// ---------------------------------------------------------------------------
+// Pull requests
+
+/// What to call them on this forge.
+fn pr_noun(kind: crate::forge::ForgeKind) -> &'static str {
+    match kind {
+        crate::forge::ForgeKind::GitLab => "merge request",
+        crate::forge::ForgeKind::GitHub => "pull request",
+    }
+}
+
+/// The filter shown: the one picked, else the first with something in it.
+pub fn pr_tab_shown(picked: Option<PrTab>, lists: &crate::forge::PrLists) -> PrTab {
+    picked.unwrap_or(if !lists.mine.is_empty() {
+        PrTab::Mine
+    } else if !lists.review_requested.is_empty() {
+        PrTab::Review
+    } else {
+        PrTab::Open
+    })
+}
+
+/// The "Pull requests" ("Merge requests") section: filter tabs and a row per
+/// pull request, with a menu each. Not shown at all while the forge can't be used.
+fn pull_requests(
+    ui: &mut Ui,
+    path: &Path,
+    picked: &mut Option<PrTab>,
+    selected: &mut Option<u64>,
+    keys: &mut bool,
+    sec: Option<&crate::app::PrSection>,
+    actions: &mut Vec<Action>,
+) {
+    *keys = false;
+    let Some(sec) = sec else { return };
+    let noun = pr_noun(sec.kind);
+    let title = noun.to_uppercase() + "S";
+    let count = sec.lists.as_ref().map_or(0, |l| l.open_total);
+    // Open or folded per repository.
+    section(ui, &format!("prs:{}", path.display()), &title, count, true, |ui| {
+        let Some(lists) = &sec.lists else {
+            let text = match &sec.error {
+                Some(e) => format!("Couldn't load {noun}s: {e}"),
+                None => "Loading…".to_string(),
+            };
+            ui.add(egui::Label::new(RichText::new(text).small().color(DIM)).wrap());
+            return;
+        };
+        let tab = pr_tab_shown(*picked, lists);
+        // One row: the full names when they fit, shorter ones in a narrow sidebar
+        // (the tooltip and the accessible name keep the full name).
+        let tabs = [
+            (PrTab::Mine, "Mine", "Mine", lists.mine.len()),
+            (PrTab::Review, "Review requested", "Review", lists.review_requested.len()),
+            (PrTab::Open, "All open", "Open", lists.open_total),
+        ];
+        const GAP: f32 = 4.0;
+        let font = egui::FontId::proportional(11.5);
+        let width_of = |s: &str| ui.painter().layout_no_wrap(s.to_string(), font.clone(), TEXT).size().x + 2.0 * ui.spacing().button_padding.x;
+        let full_width: f32 = tabs.iter().map(|(_, long, _, n)| width_of(&format!("{long} {n}"))).sum::<f32>() + GAP * (tabs.len() - 1) as f32;
+        let short = full_width > ui.available_width();
+        ui.horizontal(|ui| {
+            ui.spacing_mut().item_spacing.x = GAP;
+            for (t, long, brief, n) in tabs {
+                let full = format!("{long} {n}");
+                let shown = if short { format!("{brief} {n}") } else { full.clone() };
+                let text = RichText::new(shown).font(font.clone()).color(if tab == t { TEXT } else { DIM });
+                let tip = match t {
+                    PrTab::Mine => format!("Open {noun}s you opened"),
+                    PrTab::Review => format!("Open {noun}s waiting for your review"),
+                    PrTab::Open => format!("Every open {noun}"),
+                };
+                let resp = ui.selectable_label(tab == t, text);
+                let selected = tab == t;
+                resp.widget_info(|| egui::WidgetInfo::selected(egui::Role::Tab, true, selected, full.clone()));
+                if resp.on_hover_text(tip).clicked() {
+                    *picked = Some(t);
+                }
+            }
+        });
+        ui.add_space(2.0);
+        let list = match tab {
+            PrTab::Mine => &lists.mine,
+            PrTab::Review => &lists.review_requested,
+            PrTab::Open => &lists.open,
+        };
+        if list.is_empty() {
+            let text = match tab {
+                PrTab::Mine => format!("You have no open {noun}s"),
+                PrTab::Review => format!("No {noun}s need your review"),
+                PrTab::Open => format!("No open {noun}s"),
+            };
+            ui.add(egui::Label::new(RichText::new(text).small().color(DIM)).wrap());
+        }
+        let mut rows: Vec<(egui::Id, Rect, &crate::forge::PullRequest)> = Vec::new();
+        let mut focused = None;
+        for pr in list {
+            let st = PrStatus { pr: pr.clone(), kind: sec.kind, as_of: sec.as_of, tip_matches: false };
+            let resp = pr_row(ui, &st, *selected == Some(pr.number), path, actions);
+            if resp.clicked() || resp.secondary_clicked() {
+                *selected = Some(pr.number);
+                // So the arrows and Enter work from here.
+                resp.request_focus();
+            }
+            if resp.double_clicked() {
+                open_pr(ui.ctx(), pr);
+            }
+            if resp.has_focus() {
+                focused = Some(rows.len());
+            }
+            rows.push((resp.id, resp.rect, pr));
+        }
+        // The keyboard: arrows move between rows, Enter opens one (the arrows are
+        // the list's while a row has focus, not egui's or the history's).
+        if let Some(fi) = focused {
+            *keys = true;
+            let id = rows[fi].0;
+            ui.memory_mut(|m| m.set_focus_lock_filter(id, egui::EventFilter { vertical_arrows: true, ..Default::default() }));
+            // Move from the selected row: egui may already have moved the focus itself.
+            let cur = selected.and_then(|n| rows.iter().position(|r| r.2.number == n)).unwrap_or(fi);
+            let (up, down, enter) = ui.input(|inp| (inp.key_pressed(egui::Key::ArrowUp), inp.key_pressed(egui::Key::ArrowDown), inp.key_pressed(egui::Key::Enter)));
+            let to = if down { Some((cur + 1).min(rows.len() - 1)) } else if up { Some(cur.saturating_sub(1)) } else { None };
+            match to {
+                Some(t) => {
+                    ui.memory_mut(|m| m.request_focus(rows[t].0));
+                    *selected = Some(rows[t].2.number);
+                    ui.scroll_to_rect(rows[t].1, None);
+                }
+                // Focus that came another way (Tab, a click) picks its row.
+                None => *selected = Some(rows[fi].2.number),
+            }
+            if enter {
+                open_pr(ui.ctx(), rows[fi].2);
+            }
+        }
+        if tab == PrTab::Open && lists.open_total > lists.open.len() {
+            let more = format!("Showing {} of {} · Open all on {}", lists.open.len(), lists.open_total, sec.kind.name());
+            if let Some(web) = &sec.web_url {
+                let page = match sec.kind {
+                    crate::forge::ForgeKind::GitHub => format!("{web}/pulls"),
+                    crate::forge::ForgeKind::GitLab => format!("{web}/-/merge_requests"),
+                };
+                ui.hyperlink_to(RichText::new(more).small(), page);
+            }
+        }
+        if sec.error.is_some() {
+            ui.label(RichText::new(format!("Couldn't refresh · as of {}", theme::relative(sec.as_of))).small().color(WARN));
+        }
+    });
+}
+
+/// One pull request in the sidebar: "#12 Title" over "author · ✔ · approved · draft · 3h".
+fn pr_row(ui: &mut Ui, st: &PrStatus, selected: bool, path: &Path, actions: &mut Vec<Action>) -> egui::Response {
+    let pr = &st.pr;
+    let w = ui.available_width();
+    let (rect, resp) = ui.allocate_exact_size(vec2(w, 38.0), Sense::click());
+    let mut name = format!("#{} {} by {}", pr.number, pr.title, pr.author);
+    if pr.state == crate::forge::PrState::Draft {
+        name += ", draft";
+    }
+    for words in [st.checks_words(), st.review_words()].into_iter().flatten() {
+        name += &format!(", {words}");
+    }
+    name_it(&resp, egui::Role::Button, &name);
+    let dark = ui.visuals().dark_mode;
+    let p = ui.painter();
+    if selected {
+        p.rect_filled(rect, 4.0, SELECT);
+    } else if resp.hovered() {
+        p.rect_filled(rect, 4.0, HOVER);
+    }
+    if resp.has_focus() {
+        p.rect_stroke(rect.shrink(0.5), 4.0, Stroke::new(1.0, ACCENT), egui::StrokeKind::Inside);
+    }
+    let left = rect.left() + 8.0;
+    let text_w = rect.width() - 8.0 - 24.0;
+    let num = p.layout_no_wrap(format!("#{}", pr.number), theme::prop(12.5), DIM);
+    let top = rect.top() + 11.0;
+    let num_w = num.size().x;
+    p.galley(pos2(left, top - num.size().y / 2.0), num, DIM);
+    let title = trunc(p, &pr.title, theme::prop(13.0), TEXT, text_w - num_w - 6.0);
+    p.galley(pos2(left + num_w + 6.0, top - title.size().y / 2.0), title, TEXT);
+    // The second line, coloured in parts.
+    let mut job = LayoutJob::default();
+    let small = theme::prop(11.5);
+    let add = |job: &mut LayoutJob, t: &str, c: Color32| {
+        if !job.text.is_empty() {
+            job.append(" · ", 0.0, TextFormat::simple(small.clone(), FAINT));
+        }
+        job.append(t, 0.0, TextFormat::simple(small.clone(), c));
+    };
+    add(&mut job, &pr.author, DIM);
+    if let Some(mark) = st.check_mark() {
+        add(&mut job, mark, theme::check_color(pr.checks.state, dark));
+    }
+    if let Some(r) = st.review_words() {
+        let c = if pr.review == crate::forge::ReviewDecision::ChangesRequested { WARN } else { DIM };
+        add(&mut job, r, c);
+    }
+    if pr.state == crate::forge::PrState::Draft {
+        add(&mut job, "draft", theme::pr_color(crate::forge::PrState::Draft, dark));
+    }
+    add(&mut job, &theme::relative(pr.updated), FAINT);
+    job.wrap = TextWrapping { max_width: text_w.max(10.0), max_rows: 1, break_anywhere: true, overflow_character: Some('…') };
+    let g = p.layout_job(job);
+    p.galley(pos2(left, rect.top() + 27.0 - g.size().y / 2.0), g, DIM);
+
+    // The ⋯ button, on top of the row.
+    let br = Rect::from_center_size(pos2(rect.right() - 12.0, rect.center().y), vec2(20.0, 22.0));
+    let more = ui.interact(br, resp.id.with("more"), Sense::click());
+    name_it(&more, egui::Role::Button, format!("More for #{}", pr.number));
+    if more.hovered() {
+        ui.painter().rect_filled(br, 4.0, RAISED);
+    }
+    if resp.hovered() || more.hovered() || selected || resp.has_focus() {
+        ui.painter().text(br.center(), Align2::CENTER_CENTER, "⋯", theme::prop(14.0), if more.hovered() { TEXT } else { DIM });
+    }
+    egui::Popup::menu(&more).show(|ui| pr_menu(ui, st, path, actions));
+    let hint = format!("Double-click or Enter to open on {} · right-click for more", st.kind.name());
+    let resp = resp.on_hover_text(format!("{}\n{hint}", st.details(theme::relative)));
+    resp.context_menu(|ui| pr_menu(ui, st, path, actions));
+    resp
+}
+
+/// What can be done with a pull request (its right-click and ⋯ menu).
+fn pr_menu(ui: &mut Ui, st: &PrStatus, path: &Path, actions: &mut Vec<Action>) {
+    let pr = &st.pr;
+    let n = pr.number;
+    let mut act = |what| actions.push(Action::Pr { repo: path.to_path_buf(), number: n, what });
+    if ui.button("Check out").on_hover_text(format!("Fetch #{n} and switch to a local branch for it")).clicked() {
+        act(PrAction::Checkout);
+    }
+    if ui
+        .button("Check out in new worktree")
+        .on_hover_text(format!("Review #{n} in a folder of its own, next to this one, without touching your work here"))
+        .clicked()
+    {
+        act(PrAction::Worktree);
+    }
+    if ui.button("Show commits").on_hover_text(format!("Select #{n}'s latest commit in the history and mark the commits it adds")).clicked() {
+        act(PrAction::ShowCommits);
+    }
+    if let Some(fork) = &pr.head_repo
+        && ui.button(format!("Add {}'s fork as a remote…", fork.split('/').next().unwrap_or(fork))).on_hover_text(format!("So branches from {fork} can be fetched and tracked")).clicked()
+    {
+        act(PrAction::AddForkRemote);
+    }
+    ui.separator();
+    if ui.button(format!("Open on {}", st.kind.name())).clicked() {
+        open_pr(ui.ctx(), pr);
+        ui.close();
+    }
+    if ui.button("Copy link").clicked() {
+        actions.push(Action::Copy(pr.url.clone()));
+        ui.close();
+    }
+    if ui.button("Copy branch name").clicked() {
+        actions.push(Action::Copy(pr.head_branch.clone()));
+        ui.close();
+    }
+}
+
 fn checkout_remote(path: &Path, full: &str, local: &str, exists: bool) -> Action {
     if exists {
         checkout(path, local)
@@ -1171,7 +1435,7 @@ fn commit_list(ui: &mut Ui, rv: &mut RepoView, actions: &mut Vec<Action>) {
     };
     let mut scroll_offset = None;
     // Not while a dialog is open: its keys are its own.
-    if !rv.modal && !ui.ctx().text_edit_focused() && !ui.ctx().any_popup_open() {
+    if !rv.modal && !rv.pr_keys && !ui.ctx().text_edit_focused() && !ui.ctx().any_popup_open() {
         let (offset, view_h) = rv.list_view;
         let page = ((view_h / row_h).floor() as usize).saturating_sub(1).max(1);
         let key = ui.input(|i| {
@@ -1201,6 +1465,23 @@ fn commit_list(ui: &mut Ui, rv: &mut RepoView, actions: &mut Vec<Action>) {
             }
         }
     }
+
+    // A pull request's commits, marked (from its "Show commits").
+    let marked = rv.pr_highlight.as_ref();
+    if let Some(h) = marked {
+        let n = h.commits.len();
+        egui::Frame::new().fill(RAISED).inner_margin(Margin::symmetric(10, 4)).show(ui, |ui| {
+            ui.horizontal(|ui| {
+                let c = theme::pr_color(crate::forge::PrState::Open, ui.visuals().dark_mode);
+                ui.label(RichText::new("▌").color(c));
+                ui.label(RichText::new(format!("Showing #{}'s {n} commit{}", h.number, if n == 1 { "" } else { "s" })).size(12.5));
+                if ui.small_button("Clear").on_hover_text("Stop marking these commits").clicked() {
+                    actions.push(Action::ClearPrHighlight);
+                }
+            });
+        });
+    }
+    let mark_color = theme::pr_color(crate::forge::PrState::Open, ui.visuals().dark_mode);
 
     // Column header
     let (hr, _) = ui.allocate_exact_size(vec2(ui.available_width(), 26.0), Sense::hover());
@@ -1279,6 +1560,10 @@ fn commit_list(ui: &mut Ui, rv: &mut RepoView, actions: &mut Vec<Action>) {
                 let c = &data.commits[ci];
                 name_it(&resp, egui::Role::Row, &c.summary);
                 let selected = selected_hash.as_deref() == Some(c.hash.as_str());
+                if !selected && marked.is_some_and(|h| h.commits.contains(&c.hash)) {
+                    p.rect_filled(rect, 0.0, mark_color.gamma_multiply(0.12));
+                    p.rect_filled(Rect::from_min_size(rect.min, vec2(3.0, rect.height())), 0.0, mark_color);
+                }
                 paint_row_bg(&p, rect, selected, resp.hovered());
 
                 // Graph

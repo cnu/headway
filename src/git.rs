@@ -875,6 +875,153 @@ pub fn add_worktree(repo: &Path, path: &Path, branch: &str, new_from: Option<&st
     }
 }
 
+/// Where a pull request's commits come from, in git's terms.
+#[derive(Clone, Debug, PartialEq)]
+pub struct PrSource {
+    pub number: u64,
+    /// The remote the pull request was opened against.
+    pub remote: String,
+    /// The ref there that holds its head ("refs/pull/12/head", "refs/merge-requests/12/head").
+    pub head_ref: String,
+    /// The branch it comes from, in the head repository.
+    pub head_branch: String,
+    /// A remote for the head repository (the same as `remote` unless it's a fork),
+    /// if there is one.
+    pub head_remote: Option<String>,
+}
+
+impl PrSource {
+    /// What the local branch tracks: the head repository's branch when there's a
+    /// remote for it, else the pull request's ref (so pulling still updates it).
+    pub fn upstream(&self) -> (String, String) {
+        match &self.head_remote {
+            Some(r) => (r.clone(), format!("refs/heads/{}", self.head_branch)),
+            None => (self.remote.clone(), self.head_ref.clone()),
+        }
+    }
+}
+
+/// The local branch a pull request is checked out on.
+#[derive(Clone, Debug, PartialEq)]
+pub struct PrBranch {
+    pub name: String,
+    /// It's there already, tracking this pull request.
+    pub existing: bool,
+}
+
+fn branch_upstream(repo: &Path, name: &str) -> Option<(String, String)> {
+    let get = |k: &str| run(repo, &["config", "--get", &format!("branch.{name}.{k}")]).ok().map(|s| s.trim().to_string());
+    Some((get("remote")?, get("merge")?))
+}
+
+fn branch_exists(repo: &Path, name: &str) -> bool {
+    run(repo, &["rev-parse", "-q", "--verify", &format!("refs/heads/{name}")]).is_ok()
+}
+
+/// Which local branch to use for a pull request: one named after its branch, or
+/// `pr/N` when that name is taken by a branch that tracks something else (often
+/// a fork's `main`). A branch already tracking the pull request is reused.
+pub fn plan_pr_branch(repo: &Path, src: &PrSource) -> PrBranch {
+    let upstream = src.upstream();
+    let n = src.number;
+    let names = [src.head_branch.clone(), format!("pr/{n}")].into_iter().chain((2..).map(|i| format!("pr/{n}-{i}")));
+    for name in names {
+        if !branch_exists(repo, &name) {
+            return PrBranch { name, existing: false };
+        }
+        if branch_upstream(repo, &name).as_ref() == Some(&upstream) {
+            return PrBranch { name, existing: true };
+        }
+    }
+    unreachable!("the names go on forever")
+}
+
+/// Fetch a pull request's head; returns its commit.
+pub fn fetch_pr(repo: &Path, src: &PrSource) -> GitResult<String> {
+    run(repo, &["fetch", "--no-tags", &src.remote, &src.head_ref])?;
+    let oid = run(repo, &["rev-parse", "--verify", "FETCH_HEAD^{commit}"])?.trim().to_string();
+    // Keep the fork's branch up to date too, for ahead/behind (it may be gone).
+    if let Some(r) = src.head_remote.as_ref().filter(|r| **r != src.remote) {
+        let _ = run(repo, &["fetch", "--no-tags", r, &src.head_branch]);
+    }
+    Ok(oid)
+}
+
+fn set_upstream(repo: &Path, branch: &str, (remote, merge): &(String, String)) -> GitResult<()> {
+    run(repo, &["config", &format!("branch.{branch}.remote"), remote])?;
+    run(repo, &["config", &format!("branch.{branch}.merge"), merge])?;
+    Ok(())
+}
+
+/// Whether the branch can move to `oid` without losing commits.
+fn fast_forwards(repo: &Path, branch: &str, oid: &str) -> bool {
+    run(repo, &["merge-base", "--is-ancestor", &format!("refs/heads/{branch}"), oid]).is_ok()
+}
+
+/// Check out a pull request: fetch its head, create or fast-forward its local
+/// branch (see [`plan_pr_branch`]), switch to it and set its upstream. Like any
+/// checkout, refuses when uncommitted changes would be overwritten (and then
+/// nothing is created).
+pub fn checkout_pr(repo: &Path, src: &PrSource) -> GitResult<String> {
+    let oid = fetch_pr(repo, src)?;
+    let plan = plan_pr_branch(repo, src);
+    let name = plan.name.as_str();
+    let mut note = String::new();
+    if !plan.existing {
+        run(repo, &["checkout", "-b", name, &oid])?;
+    } else if fast_forwards(repo, name, &oid) {
+        run(repo, &["checkout", "-B", name, &oid])?;
+    } else {
+        run(repo, &["checkout", name])?;
+        note = format!("{name} has commits that aren't in #{}, so it was left where it was.", src.number);
+    }
+    set_upstream(repo, name, &src.upstream())?;
+    Ok(note)
+}
+
+/// Check out a pull request in a new worktree at `path`, leaving this one alone.
+/// Returns the branch used.
+pub fn checkout_pr_worktree(repo: &Path, src: &PrSource, path: &Path) -> GitResult<String> {
+    let oid = fetch_pr(repo, src)?;
+    let plan = plan_pr_branch(repo, src);
+    let name = plan.name.as_str();
+    if !plan.existing {
+        add_worktree(repo, path, name, Some(&oid))?;
+    } else {
+        if fast_forwards(repo, name, &oid) {
+            run(repo, &["branch", "-f", name, &oid])?;
+        }
+        add_worktree(repo, path, name, None)?;
+    }
+    set_upstream(repo, name, &src.upstream())?;
+    Ok(name.to_string())
+}
+
+/// A free folder for a pull request's worktree: next to the repository, named
+/// `<repo>-pr-<n>` (then `-2`, `-3`… if that's taken).
+pub fn pr_worktree_path(repo: &Path, number: u64) -> PathBuf {
+    let base = default_worktree_path(repo, &format!("pr-{number}"));
+    let free = |p: &Path| !p.exists() || std::fs::read_dir(p).map(|mut d| d.next().is_none()).unwrap_or(false);
+    if free(&base) {
+        return base;
+    }
+    (2..).map(|i| PathBuf::from(format!("{}-{i}", base.display()))).find(|p| free(p)).expect("the names go on forever")
+}
+
+/// Fetch a pull request's head into `refs/remotes/<remote>/pr/<n>`, so it shows
+/// in the history (the next `fetch --prune` tidies it away). Returns its commit.
+pub fn fetch_pr_for_history(repo: &Path, src: &PrSource) -> GitResult<String> {
+    let dst = format!("refs/remotes/{}/pr/{}", src.remote, src.number);
+    run(repo, &["fetch", "--no-tags", &src.remote, &format!("+{}:{dst}", src.head_ref)])?;
+    Ok(run(repo, &["rev-parse", "--verify", &format!("{dst}^{{commit}}")])?.trim().to_string())
+}
+
+/// The commits a pull request adds: on `head` but not on `base` (newest first, at most `limit`).
+pub fn pr_commits(repo: &Path, head: &str, base: &str, limit: usize) -> GitResult<Vec<String>> {
+    let n = format!("-n{limit}");
+    Ok(run(repo, &["rev-list", &n, head, "--not", base, "--"])?.lines().map(String::from).collect())
+}
+
 pub fn remove_worktree(repo: &Path, path: &Path, force: bool) -> GitResult<String> {
     let p = path.to_string_lossy();
     let mut args = vec!["worktree", "remove"];
@@ -5714,5 +5861,154 @@ index 4444444..0000000
         assert!(!log.dir.exists(), "no folder, no files");
         assert!(log.recent(&dir).is_empty());
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A "forge" repository whose pull request #12 (GitHub's ref) and !7 (GitLab's)
+    /// come from its branch `fix-x`, and a clone of it on `main`. Returns
+    /// (server, clone, the pull request's head commit).
+    fn pr_server(name: &str) -> (PathBuf, PathBuf, String) {
+        let server = temp_repo(&format!("{name}-server"));
+        commit_file(&server, "a.txt", "1\n");
+        run(&server, &["checkout", "-q", "-b", "fix-x"]).unwrap();
+        commit_file(&server, "b.txt", "from the pull request\n");
+        let oid = head(&server);
+        run(&server, &["update-ref", "refs/pull/12/head", &oid]).unwrap();
+        run(&server, &["update-ref", "refs/merge-requests/7/head", &oid]).unwrap();
+        run(&server, &["checkout", "-q", "main"]).unwrap();
+        let dir = temp_repo(name);
+        run(&dir, &["remote", "add", "origin", &server.display().to_string()]).unwrap();
+        run(&dir, &["fetch", "-q", "origin"]).unwrap();
+        run(&dir, &["checkout", "-q", "-B", "main", "--track", "origin/main"]).unwrap();
+        (server, dir, oid)
+    }
+
+    fn pr_src(number: u64, head_ref: &str, head_branch: &str, head_remote: Option<&str>) -> PrSource {
+        PrSource { number, remote: "origin".into(), head_ref: head_ref.into(), head_branch: head_branch.into(), head_remote: head_remote.map(String::from) }
+    }
+
+    fn upstream_of(dir: &Path, b: &str) -> (String, String) {
+        branch_upstream(dir, b).unwrap()
+    }
+
+    #[test]
+    fn pull_request_heads_are_fetched_from_github_and_gitlab_refs() {
+        let (server, dir, oid) = pr_server("pr-fetch");
+        use crate::forge::ForgeKind;
+        assert_eq!(ForgeKind::GitHub.pr_head_ref(12), "refs/pull/12/head");
+        assert_eq!(ForgeKind::GitLab.pr_head_ref(7), "refs/merge-requests/7/head");
+        assert_eq!(fetch_pr(&dir, &pr_src(12, &ForgeKind::GitHub.pr_head_ref(12), "fix-x", None)).unwrap(), oid);
+        assert_eq!(fetch_pr(&dir, &pr_src(7, &ForgeKind::GitLab.pr_head_ref(7), "fix-x", None)).unwrap(), oid);
+        assert!(fetch_pr(&dir, &pr_src(99, "refs/pull/99/head", "x", None)).is_err(), "no such pull request");
+        // For the history: under the remote, where the next prune tidies it away.
+        assert_eq!(fetch_pr_for_history(&dir, &pr_src(12, "refs/pull/12/head", "fix-x", None)).unwrap(), oid);
+        assert_eq!(run(&dir, &["rev-parse", "origin/pr/12"]).unwrap().trim(), oid);
+        assert_eq!(pr_commits(&dir, &oid, "origin/main", 50).unwrap(), std::slice::from_ref(&oid));
+        let _ = std::fs::remove_dir_all(&dir);
+        let _ = std::fs::remove_dir_all(&server);
+    }
+
+    #[test]
+    fn checking_out_a_pull_request_names_its_branch_and_sets_its_upstream() {
+        let (server, dir, oid) = pr_server("pr-checkout");
+        // From the project itself: a branch named after it, tracking its branch there.
+        let same = pr_src(12, "refs/pull/12/head", "fix-x", Some("origin"));
+        assert_eq!(plan_pr_branch(&dir, &same), PrBranch { name: "fix-x".into(), existing: false });
+        checkout_pr(&dir, &same).unwrap();
+        assert_eq!(run(&dir, &["symbolic-ref", "--short", "HEAD"]).unwrap().trim(), "fix-x");
+        assert_eq!(head(&dir), oid);
+        assert_eq!(upstream_of(&dir, "fix-x"), ("origin".into(), "refs/heads/fix-x".into()));
+
+        // Again, after the pull request moved on: the same branch, fast-forwarded.
+        run(&server, &["checkout", "-q", "fix-x"]).unwrap();
+        commit_file(&server, "b.txt", "a second commit\n");
+        let newer = head(&server);
+        run(&server, &["update-ref", "refs/pull/12/head", &newer]).unwrap();
+        run(&server, &["checkout", "-q", "main"]).unwrap();
+        run(&dir, &["checkout", "-q", "main"]).unwrap();
+        assert!(plan_pr_branch(&dir, &same).existing);
+        checkout_pr(&dir, &same).unwrap();
+        assert_eq!((run(&dir, &["symbolic-ref", "--short", "HEAD"]).unwrap().trim(), head(&dir)), ("fix-x", newer.clone()));
+
+        // With a local commit on it, it's checked out but not moved.
+        commit_file(&dir, "c.txt", "mine\n");
+        let mine = head(&dir);
+        run(&dir, &["checkout", "-q", "main"]).unwrap();
+        let note = checkout_pr(&dir, &same).unwrap();
+        assert!(note.contains("left where it was"), "{note}");
+        assert_eq!(head(&dir), mine);
+
+        // A fork's pull request from its `main`, with no remote for the fork: `main`
+        // is taken, so pr/12, tracking the pull request's ref (pulling updates it).
+        run(&dir, &["checkout", "-q", "main"]).unwrap();
+        let fork = pr_src(12, "refs/pull/12/head", "main", None);
+        checkout_pr(&dir, &fork).unwrap();
+        assert_eq!(run(&dir, &["symbolic-ref", "--short", "HEAD"]).unwrap().trim(), "pr/12");
+        assert_eq!(upstream_of(&dir, "pr/12"), ("origin".into(), "refs/pull/12/head".into()));
+        assert_eq!(run(&dir, &["rev-parse", "@{upstream}"]).unwrap_or_default().trim(), "", "no remote-tracking branch for a pull ref");
+        run(&dir, &["pull", "-q", "--ff-only"]).unwrap();
+        assert_eq!(head(&dir), newer, "pull still works");
+        assert!(plan_pr_branch(&dir, &fork).existing, "and it's found again");
+
+        // pr/12 taken by something unrelated: pr/12-2.
+        run(&dir, &["checkout", "-q", "main"]).unwrap();
+        run(&dir, &["branch", "-D", "pr/12"]).unwrap();
+        run(&dir, &["branch", "pr/12"]).unwrap();
+        assert_eq!(plan_pr_branch(&dir, &fork).name, "pr/12-2");
+
+        // Once the fork has a remote, the branch tracks the fork's branch.
+        run(&dir, &["remote", "add", "bob", &server.display().to_string()]).unwrap();
+        let tracked = pr_src(12, "refs/pull/12/head", "fix-x", Some("bob"));
+        run(&dir, &["branch", "-D", "fix-x"]).unwrap();
+        checkout_pr(&dir, &tracked).unwrap();
+        assert_eq!(upstream_of(&dir, "fix-x"), ("bob".into(), "refs/heads/fix-x".into()));
+        assert_eq!(run(&dir, &["rev-parse", "bob/fix-x"]).unwrap().trim(), newer, "the fork's branch was fetched too");
+        let _ = std::fs::remove_dir_all(&dir);
+        let _ = std::fs::remove_dir_all(&server);
+    }
+
+    #[test]
+    fn checking_out_a_pull_request_over_uncommitted_changes_is_refused_and_undone_like_a_switch() {
+        let (server, dir, oid) = pr_server("pr-dirty");
+        std::fs::write(dir.join("b.txt"), "my own b.txt, not committed\n").unwrap();
+        let src = pr_src(12, "refs/pull/12/head", "fix-x", Some("origin"));
+        let err = checkout_pr(&dir, &src).unwrap_err();
+        assert!(err.contains("would be overwritten"), "{err}");
+        assert!(!branch_exists(&dir, "fix-x"), "nothing created");
+        assert_eq!(std::fs::read_to_string(dir.join("b.txt")).unwrap(), "my own b.txt, not committed\n");
+
+        std::fs::remove_file(dir.join("b.txt")).unwrap();
+        let before = head(&dir);
+        let e = recorded(&dir, Undoable::Tree { save_work: false }, || {
+            checkout_pr(&dir, &src).unwrap();
+        });
+        assert_eq!(head(&dir), oid);
+        undo(&dir, &e).unwrap();
+        assert_eq!(run(&dir, &["symbolic-ref", "--short", "HEAD"]).unwrap().trim(), "main");
+        assert_eq!(head(&dir), before);
+        assert!(!branch_exists(&dir, "fix-x"), "the new branch is gone again");
+        let _ = std::fs::remove_dir_all(&dir);
+        let _ = std::fs::remove_dir_all(&server);
+    }
+
+    #[test]
+    fn a_pull_request_can_be_checked_out_in_its_own_worktree() {
+        let (server, dir, oid) = pr_server("pr-worktree");
+        std::fs::write(dir.join("a.txt"), "work in progress\n").unwrap();
+        let src = pr_src(7, "refs/merge-requests/7/head", "main", None);
+        let wt = pr_worktree_path(&dir, 7);
+        assert_eq!(wt.file_name().unwrap().to_string_lossy(), format!("{}-pr-7", repo_name(&dir)));
+        let _ = std::fs::remove_dir_all(&wt);
+        assert_eq!(checkout_pr_worktree(&dir, &src, &wt).unwrap(), "pr/7");
+        assert_eq!(head(&wt), oid);
+        assert_eq!(run(&wt, &["symbolic-ref", "--short", "HEAD"]).unwrap().trim(), "pr/7");
+        assert_eq!(upstream_of(&dir, "pr/7"), ("origin".into(), "refs/merge-requests/7/head".into()));
+        // This worktree is untouched.
+        assert_eq!(run(&dir, &["symbolic-ref", "--short", "HEAD"]).unwrap().trim(), "main");
+        assert_eq!(std::fs::read_to_string(dir.join("a.txt")).unwrap(), "work in progress\n");
+        // The folder is taken now: the next one gets a number.
+        assert!(pr_worktree_path(&dir, 7).to_string_lossy().ends_with("-pr-7-2"));
+        remove_worktree(&dir, &wt, true).unwrap();
+        let _ = std::fs::remove_dir_all(&dir);
+        let _ = std::fs::remove_dir_all(&server);
     }
 }

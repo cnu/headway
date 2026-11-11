@@ -279,6 +279,15 @@ mod imp {
                 checks: CheckSummary::from_states([(CheckState::Passing, 4)]),
                 ..pr(9, "Checkout flow with coupon codes", PrState::Merged, "sam-okafor", "feature/checkout", 24 * 12)
             },
+            // From a fork's main, waiting for the signed-in user's review.
+            PullRequest {
+                head_repo: Some("jo-lindqvist/web-shop".into()),
+                review: ReviewDecision::ReviewRequired,
+                requested_reviewers: vec!["alex-rivera".into()],
+                checks: CheckSummary::from_states([(CheckState::Passing, 4)]),
+                mergeable: Mergeable::Clean,
+                ..pr(15, "Dark theme for the storefront", PrState::Open, "jo-lindqvist", "main", 5)
+            },
         ];
         let info = RepoInfo { default_branch: "main".into(), merge_methods: vec![MergeMethod::Merge, MergeMethod::Squash, MergeMethod::Rebase], web_url: "https://github.com/headway-samples/web-shop".into() };
         let mut data = FakeData::default();

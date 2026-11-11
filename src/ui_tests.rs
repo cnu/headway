@@ -2670,3 +2670,119 @@ fn no_badges_when_the_forge_is_unavailable() {
         assert!(!shows_containing(&h, "checks failing"));
     }
 }
+
+/// Let `git fetch` from the web shop's GitHub address reach a local copy, which
+/// has each sample pull request's head at `refs/pull/N/head`. Nothing goes over
+/// the network: git's ssh command is one that serves the copy.
+fn serve_web_shop(s: &Scratch, r: &Path) -> PathBuf {
+    let server = s.root.join("server.git");
+    git_ok(&s.root, &["clone", "-q", "--bare", &r.display().to_string(), &server.display().to_string()]);
+    for (n, branch) in [(12, "feature/search"), (13, "fix/tax-rounding"), (14, "feature/reviews"), (15, "feature/reviews")] {
+        let tip = git_ok(r, &["rev-parse", branch]);
+        git_ok(&server, &["update-ref", &format!("refs/pull/{n}/head"), tip.trim()]);
+    }
+    let served = server.display().to_string().replace('\\', "/");
+    git_ok(r, &["config", "remote.origin.url", "git@github.com:headway-samples/web-shop.git"]);
+    git_ok(r, &["config", "ssh.variant", "simple"]);
+    git_ok(r, &["config", "core.sshCommand", &format!("serve() {{ git upload-pack '{served}'; }}; serve")]);
+    server
+}
+
+#[test]
+fn pull_requests_are_listed_filtered_and_checked_out_into_a_worktree() {
+    let s = scratch("pr-list");
+    let r = web_shop(&s, "main");
+    serve_web_shop(&s, &r);
+    let mut h = app_with_forge(&s, &r, true, web_shop_forge());
+
+    // alex-rivera opened two of the four: "Mine" comes first.
+    assert!(shows(&h, "PULL REQUESTS   4"));
+    assert!(shows(&h, "Mine 2") && shows(&h, "Review requested 1") && shows(&h, "All open 4"));
+    assert!(shows(&h, "#12 Add product search by alex-rivera, checks passing, approved"));
+    assert!(shows(&h, "#13 Round cart totals to cents by alex-rivera, checks failing, changes requested"));
+    assert!(!shows_containing(&h, "#15 Dark theme"));
+
+    // The one waiting for their review: from a fork's main.
+    click(&mut h, "Review requested 1");
+    let row = "#15 Dark theme for the storefront by jo-lindqvist, checks passing, review required";
+    assert!(shows(&h, row));
+    assert!(!shows_containing(&h, "#12 Add product search by"));
+    right_click(&mut h, row);
+    assert!(shows(&h, "Add jo-lindqvist's fork as a remote…"));
+    click(&mut h, "Check out in new worktree");
+
+    // A folder next to the repository, on pr/15 (main is taken), opened in a tab.
+    let wt = s.root.join("web-shop-pr-15");
+    assert_eq!(git_ok(&wt, &["symbolic-ref", "--short", "HEAD"]).trim(), "pr/15");
+    assert_eq!(git_ok(&wt, &["rev-parse", "HEAD"]), git_ok(&r, &["rev-parse", "feature/reviews"]));
+    assert_eq!(git_ok(&r, &["config", "branch.pr/15.merge"]).trim(), "refs/pull/15/head", "pulling updates it");
+    assert_eq!(h.state().active_path().as_deref(), Some(wt.as_path()));
+    // The work here is left alone.
+    assert_eq!(git_ok(&r, &["symbolic-ref", "--short", "HEAD"]).trim(), "main");
+}
+
+#[test]
+fn the_pull_request_list_works_with_the_keyboard_and_shows_a_pull_requests_commits() {
+    let s = scratch("pr-keys");
+    let r = web_shop(&s, "main");
+    serve_web_shop(&s, &r);
+    let mut h = app_with_forge(&s, &r, true, web_shop_forge());
+    let twelve = "#12 Add product search by alex-rivera, checks passing, approved";
+    let thirteen = "#13 Round cart totals to cents by alex-rivera, checks failing, changes requested";
+
+    // Newest first: #13, then #12. Down to the next row, Enter opens it; the
+    // history's selection doesn't move.
+    let selected_before = h.state().tabs.get(&r).unwrap().selection.clone();
+    h.get_by_label(thirteen).focus();
+    h.step();
+    h.step();
+    assert_eq!(h.state().tabs.get(&r).unwrap().pr_selected, Some(13));
+    h.key_press(egui::Key::ArrowDown);
+    h.step();
+    h.step();
+    assert_eq!(h.state().tabs.get(&r).unwrap().pr_selected, Some(12));
+    assert_eq!(h.state().tabs.get(&r).unwrap().selection, selected_before, "the arrows were the list's");
+    // (The output read is the frame's that saw the key go down.)
+    h.key_down(egui::Key::Enter);
+    h.step();
+    let opened: Vec<String> = h.output().platform_output.commands.iter().filter_map(|c| match c {
+        egui::OutputCommand::OpenUrl(u) => Some(u.url.clone()),
+        _ => None,
+    }).collect();
+    assert_eq!(opened, ["https://github.com/headway-samples/web-shop/pull/12"]);
+    h.key_up(egui::Key::Enter);
+    h.step();
+
+    // Show commits: fetched under origin/pr/12, selected, and its commits marked.
+    right_click(&mut h, twelve);
+    click(&mut h, "Show commits");
+    let head = git_ok(&r, &["rev-parse", "feature/search"]).trim().to_string();
+    assert_eq!(git_ok(&r, &["rev-parse", "origin/pr/12"]).trim(), head);
+    let rv = h.state().tabs.get(&r).unwrap();
+    assert_eq!(rv.selection, Some(crate::app::Selection::Commit(head.clone())));
+    let marked = rv.pr_highlight.as_ref().unwrap();
+    let expected: std::collections::HashSet<String> = git_ok(&r, &["rev-list", "feature/search", "--not", "origin/main"]).lines().map(String::from).collect();
+    assert_eq!((marked.number, &marked.commits), (12, &expected));
+    let n = expected.len();
+    assert!(shows(&h, &format!("Showing #12's {n} commits")));
+    click(&mut h, "Clear");
+    assert!(h.state().tabs.get(&r).unwrap().pr_highlight.is_none());
+}
+
+#[test]
+fn the_pull_request_section_says_when_a_list_is_empty_and_hides_without_the_forge() {
+    let s = scratch("pr-empty");
+    let r = github_repo(&s.root);
+    // alex opened nothing and was asked for nothing: "All open" is shown first.
+    let mut h = app_with_forge(&s, &r, true, fixture_forge(Some("alex"), true));
+    assert!(shows(&h, "#7 Add search by sam, checks passing, approved"));
+    click(&mut h, "Review requested 0");
+    assert!(shows(&h, "No pull requests need your review"));
+    click(&mut h, "Mine 0");
+    assert!(shows(&h, "You have no open pull requests"));
+    for forges in [fixture_forge(None, true), fixture_forge(Some("alex"), false), std::sync::Arc::new(crate::forge::NoForges) as _] {
+        let h = app_with_forge(&s, &r, true, forges);
+        assert!(!shows_containing(&h, "PULL REQUESTS"));
+        assert!(!shows_containing(&h, "Mine "));
+    }
+}

@@ -45,6 +45,14 @@ impl Forge for GitLab {
         let reply: GraphQl = self.json(&["api", "graphql", "-f", &q, "-f", &path])?;
         parse_mrs(reply, branches)
     }
+
+    fn pr_lists(&self, repo: &RepoKey, me: &str, limit: usize) -> ForgeResult<PrLists> {
+        let q = format!("query={}", lists_query(limit));
+        let path = format!("path={}", repo.path);
+        let me = format!("me={me}");
+        let reply: ListsReply = self.json(&["api", "graphql", "-f", &q, "-f", &path, "-f", &me])?;
+        parse_lists(reply)
+    }
 }
 
 /// A project path for the REST API: `group/sub/repo` → `group%2Fsub%2Frepo`.
@@ -59,10 +67,25 @@ pub fn encode_path(path: &str) -> String {
 pub fn mrs_query(branches: &[String]) -> String {
     let names: Vec<String> = branches.iter().map(|b| serde_json::to_string(b).unwrap_or_default()).collect();
     format!(
-        "query($path: ID!) {{ project(fullPath: $path) {{ mergeRequests(sourceBranches: [{}], first: 100, sort: UPDATED_DESC) {{ nodes {{ \
-iid title state draft webUrl updatedAt sourceBranch targetBranch diffHeadSha author {{ username }} sourceProject {{ fullPath }} targetProject {{ fullPath }} \
-approved detailedMergeStatus reviewers {{ nodes {{ username }} }} headPipeline {{ status jobs(first: 100) {{ nodes {{ status allowFailure }} }} }} }} }} }} }}",
+        "query($path: ID!) {{ project(fullPath: $path) {{ mergeRequests(sourceBranches: [{}], first: 100, sort: UPDATED_DESC) {{ nodes {{ ...mr }} }} }} }} {MR_FRAGMENT}",
         names.join(", ")
+    )
+}
+
+/// Everything the app reads about a merge request.
+const MR_FRAGMENT: &str = "fragment mr on MergeRequest { \
+iid title state draft webUrl updatedAt sourceBranch targetBranch diffHeadSha author { username } sourceProject { fullPath } targetProject { fullPath } \
+approved detailedMergeStatus reviewers { nodes { username } } headPipeline { status jobs(first: 100) { nodes { status allowFailure } } } }";
+
+/// One query for the sidebar's three lists (by me, asking me for a review, all
+/// open), `limit` each, newest first.
+pub fn lists_query(limit: usize) -> String {
+    let n = limit.clamp(1, 100);
+    format!(
+        "query($path: ID!, $me: String!) {{ project(fullPath: $path) {{ \
+mine: mergeRequests(state: opened, authorUsername: $me, first: {n}, sort: UPDATED_DESC) {{ nodes {{ ...mr }} }} \
+review: mergeRequests(state: opened, reviewerUsername: $me, first: {n}, sort: UPDATED_DESC) {{ nodes {{ ...mr }} }} \
+open: mergeRequests(state: opened, first: {n}, sort: UPDATED_DESC) {{ count nodes {{ ...mr }} }} }} }} {MR_FRAGMENT}"
     )
 }
 
@@ -179,10 +202,51 @@ pub fn job_state(status: &str, allow_failure: bool) -> CheckState {
     }
 }
 
-pub fn parse_mrs(reply: GraphQl, branches: &[String]) -> ForgeResult<BranchPrs> {
-    if let Some(e) = reply.errors.first() {
-        return Err(if e.message.to_ascii_lowercase().contains("rate limit") { ForgeError::RateLimited { until: None } } else { ForgeError::Other(e.message.clone()) });
+fn gql_error(errors: &[GqlError]) -> ForgeResult<()> {
+    match errors.first() {
+        Some(e) if e.message.to_ascii_lowercase().contains("rate limit") => Err(ForgeError::RateLimited { until: None }),
+        Some(e) => Err(ForgeError::Other(e.message.clone())),
+        None => Ok(()),
     }
+}
+
+#[derive(Deserialize)]
+pub struct ListsReply {
+    data: Option<ListsData>,
+    #[serde(default)]
+    errors: Vec<GqlError>,
+}
+
+#[derive(Deserialize)]
+struct ListsData {
+    project: Option<ListsProject>,
+}
+
+#[derive(Deserialize)]
+struct ListsProject {
+    mine: Option<Nodes<MrNode>>,
+    review: Option<Nodes<MrNode>>,
+    open: Option<CountedNodes>,
+}
+
+#[derive(Deserialize)]
+struct CountedNodes {
+    #[serde(default)]
+    count: usize,
+    #[serde(default = "Vec::new")]
+    nodes: Vec<Option<MrNode>>,
+}
+
+pub fn parse_lists(reply: ListsReply) -> ForgeResult<PrLists> {
+    gql_error(&reply.errors)?;
+    let p = reply.data.and_then(|d| d.project).ok_or(ForgeError::NotFound)?;
+    let read = |n: Option<Nodes<MrNode>>| n.map(|n| n.nodes.iter().flatten().map(mr_from).collect()).unwrap_or_default();
+    let (open, open_total) = p.open.map(|o| (o.nodes.iter().flatten().map(mr_from).collect(), o.count)).unwrap_or_default();
+    Ok(PrLists { mine: read(p.mine), review_requested: read(p.review), open, open_total, slow_down_until: None })
+}
+
+pub fn parse_mrs(reply: GraphQl, branches: &[String]) -> ForgeResult<BranchPrs> {
+    gql_error(&reply.errors)?;
     let project = reply.data.and_then(|d| d.project).ok_or(ForgeError::NotFound)?;
     let mut by_branch: HashMap<String, Vec<PullRequest>> = branches.iter().map(|b| (b.clone(), Vec::new())).collect();
     for n in project.merge_requests.nodes.iter().flatten() {
@@ -295,6 +359,21 @@ mod tests {
         assert!(q.contains(r#"sourceBranches: ["a\"b", "c\\d", "e"]"#), "{q}");
         assert!(f.prs_for_branches(&key, &[]).unwrap().by_branch.is_empty());
         assert_eq!(cli.calls().len(), 1, "no branches, no call");
+    }
+
+    #[test]
+    fn lists_are_read_in_one_call() {
+        let cli = Arc::new(StubCli::default().on(Tool::Glab, &["api", "graphql"], Answer::Ok(include_str!("fixtures/glab-mr-lists.json"))));
+        let f = forge(cli.clone());
+        let lists = f.pr_lists(&RepoKey { host: "gitlab.example.org".into(), path: "group/sub/shop".into() }, "tanuki-user", 50).unwrap();
+        assert_eq!((lists.mine.len(), lists.review_requested.len(), lists.open.len(), lists.open_total), (1, 1, 4, 4));
+        assert_eq!((lists.mine[0].number, lists.mine[0].author.as_str()), (44, "tanuki-user"));
+        assert_eq!(lists.review_requested[0].requested_reviewers, ["tanuki-user"]);
+        assert!(lists.open.iter().any(|p| p.state == PrState::Draft && p.head_repo.is_some()), "a draft from a fork");
+        let args = &cli.calls()[0].1;
+        assert!(args.contains(&"me=tanuki-user".to_string()) && args.contains(&"path=group/sub/shop".to_string()));
+        let q = args.iter().find(|a| a.starts_with("query=")).unwrap();
+        assert!(q.contains("authorUsername: $me") && q.contains("reviewerUsername: $me") && q.contains("first: 50") && q.contains("count"), "{q}");
     }
 
     #[test]

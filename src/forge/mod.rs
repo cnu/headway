@@ -76,6 +76,14 @@ impl ForgeKind {
     }
 
     /// The forge a host is without asking anyone, for the public sites.
+    /// The ref on the forge that holds pull request `n`'s head commit.
+    pub fn pr_head_ref(self, n: u64) -> String {
+        match self {
+            ForgeKind::GitHub => format!("refs/pull/{n}/head"),
+            ForgeKind::GitLab => format!("refs/merge-requests/{n}/head"),
+        }
+    }
+
     pub fn known_host(host: &str) -> Option<ForgeKind> {
         match host {
             "github.com" | "ssh.github.com" | "www.github.com" => Some(ForgeKind::GitHub),
@@ -359,6 +367,22 @@ pub struct BranchPrs {
     pub slow_down_until: Option<i64>,
 }
 
+/// The pull request lists in a repository's sidebar: open ones by me, open ones
+/// asking me for a review, and every open one (each newest first, at most a page).
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct PrLists {
+    pub mine: Vec<PullRequest>,
+    pub review_requested: Vec<PullRequest>,
+    pub open: Vec<PullRequest>,
+    /// How many are open in all (`open` holds the first page).
+    pub open_total: usize,
+    /// As in [`BranchPrs`]: when the request allowance comes back, if nearly used up.
+    pub slow_down_until: Option<i64>,
+}
+
+/// Pull requests listed per page.
+pub const LIST_PAGE: usize = 50;
+
 /// Which pull requests to list.
 #[derive(Clone, Debug, Default, PartialEq)]
 #[allow(dead_code)] // Ahead of the UI: the pull request features to come use it.
@@ -456,6 +480,10 @@ pub trait Forge: Send + Sync {
     fn prs_for_branches(&self, repo: &RepoKey, branches: &[String]) -> ForgeResult<BranchPrs>;
 
     fn list_prs(&self, _repo: &RepoKey, _filter: &PrFilter) -> ForgeResult<Vec<PullRequest>> {
+        Err(ForgeError::NotYet("list pull requests"))
+    }
+    /// The sidebar's lists, for the user `me`, `limit` per list.
+    fn pr_lists(&self, _repo: &RepoKey, _me: &str, _limit: usize) -> ForgeResult<PrLists> {
         Err(ForgeError::NotYet("list pull requests"))
     }
     fn pr_details(&self, _repo: &RepoKey, _number: u64) -> ForgeResult<PrDetails> {

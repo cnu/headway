@@ -30,6 +30,15 @@ workflow uses that version's section as the GitHub release notes.
 - **Merged branches**: a branch whose pull request was merged says so, and its
   menu offers "Delete branch (merged in #123)", undoable as always. The
   overview counts them per repository; click the count to see just those.
+- **Pull requests in the sidebar** ("Merge requests" on GitLab): yours, the
+  ones waiting for your review, and every open one, each with its author,
+  checks, review state, draft marker and age, and the full details on hover.
+  Right-click (or ⋯) to check one out on a local branch named after it (or
+  `pr/123` when that name is taken), fetched with git so it's in the command
+  log and undoable; to check it out in a new worktree next to the repository,
+  to review it without touching your work; to show its commits in the
+  history; to add the fork it comes from as a remote; or to open it, copy its
+  link or its branch name. Arrows and Enter work in the list.
 - `headway --version` (or `-V`) prints the version, and `--help` lists every
   option with what it does.
 
