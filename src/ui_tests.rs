@@ -2483,7 +2483,7 @@ fn fixture_forge(user: Option<&str>, installed: bool) -> std::sync::Arc<dyn crat
         head_oid: None,
     };
     let info = RepoInfo { default_branch: "main".into(), merge_methods: vec![MergeMethod::Squash], web_url: "https://github.com/acme/shop".into() };
-    data.repos.insert("github.com/acme/shop".into(), FakeRepo { info: Some(info), pulls: vec![pr] });
+    data.repos.insert("github.com/acme/shop".into(), FakeRepo { info: Some(info), pulls: vec![pr], ..Default::default() });
     std::sync::Arc::new(FakeForges::new(data))
 }
 
@@ -2684,7 +2684,8 @@ fn serve_web_shop(s: &Scratch, r: &Path) -> PathBuf {
     let served = server.display().to_string().replace('\\', "/");
     git_ok(r, &["config", "remote.origin.url", "git@github.com:headway-samples/web-shop.git"]);
     git_ok(r, &["config", "ssh.variant", "simple"]);
-    git_ok(r, &["config", "core.sshCommand", &format!("serve() {{ git upload-pack '{served}'; }}; serve")]);
+    // Pushes reach it too.
+    git_ok(r, &["config", "core.sshCommand", &format!("serve() {{ case \"$*\" in *receive-pack*) git receive-pack '{served}' ;; *) git upload-pack '{served}' ;; esac; }}; serve")]);
     server
 }
 
@@ -2785,4 +2786,112 @@ fn the_pull_request_section_says_when_a_list_is_empty_and_hides_without_the_forg
         assert!(!shows_containing(&h, "PULL REQUESTS"));
         assert!(!shows_containing(&h, "Mine "));
     }
+}
+
+// ---------------------------------------------------------------------------
+// Creating pull requests
+
+/// Whether a text box holds exactly `text`.
+fn text_box_holds(h: &Harness<'static, HeadwayApp>, text: &str) -> bool {
+    use egui_kittest::kittest::NodeT;
+    h.root().children_recursive().any(|n| {
+        matches!(n.accesskit_node().role(), egui::Role::TextInput | egui::Role::MultilineTextInput) && n.accesskit_node().value().is_some_and(|v| v == text)
+    })
+}
+
+fn click_button(h: &mut Harness<'static, HeadwayApp>, label: &str) {
+    h.get_all_by_role_and_label(egui::Role::Button, label).next().unwrap_or_else(|| panic!("no button “{label}”")).click();
+    settle(h);
+}
+
+#[test]
+fn a_pull_request_is_created_from_a_branch_pushed_first_and_its_badge_appears() {
+    let s = scratch("pr-create");
+    let r = web_shop(&s, "main");
+    let server = serve_web_shop(&s, &r);
+    // One commit more than the server has: it's pushed as part of creating.
+    git_ok(&r, &["checkout", "-q", "feature/favorites"]);
+    commit(&r, "src/favorites.js", "export const favorites = new Set(JSON.parse(localStorage.favorites ?? '[]'));\n", "Remember favorites between visits");
+    git_ok(&r, &["checkout", "-q", "main"]);
+    let mut h = app_with_forge(&s, &r, true, web_shop_forge());
+    assert!(!shows(&h, "New pull request…"), "main is where pull requests go");
+
+    right_click(&mut h, "feature/favorites");
+    click(&mut h, "Create pull request…");
+    assert!(shows(&h, "From feature/favorites"));
+    assert!(text_box_holds(&h, "Favorites"), "three commits: the branch name in words");
+    assert!(text_box_holds(&h, "- Let shoppers mark favorite products\n- Explain favorites in the README\n- Remember favorites between visits\n"));
+    assert!(shows(&h, "3 commits, 2 files changed, into origin/main"));
+    assert!(shows(&h, "feature/favorites has 1 commit that isn't on origin yet. It will be pushed first."));
+    if git::can_preview_merges(&r) {
+        // main moved on since the branch started, changing the same lines.
+        assert!(shows(&h, "⚠ This will conflict with main in 1 file"));
+        assert!(shows_containing(&h, "README.md"));
+    }
+
+    // A reviewer and a label from the forge's lists, and a draft.
+    let combo = |h: &mut Harness<'static, HeadwayApp>, name: &str| {
+        h.get_all_by_role_and_label(egui::Role::ComboBox, name).next().unwrap_or_else(|| panic!("no list “{name}”")).click();
+        settle(h);
+    };
+    combo(&mut h, "Reviewers");
+    click(&mut h, "sam-okafor");
+    combo(&mut h, "Reviewers");
+    combo(&mut h, "Labels");
+    click(&mut h, "enhancement");
+    combo(&mut h, "Labels");
+    click(&mut h, "Draft");
+    click_button(&mut h, "Create pull request");
+
+    // Pushed, created, and on the branch at once.
+    assert_eq!(git_ok(&server, &["log", "-1", "--format=%s", "feature/favorites"]).trim(), "Remember favorites between visits");
+    assert!(shows(&h, "Created #16"));
+    assert!(shows(&h, "Open in browser"));
+    assert!(!shows(&h, "From feature/favorites"), "the dialog closed");
+    assert!(shows_containing(&h, "◌ #16 draft"), "the badge on the branch");
+    assert!(shows(&h, "Mine 3"), "and in the list");
+    let key = crate::forge::RepoKey { host: "github.com".into(), path: "headway-samples/web-shop".into() };
+    let pr = h.state().forge_cache().repo(&key).unwrap().prs["feature/favorites"][0].clone();
+    assert_eq!((pr.number, pr.title.as_str(), pr.requested_reviewers.as_slice()), (16, "Favorites", ["sam-okafor".to_string()].as_slice()));
+
+    // Asking again says it's there.
+    right_click(&mut h, "feature/favorites");
+    assert!(!shows(&h, "Create pull request…"), "one is open already");
+}
+
+#[test]
+fn pushing_a_new_branch_offers_a_pull_request_and_a_rejected_push_stops_creating() {
+    let s = scratch("pr-after-push");
+    let r = web_shop(&s, "main");
+    serve_web_shop(&s, &r);
+    git_ok(&r, &["checkout", "-q", "-b", "feature/gift-cards"]);
+    commit(&r, "src/gift.js", "export const cards = [];\n", "Sell gift cards");
+    let mut h = app_with_forge(&s, &r, true, web_shop_forge());
+    assert!(shows(&h, "New pull request…"), "the current branch has none yet");
+
+    h.get_all_by_label_contains("Push").next().unwrap().click();
+    settle(&mut h);
+    click_button(&mut h, "Create pull request");
+    assert!(shows(&h, "From feature/gift-cards"));
+    assert!(text_box_holds(&h, "Sell gift cards"), "one commit: its subject");
+    assert!(shows(&h, "1 commit, 1 file changed, into origin/main"));
+    assert!(!shows_containing(&h, "pushed first"), "just pushed");
+    click_button(&mut h, "Cancel");
+
+    // Someone else pushes to the branch: creating stops at the push, with git's words.
+    let other = s.root.join("other");
+    git_ok(&s.root, &["clone", "-q", "--branch", "feature/gift-cards", &s.root.join("server.git").display().to_string(), &other.display().to_string()]);
+    git_ok(&other, &["config", "user.name", "Sam"]);
+    git_ok(&other, &["config", "user.email", "sam@example.com"]);
+    commit(&other, "src/gift.js", "export const cards = ['ten'];\n", "Their change");
+    git_ok(&other, &["push", "-q", "origin", "feature/gift-cards"]);
+    commit(&r, "src/gift.js", "export const cards = ['five'];\n", "My change");
+    ctrl(&mut h, egui::Key::R);
+    click(&mut h, "New pull request…");
+    assert!(shows(&h, "feature/gift-cards has 1 commit that isn't on origin yet. It will be pushed first."));
+    click_button(&mut h, "Create pull request");
+    assert!(shows(&h, "From feature/gift-cards"), "still open");
+    assert!(shows_containing(&h, "rejected"), "git's error, in the dialog");
+    let key = crate::forge::RepoKey { host: "github.com".into(), path: "headway-samples/web-shop".into() };
+    assert!(h.state().forge_cache().repo(&key).unwrap().prs.get("feature/gift-cards").is_none_or(|v| v.is_empty()), "nothing created");
 }

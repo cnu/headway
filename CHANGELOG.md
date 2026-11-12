@@ -39,6 +39,20 @@ workflow uses that version's section as the GitHub release notes.
   to review it without touching your work; to show its commits in the
   history; to add the fork it comes from as a remote; or to open it, copy its
   link or its branch name. Arrows and Enter work in the list.
+- **Create pull requests** ("merge requests" on GitLab) without leaving
+  Headway: from a branch's right-click menu, the "New pull request…" row in
+  the sidebar, or the button on the notification after pushing a branch that
+  has none. The title is the commit's subject (or the branch name in words),
+  the description the repository's template (pick one when there are several;
+  read from the base branch) or the list of commits. Pick another base, mark
+  it a draft, and choose reviewers, assignees and labels from the forge's
+  lists; on GitLab, delete the source branch when merged and squash. It says
+  what goes in ("3 commits, 7 files changed, into upstream/main"), pushes the
+  branch first when the remote is missing commits (a rejected push stops
+  there, with git's message), and warns when it will conflict with the base,
+  naming the files (git 2.38 or later). For a fork, it goes from your copy into
+  upstream. The new pull request's badge shows straight away, and the
+  notification opens it in the browser.
 - `headway --version` (or `-V`) prints the version, and `--help` lists every
   option with what it does.
 

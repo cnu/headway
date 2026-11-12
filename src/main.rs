@@ -11,6 +11,7 @@ mod forge;
 mod git;
 mod graph;
 mod highlight;
+mod newpr;
 mod oplog;
 mod overview;
 mod preview;

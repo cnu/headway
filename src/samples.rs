@@ -186,6 +186,15 @@ mod imp {
         b.commit(SAM, "Document how to run the shop", 30);
         b.write("src/cart.js", "export function total(items) {\n  return items.reduce((s, i) => s + i.price * (i.qty ?? 1), 0);\n}\n\nexport function count(items) {\n  return items.length;\n}\n");
         b.commit(JO, "Count quantities in cart total", 20);
+        // A branch pushed but without a pull request yet, to try creating one. It
+        // started before the README got its "Running" section and adds its own
+        // there, so the new pull request would conflict.
+        b.git(&["checkout", "-q", "-b", "feature/favorites", "main~2"]);
+        b.write("src/favorites.js", "export const favorites = new Set();\n\nexport function toggle(id) {\n  favorites.has(id) ? favorites.delete(id) : favorites.add(id);\n}\n");
+        b.commit(JO, "Let shoppers mark favorite products", 3);
+        b.write("README.md", "# Web Shop\n\nA small storefront.\n\n## Favorites\n\nClick the heart on a product to keep it for later.\n");
+        b.commit(JO, "Explain favorites in the README", 2);
+        b.git(&["checkout", "-q", "main"]);
         // Branches with pull requests on the sample's (pretend) GitHub: a draft, and
         // one with failing checks and changes requested. See `web_shop_forge`.
         b.git(&["checkout", "-q", "-b", "feature/reviews"]);
@@ -211,7 +220,7 @@ mod imp {
         b.git(&["remote", "add", "origin", WEB_SHOP_ORIGIN]);
         let behind = b.rev("main~1");
         b.git(&["update-ref", "refs/remotes/origin/main", &behind]);
-        for branch in ["feature/checkout", "feature/search", "feature/reviews", "fix/tax-rounding"] {
+        for branch in ["feature/checkout", "feature/search", "feature/reviews", "fix/tax-rounding", "feature/favorites"] {
             let tip = b.rev(branch);
             b.git(&["update-ref", &format!("refs/remotes/origin/{branch}"), &tip]);
             b.git(&["config", &format!("branch.{branch}.remote"), "origin"]);
@@ -292,7 +301,9 @@ mod imp {
         let info = RepoInfo { default_branch: "main".into(), merge_methods: vec![MergeMethod::Merge, MergeMethod::Squash, MergeMethod::Rebase], web_url: "https://github.com/headway-samples/web-shop".into() };
         let mut data = FakeData::default();
         data.hosts.insert("github.com".into(), FakeHost { kind: ForgeKind::GitHub, user: Some("alex-rivera".into()), installed: true });
-        data.repos.insert("github.com/headway-samples/web-shop".into(), FakeRepo { info: Some(info), pulls });
+        let users = ["alex-rivera", "jo-lindqvist", "sam-okafor"].map(String::from).to_vec();
+        let labels = ["bug", "checkout", "design", "documentation", "enhancement"].map(String::from).to_vec();
+        data.repos.insert("github.com/headway-samples/web-shop".into(), FakeRepo { info: Some(info), pulls, users, labels });
         data
     }
 

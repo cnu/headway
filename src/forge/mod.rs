@@ -195,6 +195,16 @@ impl RepoRemotes {
     pub fn key(&self) -> RepoKey {
         RepoKey { host: self.pr_url.host.clone(), path: self.pr_url.path.clone() }
     }
+
+    /// Where a new pull request's branch is pushed, and the fork it's then in
+    /// (`owner/repo`; `None` when that's the project itself). A fork's pull
+    /// requests go from origin's branch into upstream.
+    pub fn head_target(&self) -> (&str, Option<&str>) {
+        match &self.push {
+            Some((name, url)) => (name, Some(&url.path)),
+            None => (&self.pr_remote, None),
+        }
+    }
 }
 
 /// Choose the pull request remote (and the push remote) from `(name, url)` pairs.
@@ -399,13 +409,32 @@ pub enum CheckTarget {
     Commit(String),
 }
 
-#[allow(dead_code)] // Ahead of the UI: the pull request features to come use it.
+/// A pull request to open.
+#[derive(Clone, Debug, Default, PartialEq)]
 pub struct NewPr {
+    /// The branch name on the forge.
     pub head: String,
+    /// The fork it's in (`owner/repo`), when it isn't the project itself.
+    pub head_repo: Option<String>,
     pub base: String,
     pub title: String,
     pub body: String,
     pub draft: bool,
+    pub reviewers: Vec<String>,
+    pub assignees: Vec<String>,
+    pub labels: Vec<String>,
+    /// GitLab: delete the source branch once merged.
+    pub remove_source_branch: bool,
+    /// GitLab: squash the commits when merging.
+    pub squash: bool,
+}
+
+/// What can be picked when opening a pull request: people (for reviewers and
+/// assignees) and labels, sorted.
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct PrMeta {
+    pub users: Vec<String>,
+    pub labels: Vec<String>,
 }
 
 #[allow(dead_code)] // Ahead of the UI: the pull request features to come use it.
@@ -424,12 +453,6 @@ pub struct PrDetails {
     pub checks: Vec<Check>,
 }
 
-#[derive(Clone, Debug, PartialEq)]
-#[allow(dead_code)] // Ahead of the UI: the pull request features to come use it.
-pub struct PrTemplate {
-    pub name: String,
-    pub body: String,
-}
 
 // ---------------------------------------------------------------------------
 // Errors
@@ -467,8 +490,8 @@ pub type ForgeResult<T> = Result<T, ForgeError>;
 // ---------------------------------------------------------------------------
 // The operations
 
-/// One forge host, reached through its CLI (or fixtures). Only `whoami`,
-/// `repo_info` and `prs_for_branches` work so far; the rest say "not yet".
+/// One forge host, reached through its CLI (or fixtures). Operations not
+/// written yet say "not yet".
 #[allow(dead_code)] // Ahead of the UI: the pull request features to come use it.
 pub trait Forge: Send + Sync {
     fn kind(&self) -> ForgeKind;
@@ -492,8 +515,13 @@ pub trait Forge: Send + Sync {
     fn checks(&self, _repo: &RepoKey, _target: &CheckTarget) -> ForgeResult<Vec<Check>> {
         Err(ForgeError::NotYet("list checks"))
     }
-    fn create_pr(&self, _repo: &RepoKey, _pr: &NewPr) -> ForgeResult<PullRequest> {
+    /// Open a pull request; `me` is its author (the signed-in user).
+    fn create_pr(&self, _repo: &RepoKey, _pr: &NewPr, _me: &str) -> ForgeResult<PullRequest> {
         Err(ForgeError::NotYet("create pull requests"))
+    }
+    /// The people and labels a new pull request can name.
+    fn pr_meta(&self, _repo: &RepoKey) -> ForgeResult<PrMeta> {
+        Err(ForgeError::NotYet("list reviewers and labels"))
     }
     fn merge(&self, _repo: &RepoKey, _number: u64, _method: MergeMethod) -> ForgeResult<()> {
         Err(ForgeError::NotYet("merge pull requests"))
@@ -512,9 +540,6 @@ pub trait Forge: Send + Sync {
     }
     fn rerun_failed_checks(&self, _repo: &RepoKey, _number: u64) -> ForgeResult<()> {
         Err(ForgeError::NotYet("rerun checks"))
-    }
-    fn pr_templates(&self, _repo: &RepoKey) -> ForgeResult<Vec<PrTemplate>> {
-        Err(ForgeError::NotYet("read pull request templates"))
     }
 }
 
@@ -559,6 +584,53 @@ pub fn run_json<T: serde::de::DeserializeOwned>(cli: &dyn Cli, kind: ForgeKind, 
         return serde_json::from_slice(&out.stdout).map_err(|e| ForgeError::Other(format!("{} printed something Headway can't read: {e}", kind.tool().program())));
     }
     Err(classify_failure(kind, host, &out))
+}
+
+/// Run a CLI call that changes something on the forge; returns what it printed.
+pub fn run_write(cli: &dyn Cli, kind: ForgeKind, host: &str, dir: Option<&Path>, args: &[&str]) -> ForgeResult<String> {
+    let out = cli.run(kind.tool(), dir, args, true).map_err(|e| io_error(kind, &e))?;
+    if out.code == Some(0) {
+        return Ok(String::from_utf8_lossy(&out.stdout).into_owned());
+    }
+    Err(classify_failure(kind, host, &out))
+}
+
+/// The number at the end of a pull request's address in what `gh pr create` or
+/// `glab mr create` printed (".../pull/124", ".../-/merge_requests/12").
+pub fn created_url(out: &str, kind: ForgeKind) -> Option<(String, u64)> {
+    let marker = match kind {
+        ForgeKind::GitHub => "/pull/",
+        ForgeKind::GitLab => "/merge_requests/",
+    };
+    out.split_whitespace().filter(|w| w.starts_with("http")).find_map(|w| {
+        let (_, rest) = w.rsplit_once(marker)?;
+        let n: u64 = rest.trim_end_matches('/').parse().ok()?;
+        Some((w.trim_end_matches('/').to_string(), n))
+    })
+}
+
+/// The pull request just opened, as far as Headway can tell without asking again.
+pub fn created_pr(new: &NewPr, me: &str, url: String, number: u64, now: i64) -> PullRequest {
+    PullRequest {
+        number,
+        title: new.title.clone(),
+        state: if new.draft { PrState::Draft } else { PrState::Open },
+        author: me.to_string(),
+        head_branch: new.head.clone(),
+        base_branch: new.base.clone(),
+        head_repo: new.head_repo.clone(),
+        url,
+        review: ReviewDecision::None,
+        requested_reviewers: new.reviewers.clone(),
+        checks: CheckSummary::default(),
+        mergeable: Mergeable::Unknown,
+        updated: now,
+        head_oid: None,
+    }
+}
+
+pub fn now_secs() -> i64 {
+    std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map_or(0, |d| d.as_secs() as i64)
 }
 
 fn io_error(kind: ForgeKind, e: &std::io::Error) -> ForgeError {
@@ -890,10 +962,16 @@ mod tests {
         assert_eq!(fork.key(), RepoKey { host: "github.com".into(), path: "cnu/headway".into() });
 
         let plain = pick_remotes(&pairs(&[("origin", "https://github.com/cnu/headway.git"), ("backup", "/mnt/backup/headway.git")])).unwrap();
-        assert_eq!((plain.pr_remote.as_str(), plain.push), ("origin", None));
+        assert_eq!((plain.pr_remote.as_str(), &plain.push), ("origin", &None));
 
         let only = pick_remotes(&pairs(&[("hub", "git@gitlab.com:grp/app.git")])).unwrap();
         assert_eq!(only.pr_remote, "hub");
+
+        // A new pull request: pushed to the fork, opened against upstream.
+        assert_eq!(fork.head_target(), ("origin", Some("ana/headway")));
+        assert_eq!(plain.head_target(), ("origin", None));
+        let same = pick_remotes(&pairs(&[("origin", "git@github.com:cnu/headway.git"), ("upstream", "https://github.com/cnu/headway")])).unwrap();
+        assert_eq!(same.head_target(), ("upstream", None), "two names for one project aren't a fork");
 
         // Two remotes, neither called upstream or origin: no way to tell.
         assert_eq!(pick_remotes(&pairs(&[("a", "git@github.com:x/y.git"), ("b", "git@github.com:z/y.git")])), None);
@@ -978,6 +1056,18 @@ mod tests {
         let sign_in = StatusLine::SignIn { kind: ForgeKind::GitLab, host: "git.corp".into() };
         assert_eq!(sign_in.text(), "Run glab auth login --hostname git.corp in a terminal to see merge requests");
         assert_eq!(sign_in.command().as_deref(), Some("glab auth login --hostname git.corp"));
+    }
+
+    #[test]
+    fn created_pull_requests_are_read_from_what_the_cli_printed() {
+        let gh = "Creating pull request for ana:fix-login into main in cnu/headway\n\nhttps://github.com/cnu/headway/pull/124\n";
+        assert_eq!(created_url(gh, ForgeKind::GitHub), Some(("https://github.com/cnu/headway/pull/124".into(), 124)));
+        let glab = "!12 Fix login (fix-login)\n https://gitlab.example.org/group/sub/app/-/merge_requests/12\n";
+        assert_eq!(created_url(glab, ForgeKind::GitLab).map(|u| u.1), Some(12));
+        assert_eq!(created_url("Warning: 3 uncommitted changes", ForgeKind::GitHub), None);
+        let new = NewPr { head: "fix-login".into(), base: "main".into(), title: "Fix login".into(), draft: true, reviewers: vec!["sam".into()], ..Default::default() };
+        let pr = created_pr(&new, "ana", "u".into(), 124, 10);
+        assert_eq!((pr.number, pr.state, pr.author.as_str(), pr.head_branch.as_str(), pr.requested_reviewers.len()), (124, PrState::Draft, "ana", "fix-login", 1));
     }
 
     #[test]

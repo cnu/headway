@@ -53,6 +53,59 @@ impl Forge for GitLab {
         let reply: ListsReply = self.json(&["api", "graphql", "-f", &q, "-f", &path, "-f", &me])?;
         parse_lists(reply)
     }
+
+    fn create_pr(&self, repo: &RepoKey, pr: &NewPr, me: &str) -> ForgeResult<PullRequest> {
+        let args = create_args(repo, pr);
+        let args: Vec<&str> = args.iter().map(String::as_str).collect();
+        let out = run_write(self.cli.as_ref(), ForgeKind::GitLab, &self.host, self.dir.as_deref(), &args)?;
+        let (url, number) = created_url(&out, ForgeKind::GitLab).ok_or_else(|| ForgeError::Other("glab didn't say which merge request it opened".into()))?;
+        Ok(created_pr(pr, me, url, number, now_secs()))
+    }
+
+    fn pr_meta(&self, repo: &RepoKey) -> ForgeResult<PrMeta> {
+        #[derive(Deserialize)]
+        struct Member {
+            username: String,
+        }
+        #[derive(Deserialize)]
+        struct Label {
+            name: String,
+        }
+        let project = encode_path(&repo.path);
+        let members: Vec<Member> = self.json(&["api", &format!("projects/{project}/members/all?per_page=100")])?;
+        let labels: Vec<Label> = self.json(&["api", &format!("projects/{project}/labels?per_page=100")])?;
+        let mut users: Vec<String> = members.into_iter().map(|m| m.username).collect();
+        users.sort_by_key(|u| u.to_lowercase());
+        users.dedup();
+        let mut labels: Vec<String> = labels.into_iter().map(|l| l.name).collect();
+        labels.sort_by_key(|l| l.to_lowercase());
+        Ok(PrMeta { users, labels })
+    }
+}
+
+/// `glab mr create` for `pr`, never asking anything. Values are written
+/// `--flag=value`; lists are comma-separated, as glab takes them.
+pub fn create_args(repo: &RepoKey, pr: &NewPr) -> Vec<String> {
+    let mut a: Vec<String> = ["mr", "create", "--yes"].map(String::from).to_vec();
+    a.push(format!("--repo=https://{}/{}", repo.host, repo.path));
+    if let Some(fork) = &pr.head_repo {
+        a.push(format!("--head={fork}"));
+    }
+    a.push(format!("--source-branch={}", pr.head));
+    a.push(format!("--target-branch={}", pr.base));
+    a.push(format!("--title={}", pr.title));
+    a.push(format!("--description={}", pr.body));
+    for (flag, on) in [("--draft", pr.draft), ("--remove-source-branch", pr.remove_source_branch), ("--squash-before-merge", pr.squash)] {
+        if on {
+            a.push(flag.into());
+        }
+    }
+    for (flag, names) in [("reviewer", &pr.reviewers), ("assignee", &pr.assignees), ("label", &pr.labels)] {
+        if !names.is_empty() {
+            a.push(format!("--{flag}={}", names.join(",")));
+        }
+    }
+    a
 }
 
 /// A project path for the REST API: `group/sub/repo` → `group%2Fsub%2Frepo`.
@@ -390,6 +443,53 @@ mod tests {
         assert_eq!(info.web_url, "https://gitlab.example.org/group/sub/shop");
         assert_eq!(f.whoami().unwrap(), "tanuki-user");
         assert_eq!(encode_path("a b/c.d"), "a%20b%2Fc.d");
+    }
+
+    #[test]
+    fn creating_a_merge_request_with_gitlab_options() {
+        let new = NewPr {
+            head: "fix/rounding".into(),
+            head_repo: Some("contributor-2/shop".into()),
+            base: "main".into(),
+            title: "Round totals".into(),
+            body: "Closes #3".into(),
+            reviewers: vec!["reviewer-1".into(), "reviewer-2".into()],
+            labels: vec!["bug".into()],
+            remove_source_branch: true,
+            squash: true,
+            ..Default::default()
+        };
+        let printed = "\nCreating merge request for fix/rounding into main in group/sub/shop\n\n!57 Round totals (fix/rounding)\n https://gitlab.example.org/group/sub/shop/-/merge_requests/57\n";
+        let cli = Arc::new(StubCli::default().on(Tool::Glab, &["mr", "create"], Answer::Ok(printed)));
+        let pr = forge(cli.clone()).create_pr(&RepoKey { host: "gitlab.example.org".into(), path: "group/sub/shop".into() }, &new, "tanuki-user").unwrap();
+        assert_eq!((pr.number, pr.state, pr.author.as_str()), (57, PrState::Open, "tanuki-user"));
+        let args = &cli.calls()[0].1;
+        for want in [
+            "--yes",
+            "--repo=https://gitlab.example.org/group/sub/shop",
+            "--head=contributor-2/shop",
+            "--source-branch=fix/rounding",
+            "--target-branch=main",
+            "--description=Closes #3",
+            "--remove-source-branch",
+            "--squash-before-merge",
+            "--reviewer=reviewer-1,reviewer-2",
+            "--label=bug",
+        ] {
+            assert!(args.contains(&want.to_string()), "{want} in {args:?}");
+        }
+        assert!(!args.iter().any(|a| a == "--draft" || a.starts_with("--assignee")));
+    }
+
+    #[test]
+    fn members_and_labels_are_listed() {
+        let cli = Arc::new(
+            StubCli::default()
+                .on(Tool::Glab, &["api", "projects/group%2Fshop/members/all?per_page=100"], Answer::Ok(r#"[{"username":"zed"},{"username":"amy"}]"#))
+                .on(Tool::Glab, &["api", "projects/group%2Fshop/labels?per_page=100"], Answer::Ok(r#"[{"name":"UX"},{"name":"bug"}]"#)),
+        );
+        let meta = forge(cli).pr_meta(&RepoKey { host: "gitlab.example.org".into(), path: "group/shop".into() }).unwrap();
+        assert_eq!((meta.users, meta.labels), (vec!["amy".to_string(), "zed".into()], vec!["bug".to_string(), "UX".into()]));
     }
 
     #[test]

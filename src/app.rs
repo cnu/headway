@@ -8,7 +8,7 @@ use crate::workspace::{Config, Workspace};
 use crate::fileview::{self, FileView, Mode};
 use crate::resolver::Resolver;
 use crate::forge::{self, cache::Reason};
-use crate::{cmdlog, diffmodel, highlight, overview, preview, views};
+use crate::{cmdlog, diffmodel, highlight, newpr, overview, preview, views};
 use egui::{Align, Color32, CornerRadius, Id, Layout, Margin, RichText, Sense, Stroke, Ui};
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
@@ -146,6 +146,8 @@ pub struct PrSection {
     pub web_url: Option<String>,
     /// The last refresh failed (the lists are older).
     pub error: Option<String>,
+    /// The project's default branch, once known (new pull requests go there).
+    pub default_branch: Option<String>,
 }
 
 /// The filter tabs of the pull request section.
@@ -788,6 +790,11 @@ enum Msg {
     Cloned(u64, Result<PathBuf, String>),
     /// A GitHub or GitLab refresh finished.
     Forge(forge::cache::JobResult),
+    /// The comparison for the "Create pull request" dialog (`base`: what it was
+    /// worked out against, when the dialog didn't know yet).
+    PrPrep { repo: PathBuf, generation: u64, base: String, result: Result<git::PrPrep, String> },
+    /// The people and labels a new pull request can name.
+    PrMeta { key: forge::RepoKey, result: Result<forge::PrMeta, String> },
 }
 
 #[derive(Clone, Copy, PartialEq)]
@@ -863,6 +870,12 @@ pub enum Action {
     Pr { repo: PathBuf, number: u64, what: PrAction },
     /// Stop marking a pull request's commits in the history.
     ClearPrHighlight,
+    /// Open the "Create pull request" dialog for a branch (`None`: the current one).
+    NewPr { repo: PathBuf, branch: Option<String> },
+    /// The dialog's base changed: compare again.
+    PrPrepare,
+    /// Push (if needed) and create the pull request the dialog describes.
+    SubmitPr,
     /// How diffs are shown changed: show the open ones that way, reading them
     /// again (`reload`) when what they contain changes.
     DiffPrefsChanged { reload: bool },
@@ -930,6 +943,8 @@ pub enum FollowUp {
     Open(PathBuf),
     /// This folder was deleted: remove it from workspaces and tabs.
     Forget(PathBuf),
+    /// A pull request was created (the action puts it in `slot`).
+    PrCreated { key: forge::RepoKey, slot: Arc<Mutex<Option<forge::PullRequest>>> },
 }
 
 pub enum Dialog {
@@ -956,6 +971,7 @@ pub enum Dialog {
         path_edited: bool,
     },
     Confirm { title: String, body: String, button: String, danger: bool, then: Option<Box<Action>> },
+    CreatePr(Box<newpr::PrDraft>),
     /// Find a file or folder by name, to blame it or see its history.
     FindFile {
         repo: PathBuf,
@@ -975,6 +991,14 @@ struct Toast {
     until: f64,
     /// Offers Undo for this repository's operation log entry.
     undo: Option<(PathBuf, u64)>,
+    button: Option<ToastButton>,
+}
+
+/// A button on a notification, besides Undo.
+enum ToastButton {
+    OpenUrl { label: &'static str, url: String },
+    /// "Create pull request" for a branch just pushed.
+    NewPr { label: String, repo: PathBuf, branch: String },
 }
 
 struct Shot {
@@ -1017,8 +1041,11 @@ pub struct HeadwayApp {
     forge_cache: forge::cache::ForgeCache,
     /// What each repository needs to ask its forge, from its last load.
     forge_repos: HashMap<PathBuf, ForgeRepo>,
-    /// Tabs just opened, refreshed once their first load is in.
-    forge_opened: std::collections::HashSet<PathBuf>,
+    /// Tabs to refresh once their next load is in (just opened, or a pull
+    /// request was created and the branches need reading first), and why.
+    forge_after_load: HashMap<PathBuf, Reason>,
+    /// The people and labels each project's new pull requests can name.
+    pr_meta: HashMap<forge::RepoKey, Arc<forge::PrMeta>>,
     /// When the poll timer last looked (seconds of app time).
     forge_polled: f64,
 }
@@ -1056,7 +1083,8 @@ impl HeadwayApp {
             forges: if cfg!(test) { Arc::new(forge::NoForges) } else { forge::default_forges() },
             forge_cache: Default::default(),
             forge_repos: HashMap::new(),
-            forge_opened: Default::default(),
+            forge_after_load: HashMap::new(),
+            pr_meta: HashMap::new(),
             forge_polled: f64::NEG_INFINITY,
             shot: screenshot.map(|path| Shot {
                 path,
@@ -1127,7 +1155,7 @@ impl HeadwayApp {
     fn ensure_tab(&mut self, path: &Path) {
         if !self.tabs.contains_key(path) {
             self.tabs.insert(path.to_path_buf(), RepoView::new(path.to_path_buf()));
-            self.forge_opened.insert(path.to_path_buf());
+            self.forge_after_load.insert(path.to_path_buf(), Reason::Opened);
             self.reload_repo(path);
         }
     }
@@ -1488,9 +1516,18 @@ impl HeadwayApp {
 
     fn toast(&mut self, text: impl Into<String>, error: bool) {
         let now = self.ctx.input(|i| i.time);
-        self.toasts.push(Toast { text: text.into(), error, until: now + if error { 8.0 } else { 3.5 }, undo: None });
+        self.toasts.push(Toast { text: text.into(), error, until: now + if error { 8.0 } else { 3.5 }, undo: None, button: None });
         if self.toasts.len() > 4 {
             self.toasts.remove(0);
+        }
+    }
+
+    /// A notification with a button (shown a little longer, to give time to click it).
+    fn toast_button(&mut self, text: impl Into<String>, button: ToastButton) {
+        self.toast(text, false);
+        if let Some(t) = self.toasts.last_mut() {
+            t.until += 4.5;
+            t.button = Some(button);
         }
     }
 
@@ -1618,6 +1655,7 @@ impl HeadwayApp {
             as_of: entry.map_or(0, |e| e.lists_at),
             web_url: entry.and_then(|e| e.info.as_ref()).map(|i| i.web_url.clone()),
             error: entry.and_then(|e| e.error.as_ref()).map(|e| e.to_string()),
+            default_branch: entry.and_then(|e| e.info.as_ref()).map(|i| i.default_branch.clone()),
         })
     }
 
@@ -1685,6 +1723,112 @@ impl HeadwayApp {
                 });
             }
         }
+    }
+
+    // -----------------------------------------------------------------------
+    // Creating pull requests
+
+    /// The signed-in forge of a repository: which one, and as whom.
+    fn signed_in_forge(&self, path: &Path) -> Option<(forge::ForgeKind, String)> {
+        let r = self.forge_repos.get(path)?;
+        let host = self.forge_cache.host(&r.remotes.pr_url.host)?;
+        match (&host.kind, &host.connection) {
+            (Some(k), forge::cache::Connection::SignedIn(me)) => Some((*k, me.clone())),
+            _ => None,
+        }
+    }
+
+    /// The open (or draft) pull request a branch has already.
+    fn open_pr_of(&self, path: &Path, branch: &str) -> Option<forge::PullRequest> {
+        self.pr_statuses(path).remove(branch).map(|s| s.pr).filter(|p| matches!(p.state, forge::PrState::Open | forge::PrState::Draft))
+    }
+
+    /// Whether to offer "Create pull request" for a branch that was just pushed:
+    /// the forge is signed in, it isn't the default branch, and it has no open one.
+    fn offer_new_pr(&self, path: &Path, branch: &str) -> bool {
+        let Some(r) = self.forge_repos.get(path) else { return false };
+        let default = self.forge_cache.repo(&r.remotes.key()).and_then(|e| e.info.as_ref()).map(|i| i.default_branch.clone());
+        self.signed_in_forge(path).is_some() && default.as_deref() != Some(branch) && self.open_pr_of(path, branch).is_none()
+    }
+
+    fn open_new_pr(&mut self, repo: PathBuf, branch: Option<String>) {
+        let Some(branch) = branch.or_else(|| self.tabs.get(&repo).and_then(|rv| rv.head_branch().map(String::from))) else {
+            self.toast("Switch to a branch first: a pull request comes from a branch", true);
+            return;
+        };
+        let Some((kind, me)) = self.signed_in_forge(&repo) else {
+            let why = self.forge_line(&repo).map(|l| l.text()).unwrap_or_else(|| "This repository has no remote on GitHub or GitLab that Headway can reach".into());
+            self.toast(why, true);
+            return;
+        };
+        if let Some(pr) = self.open_pr_of(&repo, &branch) {
+            self.toast_button(format!("{branch} already has #{}", pr.number), ToastButton::OpenUrl { label: "Open in browser", url: pr.url });
+            return;
+        }
+        let r = &self.forge_repos[&repo];
+        let key = r.remotes.key();
+        let (push_remote, head_repo) = r.remotes.head_target();
+        let base = self.forge_cache.repo(&key).and_then(|e| e.info.as_ref()).map(|i| i.default_branch.clone()).unwrap_or_default();
+        let mut d = newpr::PrDraft::new(repo.clone(), kind, key.clone(), me, branch, r.remotes.pr_remote.clone(), push_remote.to_string(), head_repo.map(String::from), base);
+        match self.pr_meta.get(&key) {
+            Some(m) => d.meta = Some(Ok(m.clone())),
+            None => {
+                let f = self.forges.forge(kind, &key.host, Some(&repo));
+                self.spawn(move || {
+                    let _name = cmdlog::named("list reviewers and labels");
+                    let result = f.pr_meta(&key).map_err(|e| e.to_string());
+                    Msg::PrMeta { key, result }
+                });
+            }
+        }
+        self.dialog = Some(Dialog::CreatePr(Box::new(d)));
+        self.pr_prepare();
+    }
+
+    /// Compare the dialog's branch with its base again, on a worker.
+    fn pr_prepare(&mut self) {
+        self.next_id += 1;
+        let generation = self.next_id;
+        let Some(Dialog::CreatePr(d)) = &mut self.dialog else { return };
+        d.generation = generation;
+        d.prep = None;
+        let (repo, branch, base_remote, base, push_remote) = (d.repo.clone(), d.branch.clone(), d.base_remote.clone(), d.base.clone(), d.push_remote.clone());
+        let gitlab = d.kind == forge::ForgeKind::GitLab;
+        self.spawn(move || {
+            let _name = cmdlog::named("compare for a pull request");
+            let base = if base.is_empty() { git::remote_default_branch(&repo, &base_remote) } else { base };
+            let result = git::prepare_pr(&repo, &branch, &base_remote, &base, &push_remote, gitlab);
+            Msg::PrPrep { repo, generation, base, result }
+        });
+    }
+
+    /// Push the dialog's branch if needed, then create its pull request: one
+    /// action in the command log (it can't be undone).
+    fn submit_pr(&mut self) {
+        let Some(Dialog::CreatePr(d)) = &mut self.dialog else { return };
+        let (Some(new), Some(Ok(prep))) = (d.new_pr(), &d.prep) else { return };
+        if d.creating {
+            return;
+        }
+        d.creating = true;
+        d.error = None;
+        let push = prep.push.clone();
+        let f = self.forges.forge(d.kind, &d.key.host, Some(&d.repo));
+        let (repo, key, me) = (d.repo.clone(), d.key.clone(), d.me.clone());
+        let label = format!("Create {}", d.noun());
+        let slot = Arc::new(Mutex::new(None));
+        let (k2, s2) = (key.clone(), slot.clone());
+        let op: GitFn = Box::new(move |p| {
+            if let Some(push) = &push {
+                git::push_for_pr(p, push).map_err(|e| format!("Couldn't push {} to {}, so nothing was created.\n{e}", push.branch, push.remote))?;
+            }
+            let pr = f.create_pr(&k2, &new, &me).map_err(|e| e.to_string())?;
+            let out = format!("Created #{} {}", pr.number, pr.url);
+            *s2.lock().unwrap() = Some(pr);
+            Ok(out)
+        });
+        let id = self.run_git(repo, label, op, OpKind::Quiet, None);
+        self.followups.insert(id, FollowUp::PrCreated { key, slot });
     }
 
     /// Select a commit in the history and scroll to it (clearing the search).
@@ -1791,7 +1935,7 @@ impl HeadwayApp {
                                     }
                                     rv.wd_doc = Some(doc);
                                 }
-                                Err(e) => self.toasts.push(Toast { text: format!("Couldn't read the changes\n{e}"), error: true, until: self.ctx.input(|i| i.time) + 8.0, undo: None }),
+                                Err(e) => self.toasts.push(Toast { text: format!("Couldn't read the changes\n{e}"), error: true, until: self.ctx.input(|i| i.time) + 8.0, undo: None, button: None }),
                             }
                             rv.line_sel = LineSel::default();
                         }
@@ -1894,11 +2038,23 @@ impl HeadwayApp {
                 Msg::OpDone { id, repo, label, result, kind, undo } => {
                     self.busy.retain(|b| b.0 != id);
                     let follow = self.followups.remove(&id);
+                    let mut after = None;
                     match result {
                         Ok(out) => {
                             match follow {
                                 Some(FollowUp::Open(p)) => self.add_repo(p, true),
                                 Some(FollowUp::Forget(p)) => self.forget_repo(&p),
+                                Some(FollowUp::PrCreated { key, slot }) => {
+                                    if let Some(pr) = slot.lock().unwrap().take() {
+                                        self.forge_cache.add_created(&key, &pr, std::time::Instant::now(), forge::now_secs());
+                                        if matches!(&self.dialog, Some(Dialog::CreatePr(d)) if d.repo == repo) {
+                                            self.dialog = None;
+                                        }
+                                        self.toast_button(format!("Created #{}", pr.number), ToastButton::OpenUrl { label: "Open in browser", url: pr.url });
+                                    }
+                                    // Ask again once the branches are read (it may have been pushed just now).
+                                    after = Some(Reason::AfterPrAction);
+                                }
                                 None => {}
                             }
                             if kind == OpKind::Commit {
@@ -1929,16 +2085,59 @@ impl HeadwayApp {
                                     Some(entry) => self.toast_undo(msg, repo.clone(), entry),
                                     None => self.toast(msg, false),
                                 }
+                                // A branch just pushed, with no pull request yet: offer one.
+                                if let Some(branch) = pushed_branch(&label, self.tabs.get(&repo).and_then(|rv| rv.head_branch()))
+                                    && self.offer_new_pr(&repo, &branch)
+                                {
+                                    let noun = if self.signed_in_forge(&repo).is_some_and(|f| f.0 == forge::ForgeKind::GitLab) { "merge request" } else { "pull request" };
+                                    if let Some(t) = self.toasts.last_mut() {
+                                        t.until += 4.5;
+                                        t.button = Some(ToastButton::NewPr { label: format!("Create {noun}"), repo: repo.clone(), branch });
+                                    }
+                                }
                             }
                         }
-                        Err(e) => self.toast(failure_text(&label, kind, &e), true),
+                        Err(e) => match (&follow, &mut self.dialog) {
+                            // The dialog is still open: say it there, where the work is.
+                            (Some(FollowUp::PrCreated { .. }), Some(Dialog::CreatePr(d))) if d.repo == repo => {
+                                d.creating = false;
+                                d.error = Some(e);
+                            }
+                            _ => self.toast(failure_text(&label, kind, &e), true),
+                        },
+                    }
+                    if let Some(reason) = after {
+                        self.forge_after_load.insert(repo.clone(), reason);
                     }
                     if self.tabs.contains_key(&repo) {
                         self.reload_repo(&repo);
+                    } else if let Some(reason) = self.forge_after_load.remove(&repo) {
+                        self.forge_refresh(&repo, reason);
                     }
                     self.reload_summary(&repo);
                     if touches_remote(&label) {
                         self.forge_refresh(&repo, Reason::AfterGit);
+                    }
+                }
+                Msg::PrPrep { repo, generation, base, result } => {
+                    if let Some(Dialog::CreatePr(d)) = &mut self.dialog
+                        && d.repo == repo
+                    {
+                        if d.base.is_empty() && d.generation == generation {
+                            d.base = base;
+                        }
+                        d.prepared(generation, result);
+                    }
+                }
+                Msg::PrMeta { key, result } => {
+                    let result = result.map(Arc::new);
+                    if let Ok(m) = &result {
+                        self.pr_meta.insert(key.clone(), m.clone());
+                    }
+                    if let Some(Dialog::CreatePr(d)) = &mut self.dialog
+                        && d.key == key
+                    {
+                        d.meta = Some(result);
                     }
                 }
                 Msg::PrCommits { repo, number, result } => match result {
@@ -2072,8 +2271,8 @@ impl HeadwayApp {
         let loaded = self.tabs.get(&path).and_then(|rv| rv.data.as_ref()).map(|d| (d.remote_urls.clone(), d.branches.clone()));
         if let Some((urls, branches)) = loaded {
             self.forge_learn(&path, &urls, &branches);
-            if self.forge_opened.remove(&path) {
-                self.forge_refresh(&path, Reason::Opened);
+            if let Some(reason) = self.forge_after_load.remove(&path) {
+                self.forge_refresh(&path, reason);
             }
         }
     }
@@ -2115,6 +2314,9 @@ impl HeadwayApp {
                 }
             }
             Action::Pr { repo, number, what } => self.pr_action(repo, number, what),
+            Action::NewPr { repo, branch } => self.open_new_pr(repo, branch),
+            Action::PrPrepare => self.pr_prepare(),
+            Action::SubmitPr => self.submit_pr(),
             Action::ClearPrHighlight => {
                 if let Some(rv) = active.and_then(|p| self.tabs.get_mut(&p)) {
                     rv.pr_highlight = None;
@@ -2622,10 +2824,21 @@ impl HeadwayApp {
                                         dismiss = Some(i);
                                     }
                                 }
+                                match &t.button {
+                                    Some(ToastButton::OpenUrl { label, url }) if ui.button(*label).clicked() => {
+                                        ui.ctx().open_url(egui::OpenUrl::new_tab(url));
+                                        dismiss = Some(i);
+                                    }
+                                    Some(ToastButton::NewPr { label, repo, branch }) if ui.button(label).clicked() => {
+                                        actions.push(Action::NewPr { repo: repo.clone(), branch: Some(branch.clone()) });
+                                        dismiss = Some(i);
+                                    }
+                                    _ => {}
+                                }
                             });
                         });
                     // Click to dismiss (not when there's a button: the click would go here instead).
-                    if t.undo.is_none() && r.response.interact(Sense::click()).clicked() {
+                    if t.undo.is_none() && t.button.is_none() && r.response.interact(Sense::click()).clicked() {
                         dismiss = Some(i);
                     }
                     ui.add_space(6.0);
@@ -3035,6 +3248,12 @@ impl HeadwayApp {
                         keep = false;
                     }
                 }
+                Dialog::CreatePr(d) => match newpr::ui(ui, d) {
+                    newpr::Outcome::Keep => {}
+                    newpr::Outcome::Close => keep = false,
+                    newpr::Outcome::BaseChanged => actions.push(Action::PrPrepare),
+                    newpr::Outcome::Create => actions.push(Action::SubmitPr),
+                },
                 Dialog::Confirm { title, body, button, danger, then } => {
                     ui.heading(title.as_str());
                     ui.add_space(4.0);
@@ -3334,6 +3553,16 @@ fn first_file(st: &Status) -> Option<FileSel> {
 
 /// Turn common git errors into plain language.
 /// The message shown when a git action fails (the command log keeps the same text).
+/// The branch a push action sent (by its name: "Push" is the current branch,
+/// "Publish fix-login" a new one). Not tags.
+fn pushed_branch(label: &str, current: Option<&str>) -> Option<String> {
+    match label.split_once(' ') {
+        None if label == "Push" => current.map(String::from),
+        Some(("Publish", b)) => Some(b.to_string()),
+        _ => None,
+    }
+}
+
 /// A fetch, pull or push (by the action's name: "Fetch", "Pull web-shop", "Push tag v1"),
 /// after which the forge may know something new.
 fn touches_remote(label: &str) -> bool {

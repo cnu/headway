@@ -103,6 +103,63 @@ impl Forge for GitHub {
         let data: ListsData = self.graphql(&lists_query(limit), &vars)?;
         parse_lists(data)
     }
+
+    fn create_pr(&self, repo: &RepoKey, pr: &NewPr, me: &str) -> ForgeResult<PullRequest> {
+        let args = create_args(repo, pr);
+        let args: Vec<&str> = args.iter().map(String::as_str).collect();
+        let out = run_write(self.cli.as_ref(), ForgeKind::GitHub, &self.host, self.dir.as_deref(), &args)?;
+        let (url, number) = created_url(&out, ForgeKind::GitHub).ok_or_else(|| ForgeError::Other("gh didn't say which pull request it opened".into()))?;
+        Ok(created_pr(pr, me, url, number, now_secs()))
+    }
+
+    fn pr_meta(&self, repo: &RepoKey) -> ForgeResult<PrMeta> {
+        let q = "query($owner: String!, $name: String!) { repository(owner: $owner, name: $name) { assignableUsers(first: 100) { nodes { login } } labels(first: 100, orderBy: {field: NAME, direction: ASC}) { nodes { name } } } }";
+        let url = RemoteUrl { host: repo.host.clone(), path: repo.path.clone() };
+        let data: MetaData = self.graphql(q, &[("owner".into(), url.owner()), ("name".into(), url.name())])?;
+        parse_meta(data)
+    }
+}
+
+/// `gh pr create` for `pr`. Every value is written `--flag=value`, so a title
+/// starting with "-" stays a title.
+pub fn create_args(repo: &RepoKey, pr: &NewPr) -> Vec<String> {
+    let head = match &pr.head_repo {
+        Some(fork) => format!("{}:{}", fork.split('/').next().unwrap_or(fork), pr.head),
+        None => pr.head.clone(),
+    };
+    let mut a: Vec<String> = ["pr", "create"].map(String::from).to_vec();
+    a.push(format!("--repo={}/{}", repo.host, repo.path));
+    a.push(format!("--head={head}"));
+    a.push(format!("--base={}", pr.base));
+    a.push(format!("--title={}", pr.title));
+    a.push(format!("--body={}", pr.body));
+    if pr.draft {
+        a.push("--draft".into());
+    }
+    for (flag, names) in [("reviewer", &pr.reviewers), ("assignee", &pr.assignees), ("label", &pr.labels)] {
+        a.extend(names.iter().map(|n| format!("--{flag}={n}")));
+    }
+    a
+}
+
+#[derive(Deserialize)]
+pub struct MetaData {
+    repository: Option<MetaRepo>,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct MetaRepo {
+    assignable_users: Connection<Login>,
+    labels: Option<Connection<Name>>,
+}
+
+pub fn parse_meta(data: MetaData) -> ForgeResult<PrMeta> {
+    let r = data.repository.ok_or(ForgeError::NotFound)?;
+    let mut users: Vec<String> = r.assignable_users.nodes.into_iter().flatten().map(|u| u.login).collect();
+    users.sort_by_key(|u| u.to_lowercase());
+    let labels = r.labels.map(|l| l.nodes.into_iter().flatten().map(|n| n.name).collect()).unwrap_or_default();
+    Ok(PrMeta { users, labels })
 }
 
 /// Everything the app reads about a pull request.
@@ -486,6 +543,49 @@ mod tests {
         let cli = Arc::new(StubCli::default().on(Tool::Gh, &[], Answer::Fail(1, "gh: API rate limit exceeded for user ID 1. (HTTP 403)")));
         let forge = GitHub { cli, host: "github.com".into(), dir: None };
         assert_eq!(forge.prs_for_branches(&key(), &["x".into()]).unwrap_err(), ForgeError::RateLimited { until: None });
+    }
+
+    #[test]
+    fn creating_names_the_project_the_fork_and_every_option() {
+        let new = NewPr {
+            head: "fix-login".into(),
+            head_repo: Some("ana/headway".into()),
+            base: "main".into(),
+            title: "-x looks like a flag".into(),
+            body: "Line one\nLine two".into(),
+            draft: true,
+            reviewers: vec!["sam".into(), "jo".into()],
+            assignees: vec!["ana".into()],
+            labels: vec!["bug".into()],
+            ..Default::default()
+        };
+        let printed = "Creating pull request for ana:fix-login into main in cnu/headway\n\nhttps://github.acme.com/cnu/headway/pull/124\n";
+        let cli = Arc::new(StubCli::default().on(Tool::Gh, &["pr", "create"], Answer::Ok(printed)));
+        let forge = GitHub { cli: cli.clone(), host: "github.acme.com".into(), dir: None };
+        let pr = forge.create_pr(&RepoKey { host: "github.acme.com".into(), path: "cnu/headway".into() }, &new, "ana").unwrap();
+        assert_eq!((pr.number, pr.state, pr.url.as_str()), (124, PrState::Draft, "https://github.acme.com/cnu/headway/pull/124"));
+        assert_eq!(pr.head_repo.as_deref(), Some("ana/headway"));
+        let args = &cli.calls()[0].1;
+        for want in ["--repo=github.acme.com/cnu/headway", "--head=ana:fix-login", "--base=main", "--title=-x looks like a flag", "--body=Line one\nLine two", "--draft", "--reviewer=sam", "--reviewer=jo", "--assignee=ana", "--label=bug"] {
+            assert!(args.contains(&want.to_string()), "{want} in {args:?}");
+        }
+        let plain = create_args(&key(), &NewPr { head: "x".into(), base: "trunk".into(), ..Default::default() });
+        assert!(plain.contains(&"--head=x".to_string()) && !plain.contains(&"--draft".to_string()));
+
+        let refused = GitHub { cli: Arc::new(StubCli::default().on(Tool::Gh, &["pr", "create"], Answer::Fail(1, "pull request create failed: GraphQL: No commits between main and x"))), host: "github.com".into(), dir: None };
+        let err = refused.create_pr(&key(), &new, "ana").unwrap_err();
+        assert!(err.to_string().contains("No commits between"), "{err}");
+    }
+
+    #[test]
+    fn reviewers_and_labels_come_in_one_query() {
+        let reply = r#"{"data":{"repository":{"assignableUsers":{"nodes":[{"login":"sam"},{"login":"Ana"},{"login":"jo"}]},"labels":{"nodes":[{"name":"bug"},{"name":"docs"}]}}}}"#;
+        let cli = Arc::new(StubCli::default().on(Tool::Gh, &["api", "graphql"], Answer::Ok(reply)));
+        let forge = GitHub { cli: cli.clone(), host: "github.com".into(), dir: None };
+        let meta = forge.pr_meta(&key()).unwrap();
+        assert_eq!(meta.users, ["Ana", "jo", "sam"]);
+        assert_eq!(meta.labels, ["bug", "docs"]);
+        assert_eq!(cli.calls().len(), 1);
     }
 
     #[test]

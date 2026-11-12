@@ -753,6 +753,13 @@ fn sidebar(
                     if !data.remotes.is_empty() && ui.button("Push").clicked() {
                         actions.push(push_action(&path, Some(&name), b.upstream.is_some(), data.remotes.first()));
                     }
+                    if let Some(sec) = &rv.pr_section
+                        && !pr.is_some_and(|s| matches!(s.pr.state, crate::forge::PrState::Open | crate::forge::PrState::Draft))
+                        && sec.default_branch.as_deref() != Some(name.as_str())
+                        && ui.button(format!("Create {}…", pr_noun(sec.kind))).on_hover_text(format!("Propose merging {name} on {}", sec.kind.name())).clicked()
+                    {
+                        actions.push(Action::NewPr { repo: path.clone(), branch: Some(name.clone()) });
+                    }
                     ui.separator();
                     if ui.button("Copy name").clicked() {
                         actions.push(Action::Copy(name.clone()));
@@ -802,7 +809,12 @@ fn sidebar(
             ui.add_space(4.0);
         }
 
-        pull_requests(ui, &path, &mut rv.pr_tab, &mut rv.pr_selected, &mut rv.pr_keys, rv.pr_section.as_ref(), actions);
+        // A new pull request from the current branch, unless it has one or is where they go.
+        let new_from = data.status.head.branch.clone().filter(|b| {
+            let open = rv.prs.get(b).is_some_and(|s| matches!(s.pr.state, crate::forge::PrState::Open | crate::forge::PrState::Draft));
+            !open && rv.pr_section.as_ref().is_some_and(|s| s.default_branch.as_deref() != Some(b.as_str()))
+        });
+        pull_requests(ui, &path, &mut rv.pr_tab, &mut rv.pr_selected, &mut rv.pr_keys, rv.pr_section.as_ref(), new_from.as_deref(), actions);
 
         let shown: Vec<_> = data.worktrees.iter().filter(|w| !w.bare).collect();
         section(ui, "worktrees", "WORKTREES", shown.len(), shown.len() > 1, |ui| {
@@ -1144,6 +1156,7 @@ pub fn pr_tab_shown(picked: Option<PrTab>, lists: &crate::forge::PrLists) -> PrT
 
 /// The "Pull requests" ("Merge requests") section: filter tabs and a row per
 /// pull request, with a menu each. Not shown at all while the forge can't be used.
+#[allow(clippy::too_many_arguments)]
 fn pull_requests(
     ui: &mut Ui,
     path: &Path,
@@ -1151,6 +1164,7 @@ fn pull_requests(
     selected: &mut Option<u64>,
     keys: &mut bool,
     sec: Option<&crate::app::PrSection>,
+    new_from: Option<&str>,
     actions: &mut Vec<Action>,
 ) {
     *keys = false;
@@ -1160,6 +1174,12 @@ fn pull_requests(
     let count = sec.lists.as_ref().map_or(0, |l| l.open_total);
     // Open or folded per repository.
     section(ui, &format!("prs:{}", path.display()), &title, count, true, |ui| {
+        if let Some(branch) = new_from {
+            let add = side_row(ui, "+", ACCENT, &format!("New {noun}…"), None, false);
+            if add.on_hover_text(format!("Propose merging {branch} on {}", sec.kind.name())).clicked() {
+                actions.push(Action::NewPr { repo: path.to_path_buf(), branch: Some(branch.to_string()) });
+            }
+        }
         let Some(lists) = &sec.lists else {
             let text = match &sec.error {
                 Some(e) => format!("Couldn't load {noun}s: {e}"),

@@ -37,7 +37,6 @@ pub enum Reason {
     /// A fetch, pull or push finished.
     AfterGit,
     /// A pull request was created, merged, closed…
-    #[allow(dead_code)] // The pull request actions to come send it.
     AfterPrAction,
     /// The timer, for repositories on screen.
     Poll,
@@ -316,6 +315,30 @@ impl ForgeCache {
     }
 }
 
+impl ForgeCache {
+    /// A pull request was just opened from Headway: show it at once, before the
+    /// refresh that follows comes back.
+    pub fn add_created(&mut self, key: &RepoKey, pr: &PullRequest, now: Instant, wall_now: i64) {
+        let entry = self.repos.entry(key.clone()).or_default();
+        let list = entry.prs.entry(pr.head_branch.clone()).or_default();
+        list.retain(|p| p.number != pr.number);
+        list.insert(0, pr.clone());
+        if entry.fetched.is_none() {
+            entry.fetched = Some(now);
+            entry.fetched_at = wall_now;
+        }
+        if let Some(lists) = &entry.lists {
+            let mut l = (**lists).clone();
+            if !l.open.iter().any(|p| p.number == pr.number) {
+                l.mine.insert(0, pr.clone());
+                l.open.insert(0, pr.clone());
+                l.open_total += 1;
+            }
+            entry.lists = Some(Arc::new(l));
+        }
+    }
+}
+
 impl Job {
     fn new(key: &RepoKey, dir: &Path, branches: Vec<String>) -> Self {
         Job { key: key.clone(), dir: dir.to_path_buf(), branches, kind: None, detect: false, whoami: false, info: false, lists: false, me: None }
@@ -411,7 +434,7 @@ mod tests {
         data.hosts.insert("github.com".into(), fake::FakeHost { kind: ForgeKind::GitHub, user: Some("alex".into()), installed: true });
         let info = RepoInfo { default_branch: "main".into(), merge_methods: vec![MergeMethod::Merge], web_url: String::new() };
         for p in ["a/one", "a/two", "a/three", "a/four", "a/five", "a/six"] {
-            data.repos.insert(format!("github.com/{p}"), fake::FakeRepo { info: Some(info.clone()), pulls: vec![pr(1, "feature")] });
+            data.repos.insert(format!("github.com/{p}"), fake::FakeRepo { info: Some(info.clone()), pulls: vec![pr(1, "feature")], ..Default::default() });
         }
         fake::FakeForges::new(data)
     }
@@ -549,6 +572,27 @@ mod tests {
         drain(&mut c, &f, t);
         assert_eq!(c.host("code.corp").unwrap().kind, None);
         assert!(!c.request(&k, Path::new("/r"), &branches(), Reason::Opened, t + Duration::from_secs(3600)));
+    }
+
+    #[test]
+    fn a_created_pull_request_shows_at_once_then_is_asked_about() {
+        let f = fake();
+        let mut c = ForgeCache::default();
+        let t = Instant::now();
+        let k = key("github.com", "a/one");
+        c.want_lists(&k, true);
+        assert!(c.request(&k, Path::new("/r"), &branches(), Reason::Opened, t));
+        drain(&mut c, &f, t);
+        let before = c.repo(&k).unwrap().lists.as_ref().unwrap().open_total;
+        let new = NewPr { head: "new-thing".into(), base: "main".into(), title: "New".into(), ..Default::default() };
+        let pr = created_pr(&new, "alex", "u".into(), 99, 5);
+        c.add_created(&k, &pr, t, 5);
+        c.add_created(&k, &pr, t, 5);
+        let e = c.repo(&k).unwrap();
+        assert_eq!(e.prs["new-thing"].len(), 1, "once, however often");
+        let l = e.lists.as_ref().unwrap();
+        assert_eq!((l.open_total, l.mine[0].number, l.open[0].number), (before + 1, 99, 99));
+        assert!(c.request(&k, Path::new("/r"), &branches(), Reason::AfterPrAction, t), "and refreshed straight away");
     }
 
     #[test]

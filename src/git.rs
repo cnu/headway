@@ -1022,6 +1022,257 @@ pub fn pr_commits(repo: &Path, head: &str, base: &str, limit: usize) -> GitResul
     Ok(run(repo, &["rev-list", &n, head, "--not", base, "--"])?.lines().map(String::from).collect())
 }
 
+// ---------------------------------------------------------------------------
+// Opening a pull request
+
+/// A new pull request's title: the commit's subject when the branch adds one
+/// commit, else the branch name in words ("feature/fix-login-timeout" → "Fix
+/// login timeout").
+pub fn pr_title(subjects: &[String], branch: &str) -> String {
+    match subjects {
+        [one] => one.clone(),
+        _ => branch_words(branch),
+    }
+}
+
+/// A branch name as a sentence: its last part, dashes and underscores as spaces,
+/// the first letter capitalised.
+pub fn branch_words(branch: &str) -> String {
+    let leaf = branch.rsplit('/').find(|p| !p.is_empty()).unwrap_or(branch);
+    let words: Vec<&str> = leaf.split(['-', '_']).filter(|w| !w.is_empty()).collect();
+    let text = words.join(" ");
+    let mut chars = text.chars();
+    match chars.next() {
+        Some(c) => c.to_uppercase().chain(chars).collect(),
+        None => branch.to_string(),
+    }
+}
+
+/// A new pull request's description without a template: its commits' subjects
+/// as a list (oldest first).
+pub fn pr_body_from_commits(subjects: &[String]) -> String {
+    subjects.iter().map(|s| format!("- {s}\n")).collect()
+}
+
+/// A pull request (or merge request) description template from the repository.
+#[derive(Clone, Debug, PartialEq)]
+pub struct PrTemplate {
+    /// Where it is in the repository.
+    pub path: String,
+    pub body: String,
+}
+
+impl PrTemplate {
+    /// What to call it in a list: the file name without `.md`.
+    pub fn name(&self) -> &str {
+        let file = self.path.rsplit('/').next().unwrap_or(&self.path);
+        file.strip_suffix(".md").or_else(|| file.strip_suffix(".MD")).unwrap_or(file)
+    }
+}
+
+/// The templates among `paths` (files of the base branch), in the order the
+/// forge would use them. GitHub: `pull_request_template.md` in `.github/`, the
+/// top folder or `docs/` (any case), then every `.md` in
+/// `.github/PULL_REQUEST_TEMPLATE/`. GitLab: every `.md` in
+/// `.gitlab/merge_request_templates/`.
+pub fn template_paths(paths: &[String], gitlab: bool) -> Vec<String> {
+    let lower: Vec<(String, &String)> = paths.iter().map(|p| (p.to_ascii_lowercase(), p)).collect();
+    let in_folder = |folder: &str| {
+        let mut v: Vec<String> =
+            lower.iter().filter(|(l, _)| l.strip_prefix(folder).is_some_and(|f| !f.contains('/') && f.ends_with(".md"))).map(|(_, p)| (*p).clone()).collect();
+        v.sort_by_key(|p| p.to_ascii_lowercase());
+        v
+    };
+    if gitlab {
+        return in_folder(".gitlab/merge_request_templates/");
+    }
+    let mut out: Vec<String> = Vec::new();
+    for single in [".github/pull_request_template.md", "pull_request_template.md", "docs/pull_request_template.md"] {
+        out.extend(lower.iter().filter(|(l, _)| l == single).map(|(_, p)| (*p).clone()));
+    }
+    out.extend(in_folder(".github/pull_request_template/"));
+    out
+}
+
+/// The pull request templates on `rev` (the base branch), read with git (not
+/// from the working copy, which may be on any branch).
+pub fn pr_templates(repo: &Path, rev: &str, gitlab: bool) -> GitResult<Vec<PrTemplate>> {
+    let mut paths: Vec<String> = run(repo, &["ls-tree", "--name-only", rev])?.lines().map(unquote_path).collect();
+    let folders: &[&str] = if gitlab { &[".gitlab"] } else { &[".github", "docs"] };
+    let mut args = vec!["ls-tree", "-r", "--name-only", rev, "--"];
+    args.extend(folders);
+    paths.extend(run(repo, &args)?.lines().map(unquote_path));
+    let mut out = Vec::new();
+    for path in template_paths(&paths, gitlab).into_iter().take(20) {
+        let body = run(repo, &["show", &format!("{rev}:{path}")])?;
+        out.push(PrTemplate { path, body: body.replace("\r\n", "\n") });
+    }
+    Ok(out)
+}
+
+/// Pushing a branch before its pull request is opened.
+#[derive(Clone, Debug, PartialEq)]
+pub struct PrPush {
+    pub remote: String,
+    /// The local branch.
+    pub branch: String,
+    /// Its name on the remote.
+    pub to: String,
+    /// It isn't on the remote yet (pushed with `-u`, which also makes it the upstream).
+    pub new: bool,
+    /// Commits the remote doesn't have yet (when it isn't new).
+    pub ahead: usize,
+}
+
+impl PrPush {
+    /// What happens first, in words.
+    pub fn describe(&self) -> String {
+        if self.new {
+            format!("{} isn't on {} yet. It will be pushed first.", self.branch, self.remote)
+        } else {
+            let n = self.ahead;
+            format!("{} has {n} commit{} that {} on {} yet. {} pushed first.", self.branch, plural(n), if n == 1 { "isn't" } else { "aren't" }, self.remote, if n == 1 { "It will be" } else { "They'll be" })
+        }
+    }
+}
+
+fn plural(n: usize) -> &'static str {
+    if n == 1 { "" } else { "s" }
+}
+
+/// The branch's name on `remote` (where pull requests' branches are pushed), and
+/// what to push first, if anything: nothing when its upstream there has every
+/// commit; the new commits when it's ahead; the whole branch (with `-u`) when it
+/// has no upstream there, or the remote branch is gone.
+pub fn pr_push_plan(repo: &Path, branch: &str, remote: &str) -> GitResult<(String, Option<PrPush>)> {
+    let tracked = branch_upstream(repo, branch).and_then(|(r, merge)| (r == remote).then(|| merge.strip_prefix("refs/heads/").map(String::from)).flatten());
+    if let Some(to) = tracked {
+        let remote_ref = format!("refs/remotes/{remote}/{to}");
+        if run(repo, &["rev-parse", "-q", "--verify", &remote_ref]).is_ok() {
+            let ahead: usize = run(repo, &["rev-list", "--count", &format!("{remote_ref}..refs/heads/{branch}")])?.trim().parse().unwrap_or(0);
+            let plan = (ahead > 0).then(|| PrPush { remote: remote.into(), branch: branch.into(), to: to.clone(), new: false, ahead });
+            return Ok((to, plan));
+        }
+    }
+    Ok((branch.to_string(), Some(PrPush { remote: remote.into(), branch: branch.into(), to: branch.into(), new: true, ahead: 0 })))
+}
+
+/// Push a branch for its pull request. A rejected push is an error with git's own words.
+pub fn push_for_pr(repo: &Path, p: &PrPush) -> GitResult<String> {
+    let spec = format!("refs/heads/{}:refs/heads/{}", p.branch, p.to);
+    let mut args = vec!["push"];
+    if p.new {
+        args.push("-u");
+    }
+    args.extend([p.remote.as_str(), spec.as_str()]);
+    run(repo, &args)
+}
+
+/// git's version as (major, minor), from `git --version`
+/// ("git version 2.39.3 (Apple Git-146)", "git version 2.45.1.windows.1").
+pub fn parse_git_version(text: &str) -> Option<(u32, u32)> {
+    let v = text.split_whitespace().find(|w| w.starts_with(|c: char| c.is_ascii_digit()))?;
+    let mut parts = v.split('.');
+    Some((parts.next()?.parse().ok()?, parts.next()?.parse().ok()?))
+}
+
+/// Whether this git can preview a merge without touching anything
+/// (`merge-tree --write-tree`, git 2.38 and later).
+pub fn can_preview_merges(repo: &Path) -> bool {
+    run(repo, &["--version"]).ok().and_then(|v| parse_git_version(&v)).is_some_and(|v| v >= (2, 38))
+}
+
+/// The conflicted files in what `git merge-tree --write-tree --name-only` printed:
+/// the tree first, then one file per line until a blank line.
+pub fn parse_merge_tree(out: &str) -> Vec<String> {
+    let mut files: Vec<String> = Vec::new();
+    for line in out.lines().skip(1).take_while(|l| !l.is_empty()) {
+        let f = unquote_path(line);
+        if !files.contains(&f) {
+            files.push(f);
+        }
+    }
+    files
+}
+
+/// The files that merging `head` into `base` would conflict in (empty: it merges
+/// cleanly). `None` when it can't be told: git older than 2.38, or it failed.
+pub fn merge_conflicts(repo: &Path, base: &str, head: &str) -> Option<Vec<String>> {
+    if !can_preview_merges(repo) {
+        return None;
+    }
+    let out = exec(repo, &["merge-tree", "--write-tree", "--name-only", "--no-messages", base, head], &[], None).ok()?;
+    match out.status.code() {
+        Some(0) => Some(Vec::new()),
+        Some(1) => Some(parse_merge_tree(&String::from_utf8_lossy(&out.stdout))),
+        _ => None,
+    }
+}
+
+/// The branch a remote's HEAD points at ("main" for `origin/HEAD` → `origin/main`),
+/// else `main` or `master`, whichever the remote has.
+pub fn remote_default_branch(repo: &Path, remote: &str) -> String {
+    let prefix = format!("refs/remotes/{remote}/");
+    if let Some(b) = run(repo, &["symbolic-ref", "-q", &format!("{prefix}HEAD")]).ok().and_then(|r| r.trim().strip_prefix(&prefix).map(String::from)) {
+        return b;
+    }
+    let has = |b: &str| run(repo, &["rev-parse", "-q", "--verify", &format!("{prefix}{b}")]).is_ok();
+    if !has("main") && has("master") { "master".into() } else { "main".into() }
+}
+
+/// What the "Create pull request" dialog shows, worked out on a worker.
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct PrPrep {
+    /// The base's branches on its remote, to pick another from.
+    pub bases: Vec<String>,
+    /// The subjects of the commits the branch adds (oldest first).
+    pub subjects: Vec<String>,
+    pub files: usize,
+    /// The branch's name on the remote it's pushed to.
+    pub head: String,
+    pub push: Option<PrPush>,
+    /// `None`: not checked (git too old, or it failed).
+    pub conflicts: Option<Vec<String>>,
+    pub templates: Vec<PrTemplate>,
+    /// Fetching the base failed (what's compared is what was fetched before).
+    pub fetch_error: Option<String>,
+}
+
+/// Everything about opening a pull request from `branch` into `base` on
+/// `base_remote`, pushed to `push_remote`: fetch the base, then compare.
+pub fn prepare_pr(repo: &Path, branch: &str, base_remote: &str, base: &str, push_remote: &str, gitlab: bool) -> GitResult<PrPrep> {
+    let base_ref = format!("refs/remotes/{base_remote}/{base}");
+    let fetch_error = run(repo, &["fetch", "--no-tags", base_remote, &format!("+refs/heads/{base}:{base_ref}")]).err();
+    if run(repo, &["rev-parse", "-q", "--verify", &format!("{base_ref}^{{commit}}")]).is_err() {
+        return Err(match fetch_error {
+            Some(e) => format!("Couldn't fetch {base} from {base_remote}:\n{e}"),
+            None => format!("{base_remote} has no branch {base}"),
+        });
+    }
+    let prefix = format!("refs/remotes/{base_remote}/");
+    let mut bases: Vec<String> = run(repo, &["for-each-ref", "--format=%(refname)", &prefix])?
+        .lines()
+        .filter_map(|l| l.strip_prefix(&prefix))
+        .filter(|b| *b != "HEAD")
+        .map(String::from)
+        .collect();
+    bases.sort_by_key(|b| (b != base, b.to_lowercase()));
+    let local = format!("refs/heads/{branch}");
+    let subjects = run(repo, &["log", "--reverse", "--format=%s", &format!("{base_ref}..{local}"), "--"])?.lines().map(String::from).collect();
+    let files = run(repo, &["diff", "--name-only", "--no-renames", &format!("{base_ref}...{local}"), "--"])?.lines().count();
+    let (head, push) = pr_push_plan(repo, branch, push_remote)?;
+    Ok(PrPrep {
+        bases,
+        subjects,
+        files,
+        head,
+        push,
+        conflicts: merge_conflicts(repo, &base_ref, &local),
+        templates: pr_templates(repo, &base_ref, gitlab).unwrap_or_default(),
+        fetch_error,
+    })
+}
+
 pub fn remove_worktree(repo: &Path, path: &Path, force: bool) -> GitResult<String> {
     let p = path.to_string_lossy();
     let mut args = vec!["worktree", "remove"];
@@ -6010,5 +6261,184 @@ index 4444444..0000000
         remove_worktree(&dir, &wt, true).unwrap();
         let _ = std::fs::remove_dir_all(&dir);
         let _ = std::fs::remove_dir_all(&server);
+    }
+
+    #[test]
+    fn pull_request_titles_and_descriptions_are_filled_in() {
+        let one = vec!["Fix the login timeout".to_string()];
+        let two = vec!["Add a retry".to_string(), "Raise the timeout".to_string()];
+        assert_eq!(pr_title(&one, "fix-login"), "Fix the login timeout");
+        assert_eq!(pr_title(&two, "fix-login-timeout"), "Fix login timeout");
+        assert_eq!(pr_title(&[], "feature/dark_mode"), "Dark mode");
+        assert_eq!(pr_title(&two, "ana/wip/über-cache"), "Über cache");
+        assert_eq!(pr_title(&two, "--"), "--", "nothing to make words of");
+        assert_eq!(pr_body_from_commits(&two), "- Add a retry\n- Raise the timeout\n");
+        assert_eq!(pr_body_from_commits(&[]), "");
+    }
+
+    #[test]
+    fn templates_are_found_where_each_forge_looks() {
+        let paths = |l: &[&str]| l.iter().map(|s| s.to_string()).collect::<Vec<_>>();
+        let tree = paths(&[
+            "README.md",
+            "PULL_REQUEST_TEMPLATE.md",
+            "docs/pull_request_template.md",
+            "docs/guide.md",
+            ".github/PULL_REQUEST_TEMPLATE/feature.md",
+            ".github/PULL_REQUEST_TEMPLATE/Bug_fix.md",
+            ".github/PULL_REQUEST_TEMPLATE/notes.txt",
+            ".github/PULL_REQUEST_TEMPLATE/old/legacy.md",
+            ".gitlab/merge_request_templates/Default.md",
+            ".gitlab/merge_request_templates/Security.md",
+            ".gitlab/issue_templates/Bug.md",
+        ]);
+        assert_eq!(
+            template_paths(&tree, false),
+            [
+                "PULL_REQUEST_TEMPLATE.md",
+                "docs/pull_request_template.md",
+                ".github/PULL_REQUEST_TEMPLATE/Bug_fix.md",
+                ".github/PULL_REQUEST_TEMPLATE/feature.md"
+            ]
+        );
+        assert_eq!(template_paths(&tree, true), [".gitlab/merge_request_templates/Default.md", ".gitlab/merge_request_templates/Security.md"]);
+        assert!(template_paths(&paths(&["README.md", ".github/workflows/ci.yml"]), false).is_empty());
+        let t = PrTemplate { path: ".github/PULL_REQUEST_TEMPLATE/Bug_fix.md".into(), body: String::new() };
+        assert_eq!(t.name(), "Bug_fix");
+    }
+
+    #[test]
+    fn templates_are_read_from_the_base_branch_not_the_working_copy() {
+        let dir = temp_repo("pr-templates");
+        std::fs::create_dir_all(dir.join(".github/PULL_REQUEST_TEMPLATE")).unwrap();
+        std::fs::create_dir_all(dir.join(".gitlab/merge_request_templates")).unwrap();
+        commit_file(&dir, ".github/pull_request_template.md", "## What\r\n\r\n## Why\r\n");
+        commit_file(&dir, ".gitlab/merge_request_templates/Default.md", "/label ~review\n");
+        run(&dir, &["checkout", "-q", "-b", "work"]).unwrap();
+        commit_file(&dir, ".github/PULL_REQUEST_TEMPLATE/extra.md", "only on this branch\n");
+        std::fs::write(dir.join(".github/pull_request_template.md"), "edited, not committed\n").unwrap();
+
+        let gh = pr_templates(&dir, "main", false).unwrap();
+        assert_eq!(gh, [PrTemplate { path: ".github/pull_request_template.md".into(), body: "## What\n\n## Why\n".into() }]);
+        assert_eq!(pr_templates(&dir, "work", false).unwrap().len(), 2, "several: one to pick");
+        let gl = pr_templates(&dir, "main", true).unwrap();
+        assert_eq!((gl.len(), gl[0].name()), (1, "Default"));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A repository with a bare "server" as origin, main pushed.
+    fn repo_with_server(name: &str) -> (PathBuf, PathBuf) {
+        let server = std::env::temp_dir().join(format!("headway-test-{name}-server-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&server);
+        std::fs::create_dir_all(&server).unwrap();
+        run(&server, &["init", "-q", "--bare", "-b", "main"]).unwrap();
+        let dir = temp_repo(name);
+        commit_file(&dir, "a.txt", "one\ntwo\nthree\n");
+        run(&dir, &["remote", "add", "origin", &server.display().to_string()]).unwrap();
+        run(&dir, &["push", "-q", "-u", "origin", "main"]).unwrap();
+        (dir, server)
+    }
+
+    #[test]
+    fn a_branch_is_pushed_first_only_when_the_remote_lacks_something() {
+        let (dir, server) = repo_with_server("pr-push");
+        run(&dir, &["checkout", "-q", "-b", "fix-login"]).unwrap();
+        commit_file(&dir, "b.txt", "b\n");
+
+        // Never pushed: all of it, with -u.
+        let (head, plan) = pr_push_plan(&dir, "fix-login", "origin").unwrap();
+        let plan = plan.unwrap();
+        assert_eq!((head.as_str(), plan.new, plan.to.as_str()), ("fix-login", true, "fix-login"));
+        assert_eq!(plan.describe(), "fix-login isn't on origin yet. It will be pushed first.");
+        push_for_pr(&dir, &plan).unwrap();
+        assert_eq!(run(&dir, &["config", "branch.fix-login.merge"]).unwrap().trim(), "refs/heads/fix-login", "it tracks what was pushed");
+        assert_eq!(pr_push_plan(&dir, "fix-login", "origin").unwrap(), ("fix-login".into(), None), "up to date: nothing to push");
+
+        // Two commits ahead.
+        commit_file(&dir, "c.txt", "c\n");
+        commit_file(&dir, "d.txt", "d\n");
+        let plan = pr_push_plan(&dir, "fix-login", "origin").unwrap().1.unwrap();
+        assert_eq!((plan.new, plan.ahead), (false, 2));
+        assert_eq!(plan.describe(), "fix-login has 2 commits that aren't on origin yet. They'll be pushed first.");
+
+        // A local name tracking another name there: the pull request uses that one.
+        run(&dir, &["branch", "-q", "local-name", "fix-login"]).unwrap();
+        run(&dir, &["config", "branch.local-name.remote", "origin"]).unwrap();
+        run(&dir, &["config", "branch.local-name.merge", "refs/heads/fix-login"]).unwrap();
+        assert_eq!(pr_push_plan(&dir, "local-name", "origin").unwrap().0, "fix-login");
+
+        // Someone else pushed to it: rejected, with git's own words, and nothing else changed.
+        let other = temp_repo("pr-push-other");
+        run(&other, &["fetch", "-q", &server.display().to_string(), "fix-login"]).unwrap();
+        run(&other, &["checkout", "-q", "-b", "fix-login", "FETCH_HEAD"]).unwrap();
+        commit_file(&other, "e.txt", "e\n");
+        run(&other, &["push", "-q", &server.display().to_string(), "fix-login"]).unwrap();
+        let err = push_for_pr(&dir, &plan).unwrap_err();
+        assert!(err.contains("rejected"), "{err}");
+        for d in [&dir, &server, &other] {
+            let _ = std::fs::remove_dir_all(d);
+        }
+    }
+
+    #[test]
+    fn merge_previews_name_the_conflicting_files() {
+        assert_eq!(parse_git_version("git version 2.39.3 (Apple Git-146)"), Some((2, 39)));
+        assert_eq!(parse_git_version("git version 2.45.1.windows.1"), Some((2, 45)));
+        assert_eq!(parse_git_version("git version 2.37.0"), Some((2, 37)));
+        assert_eq!(parse_git_version("nonsense"), None);
+        let printed = "3f1e2d\nsrc/cart.js\nsrc/cart.js\n\"src/odd name.js\"\nREADME.md\n\nAuto-merging src/cart.js\n";
+        assert_eq!(parse_merge_tree(printed), ["src/cart.js", "src/odd name.js", "README.md"]);
+        assert!(parse_merge_tree("3f1e2d\n").is_empty());
+
+        let dir = temp_repo("pr-merge-tree");
+        commit_file(&dir, "a.txt", "one\n");
+        commit_file(&dir, "b.txt", "one\n");
+        run(&dir, &["checkout", "-q", "-b", "topic"]).unwrap();
+        commit_file(&dir, "a.txt", "topic\n");
+        commit_file(&dir, "b.txt", "topic\n");
+        commit_file(&dir, "c.txt", "new\n");
+        run(&dir, &["checkout", "-q", "-b", "clean", "main"]).unwrap();
+        commit_file(&dir, "d.txt", "d\n");
+        run(&dir, &["checkout", "-q", "main"]).unwrap();
+        commit_file(&dir, "a.txt", "main\n");
+        commit_file(&dir, "b.txt", "main\n");
+        let before = run(&dir, &["status", "--porcelain"]).unwrap();
+        if can_preview_merges(&dir) {
+            assert_eq!(merge_conflicts(&dir, "main", "topic"), Some(vec!["a.txt".to_string(), "b.txt".into()]));
+            assert_eq!(merge_conflicts(&dir, "main", "clean"), Some(vec![]));
+        } else {
+            assert_eq!(merge_conflicts(&dir, "main", "topic"), None, "skipped on old git");
+        }
+        assert_eq!(run(&dir, &["status", "--porcelain"]).unwrap(), before, "nothing touched");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn preparing_a_pull_request_fetches_the_base_and_compares() {
+        let (dir, server) = repo_with_server("pr-prep");
+        run(&dir, &["checkout", "-q", "-b", "fix-login-timeout"]).unwrap();
+        commit_file(&dir, "a.txt", "one\nTWO\nthree\n");
+        commit_file(&dir, "b.txt", "b\n");
+        // main moves on on the server, touching the same line.
+        let other = temp_repo("pr-prep-other");
+        run(&other, &["pull", "-q", &server.display().to_string(), "main"]).unwrap();
+        commit_file(&other, "a.txt", "one\n2\nthree\n");
+        run(&other, &["push", "-q", &server.display().to_string(), "main"]).unwrap();
+        run(&other, &["push", "-q", &server.display().to_string(), "main:release"]).unwrap();
+        run(&dir, &["fetch", "-q", "origin", "release"]).unwrap();
+
+        let p = prepare_pr(&dir, "fix-login-timeout", "origin", "main", "origin", false).unwrap();
+        assert_eq!(p.fetch_error, None);
+        assert_eq!(p.bases, ["main", "release"], "the base first");
+        assert_eq!(p.subjects, ["write a.txt", "write b.txt"]);
+        assert_eq!((p.files, p.head.as_str()), (2, "fix-login-timeout"));
+        assert!(p.push.as_ref().is_some_and(|x| x.new));
+        if can_preview_merges(&dir) {
+            assert_eq!(p.conflicts, Some(vec!["a.txt".to_string()]), "against the fetched main, not the stale one");
+        }
+        assert!(prepare_pr(&dir, "fix-login-timeout", "origin", "nope", "origin", false).unwrap_err().contains("Couldn't fetch nope"));
+        for d in [&dir, &server, &other] {
+            let _ = std::fs::remove_dir_all(d);
+        }
     }
 }
