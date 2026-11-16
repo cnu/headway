@@ -40,3 +40,10 @@ Answers from `gh` and `glab`, read by the parsing tests. Tests never call the ne
   permission to merge). The details carry `currentUser`, `userPermissions`,
   `approvedBy` and `diffRefs`; the merge methods come from
   `glab-project.json`'s `merge_method` and `squash_option`.
+- `gh-inbox.json`: the inbox's searches (`inbox_query` in `github.rs`), by
+  hand in the shape `gh api graphql` prints: two review searches (one split
+  off, as for many repositories) and one each for my open and merged pull
+  requests, with one per inbox group and one from a repository outside the
+  workspace (`acme/other`), which is left out.
+- `glab-inbox.json`: the same for GitLab's `currentUser` lists, with a merge
+  request from a project outside the workspace (`group/elsewhere`).

@@ -861,6 +861,63 @@ pub fn squash_message(kind: ForgeKind, title: &str, number: u64, messages: &[Str
     (format!("{}{suffix}", title.trim()), body)
 }
 
+/// A pull request in the inbox, with the repository it's in.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct InboxPr {
+    pub repo: RepoKey,
+    pub pr: PullRequest,
+}
+
+impl InboxPr {
+    /// Which one it is, across repositories.
+    pub fn id(&self) -> (RepoKey, u64) {
+        (self.repo.clone(), self.pr.number)
+    }
+}
+
+/// What one host says needs the signed-in user, across a workspace's
+/// repositories: open pull requests asking for my review (or my team's),
+/// my open ones, and mine merged since the app started.
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct Inbox {
+    /// The repositories it was asked about (only these are in it).
+    pub repos: Vec<RepoKey>,
+    pub review: Vec<InboxPr>,
+    pub mine: Vec<InboxPr>,
+    pub merged: Vec<InboxPr>,
+    /// As in [`BranchPrs`]: when the request allowance comes back, if nearly used up.
+    pub slow_down_until: Option<i64>,
+}
+
+impl Inbox {
+    /// Keep only what's in `repos` (searches can match more), each once per list.
+    pub fn keep(mut self, repos: &[RepoKey]) -> Self {
+        let wanted = |i: &InboxPr| repos.iter().any(|r| r.host.eq_ignore_ascii_case(&i.repo.host) && r.path.eq_ignore_ascii_case(&i.repo.path));
+        for list in [&mut self.review, &mut self.mine, &mut self.merged] {
+            let mut seen = Vec::new();
+            list.retain(|i| {
+                let new = wanted(i) && !seen.contains(&i.id());
+                seen.push(i.id());
+                new
+            });
+            // Named as in the workspace (the forge may answer in other letter cases).
+            for i in list.iter_mut() {
+                if let Some(r) = repos.iter().find(|r| r.path.eq_ignore_ascii_case(&i.repo.path)) {
+                    i.repo = r.clone();
+                }
+            }
+        }
+        self.repos = repos.to_vec();
+        self
+    }
+}
+
+/// `YYYY-MM-DD` (UTC) of a Unix time, for search terms.
+pub fn day_of(t: i64) -> String {
+    let (y, m, d) = crate::cmdlog::civil_from_days(t.div_euclid(86_400));
+    format!("{y:04}-{m:02}-{d:02}")
+}
+
 /// One pull request, for its view: what the lists know, plus its description
 /// and whether the signed-in user may run its checks again.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
@@ -971,6 +1028,11 @@ pub trait Forge: Send + Sync {
     /// GitLab: a comment on lines of the diff, as a discussion of its own.
     fn line_comment(&self, _repo: &RepoKey, _number: u64, _comment: &LineComment, _refs: &DiffRefs) -> ForgeResult<()> {
         Err(ForgeError::NotYet("comment on lines"))
+    }
+    /// The inbox for user `me` across `repos` (all on this host), in as few
+    /// calls as the forge allows; merged ones since `since` (Unix time).
+    fn inbox(&self, _me: &str, _repos: &[RepoKey], _since: i64) -> ForgeResult<Inbox> {
+        Err(ForgeError::NotYet("show an inbox"))
     }
     /// Run the failed ones of `checks` again; returns how many runs (or
     /// pipelines) were restarted.

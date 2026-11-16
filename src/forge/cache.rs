@@ -117,12 +117,46 @@ pub struct JobResult {
     pub lists: Option<ForgeResult<PrLists>>,
 }
 
+/// One host's inbox: the latest answer and when to ask again.
+#[derive(Clone, Debug, Default)]
+pub struct InboxEntry {
+    pub inbox: Option<Arc<Inbox>>,
+    /// Unix seconds of the answer.
+    pub fetched_at: i64,
+    /// The last refresh failed with this (the inbox above is older).
+    pub error: Option<ForgeError>,
+    asked: Option<Instant>,
+    busy: bool,
+}
+
+/// Reading one host's inbox, as the signed-in user, for these repositories.
+#[derive(Clone, Debug, PartialEq)]
+pub struct InboxJob {
+    pub host: String,
+    pub kind: ForgeKind,
+    pub me: String,
+    pub repos: Vec<RepoKey>,
+    /// A folder on that host, for the command log.
+    pub dir: PathBuf,
+    /// Merged ones since then (Unix seconds: when the app started).
+    pub since: i64,
+}
+
+#[derive(Debug)]
+pub struct InboxResult {
+    pub host: String,
+    pub inbox: ForgeResult<Inbox>,
+}
+
 #[derive(Default)]
 pub struct ForgeCache {
     hosts: HashMap<String, HostEntry>,
     repos: HashMap<RepoKey, RepoEntry>,
     queue: VecDeque<Job>,
     running: Vec<RepoKey>,
+    inboxes: HashMap<String, InboxEntry>,
+    inbox_queue: VecDeque<InboxJob>,
+    running_inboxes: Vec<String>,
 }
 
 impl ForgeCache {
@@ -200,7 +234,7 @@ impl ForgeCache {
     pub fn next_jobs(&mut self, now: Instant) -> Vec<Job> {
         let mut out = Vec::new();
         let mut i = 0;
-        while self.running.len() < MAX_IN_FLIGHT && i < self.queue.len() {
+        while self.in_flight() < MAX_IN_FLIGHT && i < self.queue.len() {
             let host = self.queue[i].key.host.clone();
             if self.backed_off(&host, now) {
                 // Dropped: the host is resting. The poll asks again later.
@@ -235,6 +269,117 @@ impl ForgeCache {
         out
     }
 
+    fn in_flight(&self) -> usize {
+        self.running.len() + self.running_inboxes.len()
+    }
+
+    pub fn inbox(&self, host: &str) -> Option<&InboxEntry> {
+        self.inboxes.get(host)
+    }
+
+    /// Ask for a host's inbox over `repos` (on behalf of the folder `dir`).
+    /// Only once the host is known and signed in (repository refreshes find
+    /// that out); then the same rules as a repository's refresh. Asking about
+    /// other repositories than last time (another workspace) is always due.
+    pub fn request_inbox(&mut self, host: &str, repos: &[RepoKey], dir: &Path, since: i64, reason: Reason, now: Instant) -> bool {
+        if repos.is_empty() || self.backed_off(host, now) {
+            return false;
+        }
+        let Some(h) = self.hosts.get(host) else { return false };
+        let (Some(kind), Connection::SignedIn(me)) = (h.kind, &h.connection) else { return false };
+        let me = me.clone();
+        let entry = self.inboxes.entry(host.to_string()).or_default();
+        if entry.busy {
+            return false;
+        }
+        let same = entry.inbox.as_ref().is_some_and(|i| i.repos == repos);
+        let since_asked = |d: Duration| entry.asked.is_none_or(|t| now.saturating_duration_since(t) >= d);
+        let due = !same
+            || match reason {
+                Reason::Opened | Reason::AfterGit | Reason::AfterPrAction => true,
+                Reason::Focus => since_asked(FOCUS_EVERY),
+                Reason::Poll => since_asked(POLL_EVERY),
+            };
+        if !due {
+            return false;
+        }
+        entry.asked = Some(now);
+        entry.busy = true;
+        self.inbox_queue.push_back(InboxJob { host: host.to_string(), kind, me, repos: repos.to_vec(), dir: dir.to_path_buf(), since });
+        true
+    }
+
+    /// Inbox reads to start now, within the same [`MAX_IN_FLIGHT`] as
+    /// repository refreshes (those go first).
+    pub fn next_inbox_jobs(&mut self, now: Instant) -> Vec<InboxJob> {
+        let mut out = Vec::new();
+        while self.in_flight() < MAX_IN_FLIGHT
+            && let Some(job) = self.inbox_queue.pop_front()
+        {
+            if self.backed_off(&job.host, now) {
+                if let Some(e) = self.inboxes.get_mut(&job.host) {
+                    e.busy = false;
+                }
+                continue;
+            }
+            self.running_inboxes.push(job.host.clone());
+            out.push(job);
+        }
+        out
+    }
+
+    /// Take in an inbox. Returns the inbox it replaces (to tell what changed)
+    /// and, as [`ForgeCache::finish`] does, a line for the command log when
+    /// the host starts resting.
+    pub fn finish_inbox(&mut self, res: InboxResult, now: Instant, wall_now: i64) -> (Option<Arc<Inbox>>, Option<String>) {
+        self.running_inboxes.retain(|h| *h != res.host);
+        let entry = self.inboxes.entry(res.host.clone()).or_default();
+        entry.busy = false;
+        let before = entry.inbox.clone();
+        let (limited, slow_down) = match res.inbox {
+            Ok(i) => {
+                let slow = i.slow_down_until;
+                entry.inbox = Some(Arc::new(i));
+                entry.fetched_at = wall_now;
+                entry.error = None;
+                (None, slow)
+            }
+            Err(e) => {
+                let limited = match &e {
+                    ForgeError::RateLimited { until } => Some(*until),
+                    _ => None,
+                };
+                let host = self.hosts.entry(res.host.clone()).or_default();
+                match &e {
+                    ForgeError::SignedOut { .. } => host.connection = Connection::SignedOut,
+                    ForgeError::NotInstalled(_) => host.connection = Connection::NotInstalled,
+                    _ => {}
+                }
+                self.inboxes.get_mut(&res.host).expect("just added").error = Some(e);
+                (limited, None)
+            }
+        };
+        (before, self.rest(&res.host, limited, slow_down, now, wall_now))
+    }
+
+    /// Back off from `host` after a rate limit (`limited`: until when, if it
+    /// said) or when nearly out of requests (`slow_down`). Returns the line for
+    /// the command log when it starts resting.
+    fn rest(&mut self, host_name: &str, limited: Option<Option<i64>>, slow_down: Option<i64>, now: Instant, wall_now: i64) -> Option<String> {
+        let host = self.hosts.entry(host_name.to_string()).or_default();
+        let (until, why) = match (limited, slow_down) {
+            (Some(until), _) => {
+                let default = if host.kind == Some(ForgeKind::GitLab) { GITLAB_BACKOFF } else { GITHUB_BACKOFF };
+                (until.map_or(default, |t| secs_until(t, wall_now)), "rate limited")
+            }
+            (None, Some(t)) => (secs_until(t, wall_now), "nearly out of requests"),
+            (None, None) => return None,
+        };
+        let resting = host.backoff_until.is_some_and(|t| now < t);
+        host.backoff_until = Some(now + until.min(MAX_BACKOFF));
+        (!resting).then(|| format!("{host_name}: {why}; not asking again for {} min", until.min(MAX_BACKOFF).as_secs().div_ceil(60)))
+    }
+
     /// Take in a job's results. `wall_now` is the Unix time (for reset times the
     /// forge gives). Returns a line for the command log when the host starts
     /// resting because of rate limits (once per rest, never a toast).
@@ -246,7 +391,6 @@ impl ForgeCache {
             host.kind = hk.kind;
             host.detected = true;
         }
-        let kind = host.kind;
         let mut limited: Option<Option<i64>> = None;
         let mut signed_out = |e: &ForgeError, host: &mut HostEntry| match e {
             ForgeError::NotInstalled(_) => host.connection = Connection::NotInstalled,
@@ -301,17 +445,7 @@ impl ForgeCache {
         if let Some(Err(e)) = &res.info {
             signed_out(e, host);
         }
-        let (until, why) = match (limited, slow_down) {
-            (Some(until), _) => {
-                let default = if kind == Some(ForgeKind::GitLab) { GITLAB_BACKOFF } else { GITHUB_BACKOFF };
-                (until.map_or(default, |t| secs_until(t, wall_now)), "rate limited")
-            }
-            (None, Some(t)) => (secs_until(t, wall_now), "nearly out of requests"),
-            (None, None) => return None,
-        };
-        let resting = host.backoff_until.is_some_and(|t| now < t);
-        host.backoff_until = Some(now + until.min(MAX_BACKOFF));
-        (!resting).then(|| format!("{}: {why}; not asking again for {} min", key.host, until.min(MAX_BACKOFF).as_secs().div_ceil(60)))
+        self.rest(&key.host, limited, slow_down, now, wall_now)
     }
 }
 
@@ -347,6 +481,12 @@ impl Job {
 
 fn secs_until(t: i64, wall_now: i64) -> Duration {
     Duration::from_secs(t.saturating_sub(wall_now).max(60) as u64)
+}
+
+/// Read an inbox (on a worker thread).
+pub fn run_inbox_job(forges: &dyn Forges, job: &InboxJob) -> InboxResult {
+    let forge = forges.forge(job.kind, &job.host, Some(&job.dir));
+    InboxResult { host: job.host.clone(), inbox: forge.inbox(&job.me, &job.repos, job.since) }
 }
 
 /// Do a job (on a worker thread): detect the host and check the sign-in if still
@@ -437,6 +577,59 @@ mod tests {
             data.repos.insert(format!("github.com/{p}"), fake::FakeRepo { info: Some(info.clone()), pulls: vec![pr(1, "feature")], ..Default::default() });
         }
         fake::FakeForges::new(data)
+    }
+
+    /// The inbox waits for the host to be signed in, keeps the usual pace, is
+    /// asked again at once for other repositories, shares the jobs in flight,
+    /// and rests with the host after a rate limit.
+    #[test]
+    fn a_hosts_inbox_follows_the_same_rules() {
+        let mut c = ForgeCache::default();
+        let f = fake();
+        let t = Instant::now();
+        let dir = Path::new("/r");
+        let one = vec![key("github.com", "a/one")];
+        assert!(!c.request_inbox("github.com", &one, dir, 0, Reason::Opened, t), "not known to be signed in yet");
+        c.request(&one[0], dir, &branches(), Reason::Opened, t);
+        drain(&mut c, &f, t);
+        assert!(c.request_inbox("github.com", &one, dir, 0, Reason::Poll, t));
+        assert!(!c.request_inbox("github.com", &one, dir, 0, Reason::Opened, t), "one at a time");
+        let jobs = c.next_inbox_jobs(t);
+        assert_eq!((jobs.len(), jobs[0].me.as_str(), jobs[0].kind), (1, "alex", ForgeKind::GitHub));
+        let (before, note) = c.finish_inbox(run_inbox_job(&f, &jobs[0]), t, 1_000_000);
+        assert!(before.is_none() && note.is_none(), "the first answer has nothing before it");
+        assert_eq!(c.inbox("github.com").unwrap().inbox.as_ref().unwrap().repos, one);
+
+        // The usual pace: a poll or focus soon after isn't due; asking about
+        // other repositories (another workspace's) is.
+        assert!(!c.request_inbox("github.com", &one, dir, 0, Reason::Poll, t + Duration::from_secs(30)));
+        assert!(!c.request_inbox("github.com", &one, dir, 0, Reason::Focus, t + Duration::from_secs(30)));
+        assert!(c.request_inbox("github.com", &one, dir, 0, Reason::Poll, t + POLL_EVERY));
+        let jobs = c.next_inbox_jobs(t + POLL_EVERY);
+        let (before, _) = c.finish_inbox(run_inbox_job(&f, &jobs[0]), t + POLL_EVERY, 1_000_000);
+        assert!(before.is_some(), "what it replaces, to tell what changed");
+        let two = vec![key("github.com", "a/one"), key("github.com", "a/two")];
+        assert!(c.request_inbox("github.com", &two, dir, 0, Reason::Poll, t + POLL_EVERY));
+
+        // Repository refreshes go first; the inbox waits for a free slot.
+        let t2 = t + POLL_EVERY;
+        for p in ["a/three", "a/four", "a/five", "a/six"] {
+            c.request(&key("github.com", p), dir, &branches(), Reason::Opened, t2);
+        }
+        assert_eq!(c.next_jobs(t2).len(), MAX_IN_FLIGHT);
+        assert!(c.next_inbox_jobs(t2).is_empty(), "all slots taken");
+
+        // A rate limit rests the host: no inbox until it's over.
+        let mut d = ForgeCache::default();
+        d.request(&one[0], dir, &branches(), Reason::Opened, t);
+        drain(&mut d, &f, t);
+        d.request_inbox("github.com", &one, dir, 0, Reason::Opened, t);
+        let job = d.next_inbox_jobs(t).remove(0);
+        let (_, note) = d.finish_inbox(InboxResult { host: job.host, inbox: Err(ForgeError::RateLimited { until: None }) }, t, 1_000_000);
+        assert_eq!(note.as_deref(), Some("github.com: rate limited; not asking again for 15 min"));
+        assert!(!d.request_inbox("github.com", &one, dir, 0, Reason::Opened, t + Duration::from_secs(60)));
+        assert!(!d.request(&one[0], dir, &branches(), Reason::Opened, t + Duration::from_secs(60)), "nor the repositories");
+        assert!(d.request_inbox("github.com", &one, dir, 0, Reason::Opened, t + GITHUB_BACKOFF));
     }
 
     #[test]

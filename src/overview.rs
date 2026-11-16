@@ -8,6 +8,22 @@ use egui::{Align, CornerRadius, Layout, Margin, RichText, Sense, Stroke, Ui};
 use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
 
+/// What the overview shows: the repositories' cards, or the review inbox.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum OverviewTab {
+    #[default]
+    Repos,
+    Inbox,
+}
+
+/// Which tab is shown, how many inbox items need action (for its label),
+/// and the inbox when it's the one shown.
+pub struct Tabs<'a> {
+    pub tab: OverviewTab,
+    pub inbox_count: usize,
+    pub inbox: Option<&'a crate::inbox::InboxView>,
+}
+
 /// Height of the Open/Fetch/Pull row at the bottom of a card.
 const BUTTONS_H: f32 = 28.0;
 
@@ -17,8 +33,10 @@ pub fn show(
     summaries: &HashMap<PathBuf, Result<Summary, String>>,
     forges: &HashMap<PathBuf, crate::app::ForgeCard>,
     busy: &[(u64, PathBuf, String)],
+    tabs: Tabs,
     actions: &mut Vec<Action>,
 ) {
+    let Tabs { tab, inbox_count, inbox } = tabs;
     egui::Frame::new().inner_margin(Margin::symmetric(28, 22)).show(ui, |ui| {
         // Worktrees whose main repository is here are shown inside its card.
         let top = top_level_repos(&ws.repos, summaries);
@@ -74,10 +92,28 @@ pub fn show(
                 }
             });
         });
-        ui.add_space(18.0);
+        ui.add_space(12.0);
 
         if ws.repos.is_empty() {
             empty_state(ui, actions);
+            return;
+        }
+        ui.horizontal(|ui| {
+            let inbox_label = if inbox_count > 0 { format!("Inbox {inbox_count}") } else { "Inbox".to_string() };
+            for (t, label) in [(OverviewTab::Repos, "Repositories".to_string()), (OverviewTab::Inbox, inbox_label)] {
+                let on = tab == t;
+                let r = ui.selectable_label(on, RichText::new(&label).size(14.0).color(if on { TEXT } else { DIM }));
+                r.widget_info(|| egui::WidgetInfo::selected(egui::Role::Tab, true, on, &label));
+                if r.clicked() && !on {
+                    actions.push(Action::OverviewTab(t));
+                }
+            }
+        });
+        ui.add_space(10.0);
+        if tab == OverviewTab::Inbox {
+            if let Some(v) = inbox {
+                crate::inbox::show(ui, v, actions);
+            }
             return;
         }
 
@@ -540,7 +576,7 @@ mod tests {
             };
             let mut actions = Vec::new();
             let (ws, summaries) = (&self.ws, &self.summaries);
-            let mut output = self.ctx.run_ui(input, |ui| show(ui, ws, summaries, &HashMap::new(), &[], &mut actions));
+            let mut output = self.ctx.run_ui(input, |ui| show(ui, ws, summaries, &HashMap::new(), &[], Tabs { tab: OverviewTab::Repos, inbox_count: 0, inbox: None }, &mut actions));
             output.textures_delta.clear(); // no screen to upload to
             let mut out = Opened::default();
             for a in actions {

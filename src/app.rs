@@ -8,7 +8,7 @@ use crate::workspace::{Config, Workspace};
 use crate::fileview::{self, FileView, Mode};
 use crate::resolver::Resolver;
 use crate::forge::{self, cache::Reason};
-use crate::{cmdlog, diffmodel, highlight, markdown, newpr, overview, preview, prmerge, prview, views};
+use crate::{cmdlog, diffmodel, highlight, inbox, markdown, newpr, overview, preview, prmerge, prview, views};
 use egui::{Align, Color32, CornerRadius, Id, Layout, Margin, RichText, Sense, Stroke, Ui};
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
@@ -815,6 +815,8 @@ enum Msg {
     Cloned(u64, Result<PathBuf, String>),
     /// A GitHub or GitLab refresh finished.
     Forge(forge::cache::JobResult),
+    /// A host's inbox was read.
+    Inbox(forge::cache::InboxResult),
     /// The comparison for the "Create pull request" dialog (`base`: what it was
     /// worked out against, when the dialog didn't know yet).
     PrPrep { repo: PathBuf, generation: u64, base: String, result: Result<git::PrPrep, String> },
@@ -931,6 +933,9 @@ pub enum Action {
     DiffPrefsChanged { reload: bool },
     /// Merge the pull request in the merge dialog.
     SubmitMerge,
+    /// Show the overview's cards or its inbox.
+    OverviewTab(overview::OverviewTab),
+    Inbox(inbox::InboxOp),
     /// Run a git action, then `then` once it has worked.
     Then { first: Box<Action>, then: Box<Action> },
 }
@@ -1071,6 +1076,10 @@ enum ToastButton {
     OpenUrl { label: &'static str, url: String },
     /// "Create pull request" for a branch just pushed.
     NewPr { label: String, repo: PathBuf, branch: String },
+    /// Open a pull request in its repository's window (on its checks).
+    OpenPr { label: &'static str, repo: PathBuf, pr: Box<forge::PullRequest>, checks: bool },
+    /// Delete the local branch of a pull request that was merged.
+    DeleteBranch { repo: PathBuf, branch: String, force: bool },
 }
 
 struct Shot {
@@ -1121,6 +1130,15 @@ pub struct HeadwayApp {
     /// Comments written in pull request views and not posted yet, kept while
     /// the view is closed: (repository, number).
     pr_drafts: HashMap<(PathBuf, u64), prview::ReviewDraft>,
+    /// The overview's tab.
+    overview_tab: overview::OverviewTab,
+    /// Alerts already shown (see [`inbox::Alert::key`]), and pull requests
+    /// merged from here (they don't alert).
+    alerted: std::collections::HashSet<String>,
+    merged_here: std::collections::HashSet<(forge::RepoKey, u64)>,
+    /// When the app started (Unix seconds): merges from before then aren't news.
+    started: i64,
+    inbox_polled: f64,
     /// When the poll timer last looked (seconds of app time).
     forge_polled: f64,
 }
@@ -1161,6 +1179,11 @@ impl HeadwayApp {
             forge_after_load: HashMap::new(),
             pr_meta: HashMap::new(),
             pr_drafts: HashMap::new(),
+            overview_tab: overview::OverviewTab::Repos,
+            alerted: Default::default(),
+            merged_here: Default::default(),
+            started: forge::now_secs(),
+            inbox_polled: f64::NEG_INFINITY,
             forge_polled: f64::NEG_INFINITY,
             shot: screenshot.map(|path| Shot {
                 path,
@@ -1655,6 +1678,172 @@ impl HeadwayApp {
                 Msg::Forge(forge::cache::run_job(forges.as_ref(), &job))
             });
         }
+        for job in self.forge_cache.next_inbox_jobs(std::time::Instant::now()) {
+            let forges = self.forges.clone();
+            self.spawn(move || {
+                let _name = cmdlog::named("inbox");
+                Msg::Inbox(forge::cache::run_inbox_job(forges.as_ref(), &job))
+            });
+        }
+    }
+
+    /// The current workspace's repositories on a forge, by host: (host, their
+    /// keys, a folder on it). Other workspaces are never asked about.
+    fn inbox_hosts(&self) -> Vec<(String, Vec<forge::RepoKey>, PathBuf)> {
+        let mut out: Vec<(String, Vec<forge::RepoKey>, PathBuf)> = Vec::new();
+        for path in &self.cfg.ws().repos {
+            let Some(r) = self.forge_repos.get(path) else { continue };
+            let key = r.remotes.key();
+            match out.iter_mut().find(|h| h.0 == key.host) {
+                Some(h) if !h.1.contains(&key) => h.1.push(key),
+                Some(_) => {}
+                None => out.push((key.host.clone(), vec![key], path.clone())),
+            }
+        }
+        for h in &mut out {
+            h.1.sort();
+        }
+        out
+    }
+
+    /// Ask each host for the inbox (the cache says whether it's due; hosts not
+    /// signed in yet are skipped until their repositories' refresh finds out).
+    fn inbox_refresh(&mut self, reason: Reason) {
+        let now = std::time::Instant::now();
+        for (host, keys, dir) in self.inbox_hosts() {
+            self.forge_cache.request_inbox(&host, &keys, &dir, self.started, reason, now);
+        }
+        self.forge_pump();
+    }
+
+    /// The repository folder in this workspace for a forge key.
+    fn path_of_key(&self, key: &forge::RepoKey) -> Option<PathBuf> {
+        self.cfg.ws().repos.iter().find(|p| self.forge_repos.get(*p).is_some_and(|r| r.remotes.key() == *key)).cloned()
+    }
+
+    /// The current workspace's inbox, grouped.
+    fn inbox_grouped(&self) -> inbox::Grouped {
+        let inboxes: Vec<Arc<forge::Inbox>> = self.inbox_hosts().iter().filter_map(|h| self.forge_cache.inbox(&h.0)?.inbox.clone()).collect();
+        let refs: Vec<&forge::Inbox> = inboxes.iter().map(|i| i.as_ref()).collect();
+        inbox::group(&refs, &self.cfg.ws().inbox, forge::now_secs())
+    }
+
+    /// What the Inbox tab shows.
+    fn inbox_view(&self, grouped: inbox::Grouped) -> inbox::InboxView {
+        let mut v = inbox::InboxView { grouped, alerts_off: self.cfg.ws().inbox.alerts_off.clone(), ..Default::default() };
+        for path in &self.cfg.ws().repos {
+            let Some(r) = self.forge_repos.get(path) else { continue };
+            let key = r.remotes.key();
+            let name = git::repo_name(path);
+            let host = self.forge_cache.host(&key.host);
+            match host.map(|h| (&h.connection, h.kind)) {
+                Some((forge::cache::Connection::SignedIn(_), Some(kind))) => v.repos.push((key, path.clone(), name, kind)),
+                _ => {
+                    if let Some(line) = self.forge_line(path).filter(|l| !matches!(l, forge::StatusLine::SignedIn { .. })) {
+                        v.not_connected.push((name, line));
+                    } else if host.is_none_or(|h| !h.detected) {
+                        v.loading = true;
+                    }
+                }
+            }
+        }
+        for (host, _, _) in self.inbox_hosts() {
+            match self.forge_cache.inbox(&host) {
+                Some(e) if e.inbox.is_none() && e.error.is_none() => v.loading = true,
+                Some(e) => {
+                    if let Some(err) = &e.error {
+                        v.errors.push(format!("{host}: {err}"));
+                    }
+                }
+                None if v.repos.iter().any(|r| r.0.host == host) => v.loading = true,
+                None => {}
+            }
+        }
+        v
+    }
+
+    /// A host's inbox came: alert what changed since its last one (never on
+    /// the first, so nothing from before the app started).
+    fn on_inbox(&mut self, res: forge::cache::InboxResult) {
+        let host = res.host.clone();
+        let wall = forge::now_secs();
+        let (before, note) = self.forge_cache.finish_inbox(res, std::time::Instant::now(), wall);
+        if let Some(note) = note {
+            let dir = self.inbox_hosts().into_iter().find(|h| h.0 == host).map(|h| h.2);
+            cmdlog::forge_note(dir.as_deref(), &note);
+        }
+        // Every host answered: pins and snoozes of what's left the inbox go.
+        let hosts = self.inbox_hosts();
+        let answers: Vec<Arc<forge::Inbox>> = hosts.iter().filter_map(|h| self.forge_cache.inbox(&h.0).filter(|e| e.error.is_none())?.inbox.clone()).collect();
+        if answers.len() == hosts.len() {
+            let present: Vec<inbox::PrRef> = answers.iter().flat_map(|i| i.review.iter().chain(&i.mine)).map(inbox::PrRef::of).collect();
+            let before_prefs = self.cfg.ws().inbox.clone();
+            self.cfg.ws_mut().inbox.tidy(&present, wall);
+            if self.cfg.ws().inbox != before_prefs {
+                self.save();
+            }
+        }
+        let after = self.forge_cache.inbox(&host).and_then(|e| e.inbox.clone());
+        if let (Some(b), Some(a)) = (before, after)
+            && !Arc::ptr_eq(&b, &a)
+        {
+            for al in inbox::alerts(&b, &a) {
+                self.alert(al);
+            }
+        }
+        self.forge_pump();
+    }
+
+    /// Say it, with a button for what to do next, and ask for attention when
+    /// the window isn't in front.
+    fn alert(&mut self, al: inbox::Alert) {
+        if !self.cfg.ws().inbox.alert_on(al.kind) || (al.kind == inbox::AlertKind::Merged && self.merged_here.contains(&al.pr.id())) {
+            return;
+        }
+        if !self.alerted.insert(al.key()) {
+            return;
+        }
+        let Some(path) = self.path_of_key(&al.pr.repo) else { return };
+        let kind = self.forge_cache.host(&al.pr.repo.host).and_then(|h| h.kind).unwrap_or(forge::ForgeKind::GitHub);
+        let pr = Box::new(al.pr.pr.clone());
+        let open = |checks: bool| ToastButton::OpenPr { label: if checks { "Show checks" } else { "Open" }, repo: path.clone(), pr: pr.clone(), checks };
+        let button = match al.kind {
+            inbox::AlertKind::ChecksFailed => open(true),
+            inbox::AlertKind::Merged => {
+                let local = self.forge_repos.get(&path).and_then(|r| r.branches.iter().find(|b| b.name == al.pr.pr.head_branch && !b.current).cloned());
+                match local {
+                    Some(b) => ToastButton::DeleteBranch { repo: path.clone(), force: b.tip.is_some() && b.tip == al.pr.pr.head_oid, branch: b.name },
+                    None => open(false),
+                }
+            }
+            _ => open(false),
+        };
+        self.toast_button(al.text(kind), button);
+        if !self.focused {
+            self.ctx.send_viewport_cmd(egui::ViewportCommand::RequestUserAttention(egui::UserAttentionType::Informational));
+        }
+    }
+
+    fn inbox_op(&mut self, o: inbox::InboxOp) {
+        use inbox::InboxOp;
+        let prefs = &mut self.cfg.ws_mut().inbox;
+        match o {
+            InboxOp::Pin(r) => prefs.pin(r),
+            InboxOp::Unpin(r) => prefs.unpin(&r),
+            InboxOp::Snooze(r, until) => prefs.snooze(r, until),
+            InboxOp::Wake(r) => prefs.wake(&r),
+            InboxOp::Alert(k, on) => {
+                prefs.alerts_off.retain(|a| *a != k);
+                if !on {
+                    prefs.alerts_off.push(k);
+                }
+            }
+            InboxOp::Refresh => {
+                self.inbox_refresh(Reason::Opened);
+                return;
+            }
+        }
+        self.save();
     }
 
     /// The repositories on screen: the open tab, or every card of the overview.
@@ -2003,6 +2192,7 @@ impl HeadwayApp {
                 self.followups.insert(id, FollowUp::PrPosted { number, sent: Sent::Nothing, done });
             }
             PrOp::Merge => self.open_merge(repo),
+            PrOp::ShowTab(t) => pv.tab = t,
         }
     }
 
@@ -2341,8 +2531,10 @@ impl HeadwayApp {
                     if let Some(note) = self.forge_cache.finish(res, std::time::Instant::now(), wall) {
                         cmdlog::forge_note(repo.as_deref(), &note);
                     }
-                    self.forge_pump();
+                    // The host may be signed in now: its inbox can be read (when due).
+                    self.inbox_refresh(Reason::Poll);
                 }
+                Msg::Inbox(res) => self.on_inbox(res),
                 Msg::Detail(path, hash, res) => {
                     if let Some(rv) = self.tabs.get_mut(&path) {
                         if rv.selection == Some(Selection::Commit(hash)) {
@@ -2528,6 +2720,9 @@ impl HeadwayApp {
                                     after = Some(Reason::AfterPrAction);
                                 }
                                 Some(FollowUp::PrMerged { number, base, remote, auto, done, method, local, delete_local }) => {
+                                    if let Some(r) = self.forge_repos.get(&repo) {
+                                        self.merged_here.insert((r.remotes.key(), number));
+                                    }
                                     if matches!(&self.dialog, Some(Dialog::MergePr(d)) if d.repo == repo) {
                                         self.dialog = None;
                                     }
@@ -2623,6 +2818,7 @@ impl HeadwayApp {
                     }
                     if let Some(reason) = after {
                         self.forge_after_load.insert(repo.clone(), reason);
+                        self.inbox_refresh(reason);
                     }
                     if self.tabs.contains_key(&repo) {
                         self.reload_repo(&repo);
@@ -3126,6 +3322,13 @@ impl HeadwayApp {
                 }
             },
             Action::SubmitMerge => self.submit_merge(),
+            Action::OverviewTab(t) => {
+                self.overview_tab = t;
+                if t == overview::OverviewTab::Inbox {
+                    self.inbox_refresh(Reason::Opened);
+                }
+            }
+            Action::Inbox(o) => self.inbox_op(o),
             Action::Undo { repo, id } => {
                 // One at a time: a second press would race the first.
                 if !self.busy.iter().any(|b| b.1 == repo && b.2 == "Undo") {
@@ -3388,6 +3591,17 @@ impl HeadwayApp {
                                     }
                                     Some(ToastButton::NewPr { label, repo, branch }) if ui.button(label).clicked() => {
                                         actions.push(Action::NewPr { repo: repo.clone(), branch: Some(branch.clone()) });
+                                        dismiss = Some(i);
+                                    }
+                                    Some(ToastButton::OpenPr { label, repo, pr, checks }) if ui.button(*label).clicked() => {
+                                        actions.push(Action::OpenPr { repo: repo.clone(), pr: pr.clone() });
+                                        if *checks {
+                                            actions.push(Action::PrView(prview::PrOp::ShowTab(prview::Tab::Checks)));
+                                        }
+                                        dismiss = Some(i);
+                                    }
+                                    Some(ToastButton::DeleteBranch { repo, branch, force }) if ui.button("Delete branch").clicked() => {
+                                        actions.push(views::delete_branch(repo, branch, *force));
                                         dismiss = Some(i);
                                     }
                                     _ => {}
@@ -3914,8 +4128,18 @@ impl eframe::App for HeadwayApp {
             for p in self.visible_repos() {
                 self.forge_refresh(&p, Reason::Focus);
             }
+            self.inbox_refresh(Reason::Focus);
         }
         self.focused = focused;
+        // The inbox is kept fresh even out of focus, for its alerts (the cache says how often).
+        let now_t = ctx.input(|i| i.time);
+        if now_t - self.inbox_polled >= 5.0 {
+            self.inbox_polled = now_t;
+            self.inbox_refresh(Reason::Poll);
+        }
+        if !focused && !self.forge_repos.is_empty() {
+            ctx.request_repaint_after(std::time::Duration::from_secs(60));
+        }
         // While the window has focus, keep what's on screen fresh (the cache says how often).
         let now = ctx.input(|i| i.time);
         if focused && now - self.forge_polled >= 5.0 {
@@ -3969,7 +4193,10 @@ impl eframe::App for HeadwayApp {
                 None => {
                     let ws = self.cfg.ws().clone();
                     let cards: HashMap<PathBuf, ForgeCard> = ws.repos.iter().map(|r| (r.clone(), self.forge_card(r))).collect();
-                    overview::show(ui, &ws, &self.summaries, &cards, &self.busy, &mut actions);
+                    let grouped = self.inbox_grouped();
+                    let count = grouped.action_count();
+                    let view = (self.overview_tab == overview::OverviewTab::Inbox).then(|| self.inbox_view(grouped));
+                    overview::show(ui, &ws, &self.summaries, &cards, &self.busy, overview::Tabs { tab: self.overview_tab, inbox_count: count, inbox: view.as_ref() }, &mut actions);
                 }
                 Some(p) => {
                     let ws = self.cfg.ws().clone();

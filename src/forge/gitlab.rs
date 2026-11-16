@@ -117,6 +117,13 @@ impl Forge for GitLab {
         Ok(trim_log(&text, LOG_LINES).0)
     }
 
+    /// One GraphQL call for the signed-in user's three lists, kept to `repos`.
+    fn inbox(&self, _me: &str, repos: &[RepoKey], since: i64) -> ForgeResult<Inbox> {
+        let q = format!("query={}", inbox_query(since));
+        let reply: InboxReply = self.json(&["api", "graphql", "-f", &q])?;
+        Ok(parse_inbox(reply, &self.host)?.keep(repos))
+    }
+
     fn merge(&self, repo: &RepoKey, number: u64, req: &MergeRequest) -> ForgeResult<()> {
         self.act(&merge_args(&self.host, repo, number, req)).map(drop)
     }
@@ -310,6 +317,18 @@ pub fn mrs_query(branches: &[String]) -> String {
 const MR_FRAGMENT: &str = "fragment mr on MergeRequest { \
 iid title state draft webUrl updatedAt sourceBranch targetBranch diffHeadSha author { username } sourceProject { fullPath } targetProject { fullPath } \
 approved detailedMergeStatus reviewers { nodes { username } } headPipeline { status jobs(first: 100) { nodes { status allowFailure } } } }";
+
+/// The inbox: merge requests asking for my review, mine open, and mine merged
+/// since `since`, across every project (the caller keeps the workspace's).
+pub fn inbox_query(since: i64) -> String {
+    format!(
+        "query {{ currentUser {{ \
+review: reviewRequestedMergeRequests(state: opened, first: 100, sort: UPDATED_DESC) {{ nodes {{ ...mr }} }} \
+mine: authoredMergeRequests(state: opened, first: 100, sort: UPDATED_DESC) {{ nodes {{ ...mr }} }} \
+merged: authoredMergeRequests(state: merged, mergedAfter: \"{}T00:00:00Z\", first: 50, sort: UPDATED_DESC) {{ nodes {{ ...mr }} }} }} }} {MR_FRAGMENT}",
+        day_of(since)
+    )
+}
 
 /// One query for the sidebar's three lists (by me, asking me for a review, all
 /// open), `limit` each, newest first.
@@ -574,6 +593,36 @@ pub fn conversation_query(number: u64) -> String {
         "query($path: ID!) {{ project(fullPath: $path) {{ mergeRequest(iid: \"{number}\") {{ discussions(first: 100) {{ nodes {{ notes {{ nodes {{ \
 author {{ username }} body createdAt system url position {{ newPath newLine oldPath oldLine }} }} }} }} }} }} }} }}"
     )
+}
+
+#[derive(Deserialize)]
+pub struct InboxReply {
+    data: Option<InboxData>,
+    #[serde(default)]
+    errors: Vec<GqlError>,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct InboxData {
+    current_user: Option<InboxUser>,
+}
+
+#[derive(Deserialize)]
+struct InboxUser {
+    review: Option<Nodes<MrNode>>,
+    mine: Option<Nodes<MrNode>>,
+    merged: Option<Nodes<MrNode>>,
+}
+
+/// Each merge request with the project it's in (the one it merges into).
+pub fn parse_inbox(reply: InboxReply, host: &str) -> ForgeResult<Inbox> {
+    gql_error(&reply.errors)?;
+    let user = reply.data.and_then(|d| d.current_user).ok_or(ForgeError::NotFound)?;
+    let list = |n: Option<Nodes<MrNode>>| -> Vec<InboxPr> {
+        n.map(|n| n.nodes).unwrap_or_default().iter().flatten().filter_map(|m| Some(InboxPr { repo: RepoKey { host: host.to_string(), path: m.target_project.as_ref()?.full_path.clone() }, pr: mr_from(m) })).collect()
+    };
+    Ok(Inbox { review: list(user.review), mine: list(user.mine), merged: list(user.merged), ..Default::default() })
 }
 
 #[derive(Deserialize)]
@@ -1058,6 +1107,25 @@ mod tests {
         assert_eq!(cli.calls().last().unwrap().1[3], "projects/acme%2Fshop/merge_requests/13/unapprove");
         let refused = forge(Arc::new(StubCli::default().on(Tool::Glab, &["api", "-X", "PUT"], Answer::Fail(1, "glab: 405 Method Not Allowed (HTTP 405)\n{\"message\":\"405 Method Not Allowed\"}"))));
         assert_eq!(refused.merge(&shop(), 13, &plain).unwrap_err().to_string(), "glab: 405 Method Not Allowed (HTTP 405)\n{\"message\":\"405 Method Not Allowed\"}");
+    }
+
+
+    #[test]
+    fn the_inbox_reads_my_lists_and_groups_each_merge_request() {
+        use crate::inbox::{Group, InboxPrefs, group};
+        let repos = [RepoKey { host: "gitlab.example.org".into(), path: "group/app".into() }];
+        let inbox = parse_inbox(serde_json::from_str(include_str!("fixtures/glab-inbox.json")).unwrap(), "gitlab.example.org").unwrap().keep(&repos);
+        assert_eq!((inbox.review.len(), inbox.mine.len(), inbox.merged.len()), (1, 2, 1), "group/elsewhere is left out");
+        let g = group(&[&inbox], &InboxPrefs::default(), 0);
+        let shape: Vec<(Group, Vec<u64>)> = g.groups.iter().map(|(g, l)| (*g, l.iter().map(|i| i.pr.pr.number).collect())).collect();
+        assert_eq!(shape, [(Group::NeedsReview, vec![31]), (Group::Failing, vec![13]), (Group::Ready, vec![14])]);
+        let q = inbox_query(parse_time("2026-11-16T15:00:00Z").unwrap());
+        assert!(q.contains("merged: authoredMergeRequests(state: merged, mergedAfter: \"2026-11-16T00:00:00Z\""));
+        // Through glab: one call.
+        let cli = Arc::new(StubCli::default().on(Tool::Glab, &["api", "graphql"], Answer::Ok(include_str!("fixtures/glab-inbox.json"))));
+        let gl = forge(cli.clone());
+        let got = gl.inbox("tanuki-user", &[RepoKey { host: "gitlab.example.org".into(), path: "group/app".into() }], 0).unwrap();
+        assert_eq!((got.review.len(), cli.calls().len()), (1, 1));
     }
 
 }

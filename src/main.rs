@@ -11,6 +11,7 @@ mod forge;
 mod git;
 mod graph;
 mod highlight;
+mod inbox;
 mod markdown;
 mod newpr;
 mod oplog;

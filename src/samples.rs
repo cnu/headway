@@ -197,7 +197,7 @@ mod imp {
         b.commit(JO, "Explain favorites in the README", 2);
         b.git(&["checkout", "-q", "main"]);
         // Branches with pull requests on the sample's (pretend) GitHub: a draft, and
-        // one with failing checks and changes requested. See `web_shop_forge`.
+        // one with failing checks and changes requested. See `sample_forge`.
         b.git(&["checkout", "-q", "-b", "feature/reviews"]);
         b.write("src/reviews.js", "export function average(reviews) {\n  return reviews.reduce((s, r) => s + r.stars, 0) / reviews.length;\n}\n");
         b.commit(SAM, "Show product reviews (work in progress)", 4);
@@ -240,12 +240,14 @@ mod imp {
     /// Where the sample projects live, and the forge fixtures they use (development
     /// builds talk to these instead of GitHub for anything in the samples folder).
     pub fn fake_forge() -> Option<(PathBuf, crate::forge::fake::FakeData)> {
-        Some((samples_dir(), web_shop_forge(now())))
+        Some((samples_dir(), sample_forge(now())))
     }
 
-    /// The web-shop's pull requests: open with passing checks, a draft, failing
-    /// checks with changes requested, and a merged one whose branch is still here.
-    pub fn web_shop_forge(now: i64) -> crate::forge::fake::FakeData {
+    /// The samples' forges: web-shop's pull requests on GitHub (open with
+    /// passing checks, a draft, failing checks with changes requested, and a
+    /// merged one whose branch is still here), and api-server's merge requests
+    /// on GitLab (one asking for your review, one of yours failing).
+    pub fn sample_forge(now: i64) -> crate::forge::fake::FakeData {
         use crate::forge::fake::{FakeData, FakeHost, FakeRepo};
         use crate::forge::*;
         let pr = |number: u64, title: &str, state: PrState, author: &str, branch: &str, hours_ago: i64| PullRequest {
@@ -306,7 +308,50 @@ mod imp {
         let labels = ["bug", "checkout", "design", "documentation", "enhancement"].map(String::from).to_vec();
         let details = web_shop_details(now);
         data.repos.insert("github.com/headway-samples/web-shop".into(), FakeRepo { info: Some(info), pulls, users, labels, details, ..Default::default() });
+        api_server_forge(&mut data, now);
         data
+    }
+
+    /// api-server on GitLab: Jo's timeout fix waiting for your review, your
+    /// rate limiting with a failing pipeline, and an older merged one.
+    fn api_server_forge(data: &mut crate::forge::fake::FakeData, now: i64) {
+        use crate::forge::fake::{FakeHost, FakeRepo};
+        use crate::forge::*;
+        let web = "https://gitlab.com/headway-samples/api-server";
+        let mr = |number: u64, title: &str, state: PrState, author: &str, branch: &str, hours_ago: i64| PullRequest {
+            number,
+            title: title.into(),
+            state,
+            author: author.into(),
+            head_branch: branch.into(),
+            base_branch: "main".into(),
+            head_repo: None,
+            url: format!("{web}/-/merge_requests/{number}"),
+            review: ReviewDecision::None,
+            requested_reviewers: vec![],
+            checks: CheckSummary::default(),
+            mergeable: Mergeable::Unknown,
+            updated: now - hours_ago * 3600,
+            head_oid: None,
+        };
+        let pulls = vec![
+            PullRequest {
+                requested_reviewers: vec!["alex-rivera".into()],
+                review: ReviewDecision::ReviewRequired,
+                checks: CheckSummary::from_states([(CheckState::Passing, 3)]),
+                mergeable: Mergeable::Clean,
+                ..mr(7, "Raise request timeout to 30 seconds", PrState::Open, "jo-lindqvist", "fix/timeouts", 4)
+            },
+            PullRequest {
+                checks: CheckSummary::from_states([(CheckState::Passing, 2), (CheckState::Failing, 1)]),
+                mergeable: Mergeable::Blocked,
+                ..mr(8, "Rate-limit the orders route", PrState::Open, "alex-rivera", "feature/rate-limit", 6)
+            },
+            PullRequest { review: ReviewDecision::Approved, checks: CheckSummary::from_states([(CheckState::Passing, 3)]), ..mr(5, "Log slow requests", PrState::Merged, "alex-rivera", "feature/slow-log", 24 * 9) },
+        ];
+        let info = RepoInfo { default_branch: "main".into(), merge_methods: vec![MergeMethod::Merge, MergeMethod::Squash], web_url: web.into() };
+        data.hosts.insert("gitlab.com".into(), FakeHost { kind: ForgeKind::GitLab, user: Some("alex-rivera".into()), installed: true });
+        data.repos.insert("gitlab.com/headway-samples/api-server".into(), FakeRepo { info: Some(info), pulls, users: vec!["alex-rivera".into(), "jo-lindqvist".into()], ..Default::default() });
     }
 
     /// What the web-shop's pull request views show: #13 has a failing Actions
@@ -410,7 +455,7 @@ mod imp {
     /// `HEADWAY_FAKE_FORGE` (screenshots, trying the whole app on fixtures).
     fn write_fake_forge() {
         let dir = samples_dir().join("fake-forge");
-        if let Ok(json) = serde_json::to_string_pretty(&web_shop_forge(now())) {
+        if let Ok(json) = serde_json::to_string_pretty(&sample_forge(now())) {
             let _ = std::fs::create_dir_all(&dir).and_then(|_| std::fs::write(dir.join("forge.json"), json));
         }
     }
@@ -467,7 +512,17 @@ mod imp {
         b.commit(JO, "Listen on every interface", 30);
         // Uncommitted work, so blame of the working copy has something new.
         b.write("api/server.py", &(api_server(4, true, "0.0.0.0") + "DEBUG = False\n"));
+        // A GitLab origin with main and Jo's branch (not real: merge requests come from fixtures).
+        b.git(&["remote", "add", "origin", API_SERVER_ORIGIN]);
+        for branch in ["main", "fix/timeouts"] {
+            let tip = b.rev(branch);
+            b.git(&["update-ref", &format!("refs/remotes/origin/{branch}"), &tip]);
+            b.git(&["config", &format!("branch.{branch}.remote"), "origin"]);
+            b.git(&["config", &format!("branch.{branch}.merge"), &format!("refs/heads/{branch}")]);
+        }
     }
+
+    pub const API_SERVER_ORIGIN: &str = "https://gitlab.com/headway-samples/api-server.git";
 
     fn build_tokens(b: &mut Builder) {
         b.write("tokens.json", "{\n  \"color\": { \"primary\": \"#2f6\" }\n}\n");
@@ -608,7 +663,7 @@ mod imp {
             let remotes = forge::pick_remotes(&git::remote_urls(&dir).unwrap()).unwrap();
             assert_eq!(remotes.key().to_string(), "github.com/headway-samples/web-shop");
             let (branches, _) = git::branches(&dir).unwrap();
-            let data = web_shop_forge(now());
+            let data = sample_forge(now());
             let pulls = &data.repos["github.com/headway-samples/web-shop"].pulls;
             for pr in pulls {
                 assert!(branches.iter().any(|b| !b.remote && b.name == pr.head_branch), "{} is a local branch", pr.head_branch);

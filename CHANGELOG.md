@@ -11,6 +11,23 @@ workflow uses that version's section as the GitHub release notes.
 
 ### Added
 
+- **Review inbox and alerts**: the workspace overview has an Inbox tab next to
+  the repository cards, listing the pull requests (and merge requests) that
+  need you across every repository in the workspace: reviews asked of you or
+  your team, then yours with failing checks, with changes requested, ready to
+  merge, and your other open ones, each with its repository, number, title,
+  author, checks, review state and age. Click one to open it in its
+  repository's window. Pin one to the top, or snooze it until tomorrow or next
+  week (kept with the workspace); the tab counts what needs doing. Each GitHub
+  or GitLab host is asked once for the whole workspace (GitHub's searches,
+  GitLab's lists of yours), on the usual refresh schedule and rate limits, and
+  only for the workspace that's open. When something changes for you (checks
+  fail on yours, yours is approved, changes are requested, someone asks for
+  your review, yours is merged), a notification says so with a button for
+  what's next (Show checks, Open, Delete branch), and the window asks for
+  attention when it's in the background. Each alerts once, and nothing from
+  before Headway started; each kind can be turned off in the Inbox's Alerts
+  menu. Repositories whose forge isn't connected are listed with how to fix it.
 - **GitHub and GitLab connection**: Headway finds out which repositories are on
   GitHub or GitLab (GitHub Enterprise and self-managed GitLab too) and talks to
   them through the `gh` and `glab` you're already signed in to, so it never

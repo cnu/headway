@@ -92,6 +92,12 @@ impl FakeForges {
     pub fn data(&self) -> std::sync::RwLockReadGuard<'_, FakeData> {
         self.data.read().unwrap()
     }
+
+    /// Change the fixtures, as if things happened on the forge (tests).
+    #[cfg(test)]
+    pub fn data_mut(&self) -> std::sync::RwLockWriteGuard<'_, FakeData> {
+        self.data.write().unwrap()
+    }
 }
 
 impl Forges for FakeForges {
@@ -222,6 +228,34 @@ impl Forge for FakeForge {
         }
         merge.viewer_is_author = pr.author == me;
         Ok(PrDetails { pr, body: d.body, can_rerun: d.can_rerun, merge })
+    }
+
+    /// Across the repositories asked about: open ones asking me for a review,
+    /// mine open, and mine merged since `since`.
+    fn inbox(&self, me: &str, repos: &[RepoKey], since: i64) -> ForgeResult<Inbox> {
+        self.host()?;
+        let data = self.data.read().unwrap();
+        let mut inbox = Inbox::default();
+        for key in repos {
+            let Some(r) = data.repos.get(&key.to_string()) else { continue };
+            for pr in &r.pulls {
+                let item = || InboxPr { repo: key.clone(), pr: pr.clone() };
+                let open = matches!(pr.state, PrState::Open | PrState::Draft);
+                if open && pr.author != me && pr.requested_reviewers.iter().any(|r| r == me) {
+                    inbox.review.push(item());
+                }
+                if open && pr.author == me {
+                    inbox.mine.push(item());
+                }
+                if pr.state == PrState::Merged && pr.author == me && pr.updated >= since {
+                    inbox.merged.push(item());
+                }
+            }
+        }
+        for list in [&mut inbox.review, &mut inbox.mine, &mut inbox.merged] {
+            list.sort_by_key(|i| std::cmp::Reverse(i.pr.updated));
+        }
+        Ok(inbox.keep(repos))
     }
 
     /// Refused like the real ones when something's in the way (unless it's
@@ -386,7 +420,7 @@ mod tests {
     /// a merge with something in the way is refused unless it's auto-merge.
     #[test]
     fn pull_requests_are_merged_reviewed_and_closed() {
-        let data = crate::samples::web_shop_forge(1_000_000);
+        let data = crate::samples::sample_forge(1_000_000);
         let forges = FakeForges::new(data);
         let gh = forges.forge(ForgeKind::GitHub, "github.com", None);
         let key = RepoKey { host: "github.com".into(), path: "headway-samples/web-shop".into() };

@@ -14,11 +14,14 @@ pub struct Workspace {
     /// `None` shows the workspace overview.
     #[serde(default)]
     pub active_tab: Option<usize>,
+    /// The overview's inbox: pins, snoozes and which alerts are off.
+    #[serde(default)]
+    pub inbox: crate::inbox::InboxPrefs,
 }
 
 impl Workspace {
     pub fn new(name: &str) -> Self {
-        Self { name: name.to_string(), repos: Vec::new(), open_tabs: Vec::new(), active_tab: None }
+        Self { name: name.to_string(), repos: Vec::new(), open_tabs: Vec::new(), active_tab: None, inbox: Default::default() }
     }
 }
 
@@ -150,6 +153,11 @@ mod tests {
         ws.repos = vec!["/a".into(), "/b".into()];
         ws.open_tabs = vec!["/b".into()];
         ws.active_tab = Some(0);
+        // Pins, snoozes and alerts are the workspace's own.
+        let pr = |n: u64| crate::inbox::PrRef { repo: crate::forge::RepoKey { host: "github.com".into(), path: "acme/shop".into() }, number: n };
+        ws.inbox.pin(pr(12));
+        ws.inbox.snooze(pr(14), 1_900_000_000);
+        ws.inbox.alerts_off.push(crate::inbox::AlertKind::Merged);
         let cfg = Config { workspaces: vec![ws, Workspace::new("Other")], current: 1, view: ViewPrefs { sidebar_open: false, split: 0.3, ..Default::default() }, hidden_refs: [(PathBuf::from("/a"), vec!["refs/heads/x".to_string()])].into(), merge_methods: Default::default(), file: None };
         let back: Config = serde_json::from_str(&serde_json::to_string(&cfg).unwrap()).unwrap();
         assert_eq!(back.current, 1);
@@ -157,5 +165,10 @@ mod tests {
         assert_eq!(back.workspaces[0].open_tabs, [PathBuf::from("/b")]);
         assert_eq!(back.view, cfg.view);
         assert_eq!(back.hidden_refs, cfg.hidden_refs);
+        assert_eq!(back.workspaces[0].inbox, cfg.workspaces[0].inbox);
+        assert_eq!(back.workspaces[0].inbox.snoozed_until(&pr(14), 0), Some(1_900_000_000));
+        assert_eq!(back.workspaces[1].inbox, crate::inbox::InboxPrefs::default(), "not shared with the other workspace");
+        let old = r#"{"workspaces":[{"name":"Old","repos":["/x"]}],"current":0}"#;
+        assert_eq!(serde_json::from_str::<Config>(old).unwrap().ws().inbox, crate::inbox::InboxPrefs::default(), "older settings load");
     }
 }

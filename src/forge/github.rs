@@ -152,6 +152,18 @@ impl Forge for GitHub {
         Ok(trim_log(&failed_job_log(&text, &check.name), LOG_LINES).0)
     }
 
+    /// Every search in one GraphQL call (as variables), scoped to the repositories.
+    fn inbox(&self, _me: &str, repos: &[RepoKey], since: i64) -> ForgeResult<Inbox> {
+        let searches = inbox_searches(repos, since);
+        if searches.is_empty() {
+            return Ok(Inbox { repos: repos.to_vec(), ..Default::default() });
+        }
+        let vars: Vec<(String, &str)> = searches.iter().map(|(alias, q)| (format!("{alias}_q"), q.as_str())).collect();
+        let aliases: Vec<&str> = searches.iter().map(|(a, _)| a.as_str()).collect();
+        let data: InboxData = self.graphql(&inbox_query(&aliases), &vars)?;
+        Ok(parse_inbox(data, &self.host)?.keep(repos))
+    }
+
     fn merge(&self, repo: &RepoKey, number: u64, req: &MergeRequest) -> ForgeResult<()> {
         self.act(&merge_args(repo, number, req)).map(drop)
     }
@@ -388,6 +400,49 @@ mine: search(query: $mine, type: ISSUE, first: {n}) {{ nodes {{ ...pr }} }} \
 review: search(query: $review, type: ISSUE, first: {n}) {{ nodes {{ ...pr }} }} \
 repository(owner: $owner, name: $name) {{ pullRequests(states: OPEN, first: {n}, orderBy: {{field: UPDATED_AT, direction: DESC}}) {{ totalCount nodes {{ ...pr }} }} }} }} {PR_FRAGMENT}"
     )
+}
+
+/// GitHub refuses search terms longer than this.
+const SEARCH_MAX: usize = 256;
+
+/// The inbox's searches, as (alias, terms): asking for my review (GitHub
+/// counts my teams too), mine open, and mine merged since `since`. Each is
+/// scoped with `repo:` terms, split over several searches (`review0`,
+/// `review1`, …) when there are too many repositories for one.
+pub fn inbox_searches(repos: &[RepoKey], since: i64) -> Vec<(String, String)> {
+    let kinds = [
+        ("review", "is:pr is:open archived:false review-requested:@me".to_string()),
+        ("mine", "is:pr is:open archived:false author:@me".to_string()),
+        ("merged", format!("is:pr is:merged author:@me merged:>={}", day_of(since))),
+    ];
+    let mut out = Vec::new();
+    for (name, base) in kinds {
+        let mut chunk = base.clone();
+        let mut n = 0;
+        for r in repos {
+            let term = format!(" repo:{}", r.path);
+            if chunk.len() + term.len() > SEARCH_MAX && chunk != base {
+                out.push((format!("{name}{n}"), chunk));
+                n += 1;
+                chunk = base.clone();
+            }
+            chunk.push_str(&term);
+        }
+        if chunk != base {
+            out.push((format!("{name}{n}"), chunk));
+        }
+    }
+    out
+}
+
+/// One query for the inbox's searches (their terms go in as `<alias>_q`).
+pub fn inbox_query(aliases: &[&str]) -> String {
+    let vars: String = aliases.iter().map(|a| format!("${a}_q: String!")).collect::<Vec<_>>().join(", ");
+    let fields: String = aliases
+        .iter()
+        .map(|a| format!(" {a}: search(query: ${a}_q, type: ISSUE, first: 50) {{ nodes {{ ...pr ... on PullRequest {{ repository {{ nameWithOwner }} }} }} }}"))
+        .collect();
+    format!("query({vars}) {{ rateLimit {{ remaining resetAt }}{fields} }} {PR_FRAGMENT}")
 }
 
 /// The search terms for a list: open pull requests in `owner/name`, plus `who`.
@@ -672,6 +727,40 @@ pub fn conversation_query(number: u64) -> String {
 comments(first: 100) {{ nodes {{ author {{ login }} body createdAt url }} }} \
 reviews(first: 100) {{ nodes {{ author {{ login }} state body submittedAt url comments(first: 100) {{ nodes {{ author {{ login }} body createdAt path line originalLine url }} }} }} }} }} }} }}"
     )
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct InboxData {
+    rate_limit: Option<RateLimit>,
+    #[serde(flatten)]
+    searches: HashMap<String, Connection<InboxNode>>,
+}
+
+#[derive(Deserialize)]
+struct InboxNode {
+    #[serde(flatten)]
+    pr: PrNode,
+    repository: NameWithOwner,
+}
+
+/// The searches' answers sorted into the inbox's lists by their alias.
+pub fn parse_inbox(data: InboxData, host: &str) -> ForgeResult<Inbox> {
+    let mut inbox = Inbox { slow_down_until: data.rate_limit.filter(|r| r.remaining < LOW_RATE).and_then(|r| parse_time(&r.reset_at)), ..Default::default() };
+    let mut aliases: Vec<&String> = data.searches.keys().collect();
+    aliases.sort();
+    for alias in aliases {
+        let list = match alias.trim_end_matches(|c: char| c.is_ascii_digit()) {
+            "review" => &mut inbox.review,
+            "mine" => &mut inbox.mine,
+            "merged" => &mut inbox.merged,
+            _ => continue,
+        };
+        for n in data.searches[alias].nodes.iter().flatten() {
+            list.push(InboxPr { repo: RepoKey { host: host.to_string(), path: n.repository.name_with_owner.clone() }, pr: pr_from(&n.pr) });
+        }
+    }
+    Ok(inbox)
 }
 
 #[derive(Deserialize)]
@@ -1241,6 +1330,58 @@ mod tests {
             refused.merge(&key, 12, &squash).unwrap_err().to_string(),
             "X Pull request team/app#12 is not mergeable: the base branch policy prohibits the merge.\nTo have the pull request merged after all the requirements have been met, add the `--auto` flag."
         );
+    }
+
+
+    /// Each fixture pull request lands in its inbox group; one from outside the
+    /// workspace is left out.
+    #[test]
+    fn the_inbox_reads_every_search_and_groups_each_pull_request() {
+        use crate::inbox::{Group, InboxPrefs, group};
+        let repos = [RepoKey { host: "github.com".into(), path: "acme/api".into() }, RepoKey { host: "github.com".into(), path: "acme/shop".into() }];
+        let inbox = parse_inbox(gql(include_str!("fixtures/gh-inbox.json")), "github.com").unwrap().keep(&repos);
+        assert_eq!((inbox.review.len(), inbox.mine.len(), inbox.merged.len()), (2, 4, 1), "acme/other is left out");
+        assert_eq!(inbox.merged[0].pr.state, PrState::Merged);
+        let g = group(&[&inbox], &InboxPrefs::default(), 0);
+        let shape: Vec<(Group, Vec<(String, u64)>)> = g.groups.iter().map(|(g, l)| (*g, l.iter().map(|i| (i.pr.repo.path.clone(), i.pr.pr.number)).collect())).collect();
+        let at = |p: &str, n: u64| (p.to_string(), n);
+        assert_eq!(
+            shape,
+            [
+                (Group::NeedsReview, vec![at("acme/shop", 21), at("acme/api", 4)]),
+                (Group::Failing, vec![at("acme/shop", 13)]),
+                (Group::ChangesRequested, vec![at("acme/shop", 15)]),
+                (Group::Ready, vec![at("acme/shop", 12)]),
+                (Group::Mine, vec![at("acme/api", 9)]),
+            ]
+        );
+        assert_eq!(g.action_count(), 5);
+    }
+
+    #[test]
+    fn inbox_searches_are_scoped_to_the_workspace_and_split_when_long() {
+        let since = parse_time("2026-11-16T15:00:00Z").unwrap();
+        let few = [RepoKey { host: "github.com".into(), path: "acme/shop".into() }];
+        let s = inbox_searches(&few, since);
+        assert_eq!(
+            s,
+            [
+                ("review0".to_string(), "is:pr is:open archived:false review-requested:@me repo:acme/shop".to_string()),
+                ("mine0".to_string(), "is:pr is:open archived:false author:@me repo:acme/shop".to_string()),
+                ("merged0".to_string(), "is:pr is:merged author:@me merged:>=2026-11-16 repo:acme/shop".to_string()),
+            ]
+        );
+        let many: Vec<RepoKey> = (0..20).map(|i| RepoKey { host: "github.com".into(), path: format!("some-organisation/repository-{i}") }).collect();
+        let s = inbox_searches(&many, since);
+        assert!(s.iter().all(|(_, q)| q.len() <= 256), "GitHub's limit");
+        let review: Vec<&(String, String)> = s.iter().filter(|(a, _)| a.starts_with("review")).collect();
+        assert!(review.len() > 1 && review[1].0 == "review1");
+        let mentioned: usize = review.iter().map(|(_, q)| q.matches(" repo:").count()).sum();
+        assert_eq!(mentioned, 20, "every repository in some search");
+        assert!(inbox_searches(&[], since).is_empty());
+        let q = inbox_query(&["review0", "mine0"]);
+        assert!(q.starts_with("query($review0_q: String!, $mine0_q: String!) { rateLimit"));
+        assert!(q.contains(" mine0: search(query: $mine0_q, type: ISSUE, first: 50)"));
     }
 
 }

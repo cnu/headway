@@ -202,6 +202,8 @@ pub enum PrOp {
     SetState(StateChange),
     /// Open the merge dialog.
     Merge,
+    /// Turn to this tab (an alert's "Show checks").
+    ShowTab(Tab),
 }
 
 fn op(o: PrOp) -> Action {

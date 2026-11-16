@@ -2603,7 +2603,7 @@ fn web_shop(s: &Scratch, branch: &str) -> PathBuf {
 
 fn web_shop_forge() -> std::sync::Arc<dyn crate::forge::Forges> {
     let now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_secs() as i64;
-    std::sync::Arc::new(crate::forge::fake::FakeForges::new(crate::samples::web_shop_forge(now)))
+    std::sync::Arc::new(crate::forge::fake::FakeForges::new(crate::samples::sample_forge(now)))
 }
 
 #[test]
@@ -2977,7 +2977,7 @@ fn a_pull_request_is_approved_and_another_squash_merged_from_its_view() {
     // On #12's branch, so merging it offers to switch to main.
     let r = web_shop(&s, "feature/search");
     serve_web_shop(&s, &r);
-    let forges = std::sync::Arc::new(crate::forge::fake::FakeForges::new(crate::samples::web_shop_forge(crate::forge::now_secs())));
+    let forges = std::sync::Arc::new(crate::forge::fake::FakeForges::new(crate::samples::sample_forge(crate::forge::now_secs())));
     let mut h = app_with_forge(&s, &r, true, forges.clone());
 
     // Someone else's draft: approve it, with a comment. The box empties once it's posted.
@@ -3041,7 +3041,7 @@ fn a_pull_request_is_approved_and_another_squash_merged_from_its_view() {
 fn merging_is_refused_with_the_reason_and_closing_asks_first() {
     let s = scratch("pr-merge-blocked");
     let r = web_shop(&s, "main");
-    let forges = std::sync::Arc::new(crate::forge::fake::FakeForges::new(crate::samples::web_shop_forge(crate::forge::now_secs())));
+    let forges = std::sync::Arc::new(crate::forge::fake::FakeForges::new(crate::samples::sample_forge(crate::forge::now_secs())));
     let mut h = app_with_forge(&s, &r, true, forges.clone());
     click(&mut h, "#13 Round cart totals to cents by alex-rivera, checks failing, changes requested");
     click(&mut h, "Merge…");
@@ -3061,11 +3061,112 @@ fn merging_is_refused_with_the_reason_and_closing_asks_first() {
     assert_eq!(forge_done(&forges), ["close #13"]);
 }
 
+/// The sample workspace's two forge projects (web-shop on GitHub, api-server
+/// on GitLab), on the overview.
+fn inbox_app(s: &Scratch, forges: std::sync::Arc<crate::forge::fake::FakeForges>) -> (Harness<'static, HeadwayApp>, PathBuf, PathBuf) {
+    let shop = web_shop(s, "main");
+    let api = s.root.join("api-server");
+    crate::samples::build_sample_at(&api, "api-server");
+    let mut ws = Workspace::new("Office");
+    ws.repos = vec![shop.clone(), api.clone()];
+    let cfg = Config::for_test(vec![ws], s.root.join("settings.json"));
+    let mut h = Harness::builder()
+        .with_size(egui::vec2(1600.0, 1000.0))
+        .with_step_dt(1.0 / 60.0)
+        .with_context_setup(|ctx| ctx.add_font_provider(std::sync::Arc::new(egui_system_font_provider::SystemFontProvider::new())))
+        .build_eframe(move |cc| {
+            let mut app = HeadwayApp::with_config(cc.egui_ctx.clone(), cfg, false, None);
+            app.set_forges(forges);
+            app
+        });
+    settle(&mut h);
+    (h, shop, api)
+}
+
+#[test]
+fn the_inbox_lists_what_needs_me_across_repositories_and_alerts_on_changes() {
+    let s = scratch("inbox");
+    let forges = std::sync::Arc::new(crate::forge::fake::FakeForges::new(crate::samples::sample_forge(crate::forge::now_secs())));
+    let (mut h, shop, api) = inbox_app(&s, forges.clone());
+    // What was so before the app started doesn't alert (#15 already asked for my review).
+    assert!(!shows_containing(&h, "asks for your review"));
+
+    // Five need me: two reviews, two failing, one ready to merge.
+    click(&mut h, "Inbox 5");
+    assert!(shows(&h, "5 need you"));
+    assert!(shows(&h, "Needs your review 2") && shows(&h, "Your pull requests with failing checks 2") && shows(&h, "Your pull requests ready to merge 1"));
+    assert!(shows(&h, "web-shop #15 Dark theme for the storefront") && shows(&h, "api-server !7 Raise request timeout to 30 seconds"));
+    assert!(shows(&h, "web-shop #13 Round cart totals to cents") && shows(&h, "api-server !8 Rate-limit the orders route"));
+    assert!(!shows_containing(&h, "#14 Show product reviews"), "someone else's, not asking me");
+
+    // Pin one to the top; snooze another until tomorrow (it stops counting).
+    click(&mut h, "More for web-shop #12");
+    click(&mut h, "Pin to the top");
+    assert!(shows(&h, "Pinned 1"));
+    click(&mut h, "More for api-server !7");
+    click(&mut h, "Snooze until tomorrow");
+    assert!(shows(&h, "Inbox 4") && shows(&h, "Needs your review 1") && shows(&h, "1 snoozed · Show"));
+    // Saved with the workspace.
+    let saved: Config = serde_json::from_str(&std::fs::read_to_string(s.root.join("settings.json")).unwrap()).unwrap();
+    let prefs = &saved.ws().inbox;
+    assert_eq!(prefs.pinned.iter().map(|p| (p.repo.to_string(), p.number)).collect::<Vec<_>>(), [("github.com/headway-samples/web-shop".to_string(), 12)]);
+    assert_eq!(prefs.snoozed.iter().map(|p| (p.pr.repo.to_string(), p.pr.number)).collect::<Vec<_>>(), [("gitlab.com/headway-samples/api-server".to_string(), 7)]);
+    assert!(prefs.snoozed[0].until > crate::forge::now_secs() + 23 * 3600);
+
+    // Things happen: Sam asks me to review #14, and #12 is merged.
+    {
+        let mut d = forges.data_mut();
+        let shop_prs = &mut d.repos.get_mut("github.com/headway-samples/web-shop").unwrap().pulls;
+        shop_prs.iter_mut().find(|p| p.number == 14).unwrap().requested_reviewers.push("alex-rivera".into());
+        let merged = shop_prs.iter_mut().find(|p| p.number == 12).unwrap();
+        merged.state = crate::forge::PrState::Merged;
+        merged.updated = crate::forge::now_secs();
+    }
+    click(&mut h, "⟳");
+    assert!(shows_containing(&h, "sam-okafor asks for your review on #14 Show product reviews"));
+    assert!(shows_containing(&h, "#12 Add product search was merged into main"));
+    assert!(shows(&h, "web-shop #14 Show product reviews"), "listed for review now");
+    assert!(!shows(&h, "Pinned 1"), "a merged one leaves the inbox, pin and all");
+    // Each alerts once: asking again changes nothing.
+    click(&mut h, "⟳");
+    assert_eq!(h.query_all_by_label_contains("asks for your review on #14").count(), 1);
+    // The merged branch can go from the alert (undoably).
+    click(&mut h, "Delete branch");
+    assert!(git::run(&shop, &["rev-parse", "--verify", "-q", "refs/heads/feature/search"]).is_err());
+
+    // Turned off, an alert kind says nothing: !8 approved, quietly.
+    click(&mut h, "Alerts");
+    click(&mut h, "My pull requests approved");
+    key(&mut h, egui::Key::Escape);
+    assert_eq!(h.state().cfg.ws().inbox.alerts_off, [crate::inbox::AlertKind::Approved]);
+    forges.data_mut().repos.get_mut("gitlab.com/headway-samples/api-server").unwrap().pulls.iter_mut().find(|p| p.number == 8).unwrap().review = crate::forge::ReviewDecision::Approved;
+    click(&mut h, "⟳");
+    assert!(!shows_containing(&h, "was approved"));
+    assert!(shows_containing(&h, "!8 Rate-limit the orders route"), "still failing, still listed");
+
+    // A click opens it in its repository's window.
+    click(&mut h, "api-server !8 Rate-limit the orders route");
+    assert_eq!(h.state().active_path().as_deref(), Some(api.as_path()));
+    assert_eq!(h.state().tabs.get(&api).unwrap().pr_view.as_ref().map(|v| v.pr.number), Some(8));
+}
+
+#[test]
+fn repositories_whose_forge_isnt_connected_say_how_to_fix_it() {
+    let s = scratch("inbox-signed-out");
+    let mut data = crate::samples::sample_forge(crate::forge::now_secs());
+    data.hosts.get_mut("gitlab.com").unwrap().user = None;
+    let (mut h, _, _) = inbox_app(&s, std::sync::Arc::new(crate::forge::fake::FakeForges::new(data)));
+    click(&mut h, "Inbox 3");
+    assert!(shows(&h, "Not connected 1"));
+    assert!(shows(&h, "Run glab auth login --hostname gitlab.com in a terminal to see merge requests"));
+    assert!(shows(&h, "web-shop #15 Dark theme for the storefront"), "GitHub's are still there");
+}
+
 #[test]
 fn rerun_is_refused_with_a_reason_without_permission() {
     let s = scratch("pr-view-denied");
     let r = web_shop(&s, "main");
-    let mut data = crate::samples::web_shop_forge(crate::forge::now_secs());
+    let mut data = crate::samples::sample_forge(crate::forge::now_secs());
     data.repos.values_mut().for_each(|repo| repo.details.values_mut().for_each(|d| d.can_rerun = false));
     let mut h = app_with_forge(&s, &r, true, std::sync::Arc::new(crate::forge::fake::FakeForges::new(data)));
     click(&mut h, "#13 Round cart totals to cents by alex-rivera, checks failing, changes requested");

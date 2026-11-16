@@ -385,7 +385,7 @@ mod tests {
 
     #[test]
     fn badges_for_each_sample_pull_request() {
-        let data = crate::samples::web_shop_forge(1_000_000);
+        let data = crate::samples::sample_forge(1_000_000);
         let pulls = &data.repos["github.com/headway-samples/web-shop"].pulls;
         let st = |n: u64| PrStatus { pr: pulls.iter().find(|p| p.number == n).unwrap().clone(), kind: ForgeKind::GitHub, as_of: 1_000_000, tip_matches: false };
         let rel = |t: i64| format!("{}s", 1_000_000 - t);
