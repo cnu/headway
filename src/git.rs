@@ -2205,6 +2205,9 @@ pub struct Operation {
     pub before: Option<String>,
     /// The external merge tool from `merge.tool`, if one is set.
     pub merge_tool: Option<String>,
+    /// An interactive rebase stopped on purpose (an `edit` step): the commit is applied
+    /// and nothing conflicts; change it if you like, then continue.
+    pub editing: bool,
 }
 
 impl Operation {
@@ -2229,7 +2232,8 @@ impl Operation {
 
     /// Skip only makes sense when there's a sequence of commits to carry on with.
     pub fn can_skip(&self) -> bool {
-        self.kind == OpType::Rebase || self.remaining > 0
+        // At an `edit` step the commit is already applied: skipping would only throw away your changes to it.
+        (self.kind == OpType::Rebase && !self.editing) || self.remaining > 0
     }
 }
 
@@ -2283,7 +2287,18 @@ pub fn operation(repo: &Path) -> GitResult<Option<Operation>> {
         let rebased = file("head-name").and_then(|h| h.strip_prefix("refs/heads/").map(String::from));
         let onto = file("onto").map(|o| name_commit(repo, &o)).unwrap_or_else(|| "?".into());
         let (n, of) = if dir == "rebase-merge" { (file("msgnum"), file("end")) } else { (file("next"), file("last")) };
-        let step = n.and_then(|n| n.parse().ok()).zip(of.and_then(|o| o.parse().ok()));
+        let mut step = n.and_then(|n| n.parse().ok()).zip(of.and_then(|o| o.parse().ok()));
+        // An interactive rebase also has update-ref and drop lines: count only the commits.
+        if dir == "rebase-merge"
+            && exists("rebase-merge/interactive")
+            && let (Some(done), Some(todo)) = (file("done"), file("git-rebase-todo"))
+        {
+            step = Some(crate::rebase::progress(&done, &todo)).filter(|s| s.1 > 0);
+        }
+        // Stopped on an `edit` step (a squash or fixup that conflicts leaves the same files).
+        let editing = dir == "rebase-merge"
+            && file("done").and_then(|d| crate::rebase::current_command(&d)) == Some(crate::rebase::Act::Edit)
+            && !has_conflicts(repo);
         // REBASE_HEAD is the commit that stopped; older gits only leave stopped-sha.
         let stopped = if exists("REBASE_HEAD") { Some("REBASE_HEAD".to_string()) } else { file("stopped-sha") };
         let commit = stopped.as_deref().and_then(|c| commit_title(repo, c));
@@ -2297,6 +2312,7 @@ pub fn operation(repo: &Path) -> GitResult<Option<Operation>> {
             remaining: 0,
             before: file("orig-head").map(|o| short_id(repo, &o)),
             merge_tool,
+            editing,
         }
     } else if exists("MERGE_HEAD") {
         Operation {
@@ -2309,6 +2325,7 @@ pub fn operation(repo: &Path) -> GitResult<Option<Operation>> {
             remaining: 0,
             before: Some(short_id(repo, "HEAD")),
             merge_tool,
+            editing: false,
         }
     } else if exists("CHERRY_PICK_HEAD") || exists("REVERT_HEAD") {
         let pick = exists("CHERRY_PICK_HEAD");
@@ -2331,6 +2348,7 @@ pub fn operation(repo: &Path) -> GitResult<Option<Operation>> {
             remaining,
             before: before(),
             merge_tool,
+            editing: false,
         }
     } else {
         return Ok(None);
@@ -2339,8 +2357,14 @@ pub fn operation(repo: &Path) -> GitResult<Option<Operation>> {
 }
 
 /// Carry on after the conflicts are resolved. A merge uses `message` when given
-/// (else the prepared merge message); nothing ever opens an editor.
+/// (else the prepared merge message); nothing ever opens an editor (a rebase
+/// Headway started answers git's message requests itself, see `rebase.rs`).
 pub fn continue_operation(repo: &Path, kind: OpType, message: Option<&str>) -> GitResult<String> {
+    if kind == OpType::Rebase
+        && let Some(s) = current_session(repo)
+    {
+        return step_rebase(repo, s, "--continue");
+    }
     let env = [("GIT_EDITOR", "true")];
     match (kind, message.map(str::trim).filter(|m| !m.is_empty())) {
         (OpType::Merge, Some(m)) => run_stdin_env(repo, &["commit", "-F", "-"], m, &env),
@@ -2349,11 +2373,27 @@ pub fn continue_operation(repo: &Path, kind: OpType, message: Option<&str>) -> G
 }
 
 pub fn abort_operation(repo: &Path, kind: OpType) -> GitResult<String> {
-    run(repo, &[kind.command(), "--abort"])
+    let session = (kind == OpType::Rebase).then(|| current_session(repo)).flatten();
+    let out = run(repo, &[kind.command(), "--abort"])?;
+    if let Some(s) = session {
+        // Fixup into…: the fixup commit made first goes too, and its changes are staged again.
+        if let Some((fixup, before)) = &s.fixup
+            && run(repo, &["rev-parse", "HEAD"]).is_ok_and(|h| h.trim() == fixup)
+        {
+            let _ = run(repo, &["reset", "--soft", before]);
+        }
+        forget_session(repo);
+    }
+    Ok(out)
 }
 
 /// Leave out the commit that stopped and go on with the rest.
 pub fn skip_operation(repo: &Path, kind: OpType) -> GitResult<String> {
+    if kind == OpType::Rebase
+        && let Some(s) = current_session(repo)
+    {
+        return step_rebase(repo, s, "--skip");
+    }
     run_env(repo, &[kind.command(), "--skip"], &[("GIT_EDITOR", "true")])
 }
 
@@ -2745,6 +2785,351 @@ fn bases_from_index(repo: &Path, stages: &[IndexStage], marker_size: usize) -> G
 }
 
 // ---------------------------------------------------------------------------
+// Interactive rebase (the plan and the todo list are in rebase.rs)
+
+const IN_PROGRESS: &str = "A merge, rebase, cherry-pick or revert is in progress. Finish or abort it first.";
+
+fn rebase_running(repo: &Path) -> bool {
+    ["rebase-merge", "rebase-apply"].iter().any(|n| git_path(repo, n).is_ok_and(|p| p.exists()))
+}
+
+/// A rebase is waiting after a command (an `edit` step, or a conflict).
+pub fn rebase_stopped(repo: &Path) -> bool {
+    rebase_running(repo)
+}
+
+fn absolute(p: PathBuf) -> PathBuf {
+    std::path::absolute(&p).unwrap_or(p)
+}
+
+/// Where Headway keeps what a rebase it started needs (right for linked worktrees too).
+fn session_dir(repo: &Path) -> GitResult<PathBuf> {
+    git_path(repo, "headway-rebase").map(absolute)
+}
+
+fn write_session(dir: &Path, s: &crate::rebase::Session) -> GitResult<()> {
+    std::fs::create_dir_all(dir).map_err(|e| format!("Couldn't prepare the rebase: {e}"))?;
+    let text = serde_json::to_string(s).map_err(|e| e.to_string())?;
+    std::fs::write(dir.join(crate::rebase::SESSION_FILE), text).map_err(|e| format!("Couldn't prepare the rebase: {e}"))
+}
+
+/// The session of the rebase that's running now. One left behind by a rebase that
+/// ended some other way (the command line, say) is deleted.
+fn current_session(repo: &Path) -> Option<crate::rebase::Session> {
+    let dir = session_dir(repo).ok()?;
+    let text = std::fs::read_to_string(dir.join(crate::rebase::SESSION_FILE)).ok()?;
+    let s: crate::rebase::Session = serde_json::from_str(&text).ok().or_else(|| {
+        let _ = std::fs::remove_dir_all(&dir);
+        None
+    })?;
+    let same_onto = s.onto.as_ref().is_none_or(|o| read_git_file(repo, "rebase-merge/onto").as_ref() == Some(o));
+    if rebase_running(repo) && same_onto && read_git_file(repo, "rebase-merge/orig-head").as_deref() == Some(s.orig_head.as_str()) {
+        Some(s)
+    } else {
+        let _ = std::fs::remove_dir_all(&dir);
+        None
+    }
+}
+
+fn forget_session(repo: &Path) {
+    if let Ok(d) = session_dir(repo) {
+        let _ = std::fs::remove_dir_all(d);
+    }
+}
+
+/// The rebase stopped: keep what Undo needs until it's finished.
+pub fn keep_undo_for_later(repo: &Path, prep: UndoPrep, what: &str) {
+    if let (Some(mut s), Ok(dir)) = (current_session(repo), session_dir(repo)) {
+        s.undo = Some(prep);
+        s.what = what.to_string();
+        let _ = write_session(&dir, &s);
+    }
+}
+
+/// The rebase is over: record it for Undo, and forget the session.
+fn finish_session(repo: &Path, s: &crate::rebase::Session) {
+    if let Some(prep) = s.undo.clone()
+        && let Ok(Some(e)) = finish_undo(repo, prep, &s.what)
+    {
+        let _ = crate::oplog::push(repo, e);
+    }
+    forget_session(repo);
+}
+
+fn has_conflicts(repo: &Path) -> bool {
+    run(repo, &["diff", "--name-only", "--diff-filter=U"]).is_ok_and(|o| !o.trim().is_empty())
+}
+
+/// What to tell the user when a rebase stopped.
+fn stop_message(repo: &Path) -> String {
+    match operation(repo) {
+        Ok(Some(op)) => {
+            let at = op.step.map(|(n, of)| format!("Stopped at {n} of {of}")).unwrap_or_else(|| "Stopped".into());
+            let commit = op.commit.clone().unwrap_or_else(|| "a commit".into());
+            if op.editing { format!("{at} to edit {commit}") } else { format!("{at}: {commit} has conflicts") }
+        }
+        _ => "The rebase stopped".into(),
+    }
+}
+
+/// Git's answer to starting or continuing a rebase: finished, stopped (to edit or on
+/// conflicts; that isn't an error), or failed.
+fn rebase_result(repo: &Path, out: std::process::Output) -> GitResult<String> {
+    let ok = out.status.success();
+    let text = |o: &std::process::Output| {
+        let e = String::from_utf8_lossy(&o.stderr).trim().to_string();
+        if e.is_empty() { String::from_utf8_lossy(&o.stdout).trim().to_string() } else { e }
+    };
+    if rebase_running(repo) {
+        if ok || has_conflicts(repo) {
+            return Ok(stop_message(repo));
+        }
+        return Err(text(&out));
+    }
+    if ok { Ok(String::from_utf8_lossy(&out.stdout).into_owned()) } else { Err(text(&out)) }
+}
+
+/// Continue or skip a rebase Headway started, with the same editors.
+fn step_rebase(repo: &Path, s: crate::rebase::Session, flag: &str) -> GitResult<String> {
+    let dir = session_dir(repo)?;
+    let ed = crate::rebase::editors(&std::env::current_exe().unwrap_or_else(|_| "headway".into()), &dir.join(crate::rebase::TODO_FILE), &dir);
+    let mut env: Vec<(&str, &str)> = vec![("GIT_SEQUENCE_EDITOR", "true"), ("GIT_EDITOR", &ed.message)];
+    env.extend(ed.env.iter().map(|(k, v)| (k.as_str(), v.as_str())));
+    let comment = s.comment_char.map(|c| format!("core.commentChar={c}"));
+    let mut args: Vec<&str> = Vec::new();
+    if let Some(c) = &comment {
+        args.extend(["-c", c]);
+    }
+    args.extend(["rebase", flag]);
+    let out = exec(repo, &args, &env, None).map_err(|e| format!("Could not start git: {e}"))?;
+    let result = rebase_result(repo, out);
+    if !rebase_running(repo) {
+        // Git failing after the history was rewritten (a hook, say) still leaves something to undo.
+        let moved = run(repo, &["rev-parse", "HEAD"]).is_ok_and(|h| h.trim() != s.orig_head);
+        if result.is_ok() || moved { finish_session(repo, &s) } else { forget_session(repo) }
+    }
+    result
+}
+
+/// The commits from `from` up to HEAD as a range git understands (everything, for a root commit).
+fn range_from(repo: &Path, from: &str) -> String {
+    if run(repo, &["rev-parse", "-q", "--verify", &format!("{from}^")]).is_ok() { format!("{from}^..HEAD") } else { "HEAD".into() }
+}
+
+/// A sentence about the first merge commit in the range, if there is one.
+fn merge_in_range(repo: &Path, range: &str) -> GitResult<Option<String>> {
+    let found = run(repo, &["log", "--min-parents=2", "--max-count=1", "--format=%h%x1f%s", range])?;
+    Ok(found.trim().split_once('\x1f').map(|(h, s)| {
+        format!(
+            "This range includes a merge commit ({h} “{s}”). An interactive rebase here would flatten it into plain commits and lose the merge, so Headway doesn't offer it yet. Start from a commit after the merge, or use `git rebase -i --rebase-merges` in a terminal."
+        )
+    }))
+}
+
+/// What the interactive rebase editor starts from.
+pub struct RebaseRange {
+    pub plan: crate::rebase::Plan,
+    /// The checked-out branch (none when HEAD is detached).
+    pub branch: Option<String>,
+    /// There are uncommitted changes to tracked files, which git sets aside for the rebase.
+    pub dirty: bool,
+    /// This git can move the branches in the range along (2.38 and later).
+    pub update_refs: bool,
+    /// What the first commit is rebased onto, to show.
+    pub onto: String,
+}
+
+fn can_update_refs(repo: &Path) -> bool {
+    can_preview_merges(repo)
+}
+
+/// The commits from `from` to HEAD, oldest first, ready to edit. Fails, saying why,
+/// when that can't be rebased: not on this branch, a merge in the way, or another operation.
+pub fn rebase_range(repo: &Path, from: &str) -> GitResult<RebaseRange> {
+    let from = run(repo, &["rev-parse", "--verify", "-q", &format!("{from}^{{commit}}")]).map_err(|_| "That commit can't be found.".to_string())?.trim().to_string();
+    if operation(repo)?.is_some() {
+        return Err(IN_PROGRESS.into());
+    }
+    if run(repo, &["rev-parse", "-q", "--verify", "HEAD"]).is_err() || run(repo, &["merge-base", "--is-ancestor", &from, "HEAD"]).is_err() {
+        return Err("Only commits on the current branch can be rebased. Check out the branch that has this commit first.".into());
+    }
+    let range = range_from(repo, &from);
+    if let Some(why) = merge_in_range(repo, &range)? {
+        return Err(why);
+    }
+    let log = run(repo, &["log", "--reverse", "--format=%H%x1f%s%x1f%B%x1e", &range])?;
+    let unpushed: std::collections::HashSet<String> =
+        run(repo, &["rev-list", &range, "--not", "--remotes"])?.lines().map(|l| l.trim().to_string()).collect();
+    let head_ref = run(repo, &["symbolic-ref", "-q", "HEAD"]).ok().map(|s| s.trim().to_string()).filter(|s| !s.is_empty());
+    // Branches checked out in another worktree stay where they are: moving one would leave
+    // that folder's files out of step with it.
+    let elsewhere: Vec<String> = worktrees(repo).unwrap_or_default().into_iter().filter(|w| !w.is_current).filter_map(|w| w.branch).map(|b| format!("refs/heads/{b}")).collect();
+    let mut by_commit: HashMap<String, Vec<String>> = HashMap::new();
+    for l in run(repo, &["for-each-ref", "--format=%(refname)%1f%(objectname)", "refs/heads"])?.lines() {
+        if let Some((name, oid)) = l.split_once('\x1f')
+            && Some(name) != head_ref.as_deref()
+            && !elsewhere.iter().any(|e| e == name)
+        {
+            by_commit.entry(oid.to_string()).or_default().push(name.to_string());
+        }
+    }
+    let mut steps = Vec::new();
+    for rec in log.split('\x1e').map(|r| r.trim_start_matches('\n')).filter(|r| !r.trim().is_empty()) {
+        let mut f = rec.splitn(3, '\x1f');
+        let (Some(hash), Some(summary), Some(msg)) = (f.next(), f.next(), f.next()) else { continue };
+        let message = msg.trim_end().to_string();
+        steps.push(crate::rebase::Step {
+            hash: hash.to_string(),
+            summary: summary.to_string(),
+            original: message.clone(),
+            message,
+            act: crate::rebase::Act::Pick,
+            branches: by_commit.remove(hash).unwrap_or_default(),
+            pushed: !unpushed.contains(hash),
+        });
+    }
+    if steps.is_empty() {
+        return Err("There are no commits to rebase.".into());
+    }
+    let onto = run(repo, &["rev-parse", "--short", &format!("{}^", steps[0].hash)]).map(|s| s.trim().to_string()).unwrap_or_else(|_| "the start of history".into());
+    let dirty = !run(repo, &["status", "--porcelain", "--untracked-files=no"])?.trim().is_empty();
+    let mut plan = crate::rebase::Plan::new(steps);
+    plan.taken_at = Some((run(repo, &["rev-parse", "HEAD"])?.trim().to_string(), head_ref.clone()));
+    Ok(RebaseRange {
+        plan,
+        branch: head_ref.map(|r| r.strip_prefix("refs/heads/").unwrap_or(&r).to_string()),
+        dirty,
+        update_refs: can_update_refs(repo),
+        onto,
+    })
+}
+
+/// Start a rebase with git's help: our todo list, our messages, and every step
+/// that can be done on its own done at once. Stops (not an error) at an `edit`
+/// step or a conflict; Continue, Skip and Abort take it from there.
+pub fn rebase_interactive(repo: &Path, plan: &crate::rebase::Plan, autostash: bool) -> GitResult<String> {
+    if let Some(p) = plan.problem() {
+        return Err(p);
+    }
+    if operation(repo)?.is_some() {
+        return Err(IN_PROGRESS.into());
+    }
+    let first = plan.first_original().ok_or("There are no commits to rebase.")?.to_string();
+    // The plan is for the commits that were checked out when the editor opened.
+    if let Some((oid, branch)) = &plan.taken_at {
+        let now_oid = run(repo, &["rev-parse", "HEAD"])?.trim().to_string();
+        let now_branch = run(repo, &["symbolic-ref", "-q", "HEAD"]).ok().map(|s| s.trim().to_string()).filter(|s| !s.is_empty());
+        if &now_oid != oid || &now_branch != branch {
+            return Err("The branch has changed since the editor was opened (a new commit, or another branch checked out). Open it again from the commit you want.".into());
+        }
+    }
+    forget_session(repo);
+    let update_refs = can_update_refs(repo);
+    let dir = session_dir(repo)?;
+    std::fs::create_dir_all(&dir).map_err(|e| format!("Couldn't prepare the rebase: {e}"))?;
+    let todo = dir.join(crate::rebase::TODO_FILE);
+    std::fs::write(&todo, plan.todo(update_refs)).map_err(|e| format!("Couldn't prepare the rebase: {e}"))?;
+    let head = run(repo, &["rev-parse", "HEAD"])?.trim().to_string();
+    let onto = run(repo, &["rev-parse", "-q", "--verify", &format!("{first}^")]).ok().map(|s| s.trim().to_string());
+    let session = crate::rebase::Session {
+        orig_head: head,
+        onto,
+        what: "interactive rebase".into(),
+        rebase_merge: absolute(git_path(repo, "rebase-merge")?),
+        comment_char: plan.messages().comment_char(),
+        messages: plan.messages(),
+        fixup: None,
+        undo: None,
+    };
+    write_session(&dir, &session)?;
+    let ed = crate::rebase::editors(&std::env::current_exe().unwrap_or_else(|_| "headway".into()), &todo, &dir);
+    let mut env: Vec<(&str, &str)> = vec![("GIT_SEQUENCE_EDITOR", &ed.sequence), ("GIT_EDITOR", &ed.message)];
+    env.extend(ed.env.iter().map(|(k, v)| (k.as_str(), v.as_str())));
+    let base = format!("{first}^");
+    let comment = session.comment_char.map(|c| format!("core.commentChar={c}"));
+    let mut args: Vec<&str> = Vec::new();
+    if let Some(c) = &comment {
+        args.extend(["-c", c]);
+    }
+    args.extend(["rebase", "-i"]);
+    if update_refs {
+        args.push("--update-refs");
+    }
+    if autostash {
+        args.push("--autostash");
+    }
+    if run(repo, &["rev-parse", "-q", "--verify", &base]).is_ok() {
+        args.push(&base);
+    } else {
+        args.push("--root");
+    }
+    let out = exec(repo, &args, &env, None).map_err(|e| format!("Could not start git: {e}"));
+    let result = out.and_then(|o| rebase_result(repo, o));
+    if !rebase_running(repo) {
+        forget_session(repo);
+    }
+    result
+}
+
+/// Make a fixup commit of what's staged for `target`, then fold it into `target`
+/// (git's `--autosquash`), all at once. Stops like [`rebase_interactive`].
+pub fn fixup_into(repo: &Path, target: &str) -> GitResult<String> {
+    if operation(repo)?.is_some() {
+        return Err(IN_PROGRESS.into());
+    }
+    let target = run(repo, &["rev-parse", "--verify", "-q", &format!("{target}^{{commit}}")]).map_err(|_| "That commit can't be found.".to_string())?.trim().to_string();
+    if run(repo, &["merge-base", "--is-ancestor", &target, "HEAD"]).is_err() {
+        return Err("Pick a commit on the current branch.".into());
+    }
+    if run(repo, &["diff", "--cached", "--name-only"])?.trim().is_empty() {
+        return Err("Nothing is staged. Stage the changes that belong in that commit first.".into());
+    }
+    let range = range_from(repo, &target);
+    if let Some(why) = merge_in_range(repo, &range)? {
+        return Err(why);
+    }
+    forget_session(repo);
+    let before = run(repo, &["rev-parse", "HEAD"])?.trim().to_string();
+    run(repo, &["commit", "--fixup", &target])?;
+    let fixup = run(repo, &["rev-parse", "HEAD"])?.trim().to_string();
+    let dir = session_dir(repo)?;
+    let session = crate::rebase::Session {
+        orig_head: fixup.clone(),
+        onto: run(repo, &["rev-parse", "-q", "--verify", &format!("{target}^")]).ok().map(|s| s.trim().to_string()),
+        what: format!("fix up into {}", &target[..target.len().min(7)]),
+        rebase_merge: absolute(git_path(repo, "rebase-merge")?),
+        messages: Default::default(),
+        comment_char: None,
+        fixup: Some((fixup.clone(), before.clone())),
+        undo: None,
+    };
+    write_session(&dir, &session)?;
+    let ed = crate::rebase::editors(&std::env::current_exe().unwrap_or_else(|_| "headway".into()), &dir.join(crate::rebase::TODO_FILE), &dir);
+    let mut env: Vec<(&str, &str)> = vec![("GIT_SEQUENCE_EDITOR", "true"), ("GIT_EDITOR", &ed.message)];
+    env.extend(ed.env.iter().map(|(k, v)| (k.as_str(), v.as_str())));
+    let base = format!("{target}^");
+    let mut args = vec!["rebase", "-i", "--autosquash", "--autostash"];
+    if can_update_refs(repo) {
+        args.push("--update-refs");
+    }
+    if run(repo, &["rev-parse", "-q", "--verify", &base]).is_ok() {
+        args.push(&base);
+    } else {
+        args.push("--root");
+    }
+    let out = exec(repo, &args, &env, None).map_err(|e| format!("Could not start git: {e}"));
+    let result = out.and_then(|o| rebase_result(repo, o));
+    if !rebase_running(repo) {
+        forget_session(repo);
+        if result.is_err() && run(repo, &["rev-parse", "HEAD"]).is_ok_and(|h| h.trim() == fixup) {
+            // It didn't start: take the fixup commit back, so the changes are staged as they were.
+            let _ = run(repo, &["reset", "--soft", &before]);
+        }
+    }
+    result
+}
+
+// ---------------------------------------------------------------------------
 // Undo: what an action changed, so it can be put back
 
 /// How an action's undo puts things back.
@@ -2773,6 +3158,9 @@ pub enum Undoable {
     Tree { save_work: bool },
     /// These files (repository-relative) will change on disk.
     Files(Vec<String>),
+    /// An interactive rebase, which may stop part-way: like `Tree`, but the entry is
+    /// made when the rebase is finished. `save_work`: as for `Tree`.
+    Rebase { save_work: bool },
 }
 
 /// Where HEAD is: on a branch (full ref name) and/or at a commit.
@@ -2783,7 +3171,7 @@ pub struct HeadState {
 }
 
 /// Every local branch and tag, HEAD and the stashes, at one moment.
-#[derive(Clone, Debug, Default, PartialEq)]
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
 pub struct RefState {
     pub head: HeadState,
     pub refs: std::collections::BTreeMap<String, String>,
@@ -2862,6 +3250,7 @@ pub struct UndoEntry {
 }
 
 /// What was saved before an action ran; [`finish_undo`] turns it into an entry.
+#[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct UndoPrep {
     mode: UndoMode,
     before: RefState,
@@ -2877,7 +3266,7 @@ pub fn prepare_undo(repo: &Path, what: &Undoable) -> GitResult<UndoPrep> {
     let mode = match what {
         Undoable::Refs => UndoMode::Refs,
         Undoable::Index => UndoMode::Index,
-        Undoable::Tree { .. } => UndoMode::Tree,
+        Undoable::Tree { .. } | Undoable::Rebase { .. } => UndoMode::Tree,
         Undoable::Files(_) => UndoMode::Files,
     };
     let mut prep = UndoPrep { mode, before: ref_state(repo)?, index: None, saved_work: None, files: Vec::new(), problem: None };
@@ -2887,7 +3276,21 @@ pub fn prepare_undo(repo: &Path, what: &Undoable) -> GitResult<UndoPrep> {
             Ok(t) => prep.index = Some(t.trim().to_string()),
             Err(_) => prep.problem = Some("the staging area had unresolved conflicts, which can't be saved".into()),
         },
-        Undoable::Tree { save_work } => {
+        Undoable::Rebase { save_work: true } => {
+            // Only the staged changes (Fixup into…): the rest stays in the files and comes
+            // back by itself, so undoing can't clash with it. Built like a stash commit.
+            let staged = run(repo, &["write-tree"]).and_then(|t| {
+                let t = t.trim().to_string();
+                let index = run(repo, &["commit-tree", &t, "-p", "HEAD", "-m", "index"])?;
+                let work = run(repo, &["commit-tree", &t, "-p", "HEAD", "-p", index.trim(), "-m", "staged changes"])?;
+                Ok(work.trim().to_string())
+            });
+            match staged {
+                Ok(w) => prep.saved_work = Some(w),
+                Err(_) => prep.problem = Some("your staged changes couldn't be saved first".into()),
+            }
+        }
+        Undoable::Tree { save_work } | Undoable::Rebase { save_work } => {
             if *save_work {
                 // A commit holding the staged and unstaged changes, without touching them.
                 match run(repo, &["stash", "create"]) {
@@ -6594,5 +6997,644 @@ index 4444444..0000000
         for d in [&dir, &server, &other] {
             let _ = std::fs::remove_dir_all(d);
         }
+    }
+
+    // ---- Interactive rebase
+
+    use crate::rebase::{Act, Plan};
+
+    /// A repository with commits c1 to c5, each adding its own file (so they reorder freely).
+    fn lab(name: &str) -> PathBuf {
+        let dir = temp_repo(name);
+        for n in 1..=5 {
+            commit_file_with(&dir, &format!("f{n}.txt"), &format!("{n}\n"), &format!("c{n}"));
+        }
+        dir
+    }
+
+    /// The editor's plan for the commits from `subject` to HEAD.
+    fn plan_from(dir: &Path, subject: &str) -> Plan {
+        rebase_range(dir, &commit_id(dir, subject)).unwrap().plan
+    }
+
+    fn row(plan: &Plan, subject: &str) -> usize {
+        plan.steps.iter().position(|s| s.summary == subject).unwrap_or_else(|| panic!("no row {subject}"))
+    }
+
+    fn set(plan: &mut Plan, subject: &str, act: Act) {
+        let i = row(plan, subject);
+        plan.steps[i].act = act;
+    }
+
+    fn subjects(dir: &Path) -> Vec<String> {
+        run(dir, &["log", "--reverse", "--format=%s"]).unwrap().lines().map(String::from).collect()
+    }
+
+    fn rebase(dir: &Path, plan: &Plan) -> GitResult<String> {
+        rebase_interactive(dir, plan, false)
+    }
+
+    fn clean(dir: &Path) {
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn rebase_range_lists_the_commits_oldest_first_and_says_what_it_can_move() {
+        let dir = lab("rb-range");
+        run(&dir, &["branch", "mid", &commit_id(&dir, "c3")]).unwrap();
+        let r = rebase_range(&dir, &commit_id(&dir, "c2")).unwrap();
+        assert_eq!(r.plan.steps.iter().map(|s| s.summary.as_str()).collect::<Vec<_>>(), ["c2", "c3", "c4", "c5"]);
+        assert_eq!(r.plan.steps[1].branches, vec!["refs/heads/mid".to_string()]);
+        assert!(r.plan.steps[0].branches.is_empty(), "the checked-out branch isn't listed");
+        assert_eq!(r.branch.as_deref(), Some("main"));
+        assert!(!r.dirty);
+        assert!(r.plan.steps.iter().all(|s| !s.pushed));
+        // From the very first commit, too.
+        assert_eq!(rebase_range(&dir, &commit_id(&dir, "c1")).unwrap().plan.steps.len(), 5);
+        clean(&dir);
+    }
+
+    #[test]
+    fn reorder_commits() {
+        let dir = lab("rb-reorder");
+        let mut plan = plan_from(&dir, "c2");
+        let (a, b) = (row(&plan, "c3"), row(&plan, "c4"));
+        plan.move_to(b, a);
+        rebase(&dir, &plan).unwrap();
+        assert_eq!(subjects(&dir), ["c1", "c2", "c4", "c3", "c5"]);
+        assert!(operation(&dir).unwrap().is_none());
+        for n in 1..=5 {
+            assert!(dir.join(format!("f{n}.txt")).exists());
+        }
+        assert!(!dir.join(".git").join("headway-rebase").exists(), "the session is cleaned up");
+        clean(&dir);
+    }
+
+    #[test]
+    fn squash_melts_commits_with_the_combined_message_and_fixup_keeps_the_first() {
+        let dir = lab("rb-squash");
+        let mut plan = plan_from(&dir, "c2");
+        set(&mut plan, "c3", Act::Squash);
+        set(&mut plan, "c4", Act::Fixup);
+        let chain = plan.chains()[0].clone();
+        // c2 + c3's message by default; the fixup adds nothing.
+        assert_eq!(plan.combined(&chain), "c2\n\nc3");
+        plan.set_combined(&chain, "Cart and search\n\nBoth parts, together.".into());
+        assert_eq!(plan.counts(), (4, 2));
+        rebase(&dir, &plan).unwrap();
+        assert_eq!(subjects(&dir), ["c1", "Cart and search", "c5"]);
+        assert_eq!(message_of(&dir, "HEAD~1"), "Cart and search\n\nBoth parts, together.");
+        for n in 2..=4 {
+            assert!(dir.join(format!("f{n}.txt")).exists(), "the melted commits' files are kept");
+        }
+        clean(&dir);
+    }
+
+    #[test]
+    fn squash_defaults_to_the_messages_joined_and_a_fixup_alone_keeps_the_first() {
+        let dir = lab("rb-squash-default");
+        let mut plan = plan_from(&dir, "c2");
+        set(&mut plan, "c3", Act::Squash);
+        set(&mut plan, "c5", Act::Fixup);
+        rebase(&dir, &plan).unwrap();
+        assert_eq!(subjects(&dir), ["c1", "c2", "c4"]);
+        assert_eq!(message_of(&dir, "HEAD~1"), "c2\n\nc3");
+        assert_eq!(message_of(&dir, "HEAD"), "c4", "a fixup adds nothing to the message");
+        clean(&dir);
+    }
+
+    #[test]
+    fn drop_leaves_a_commit_out() {
+        let dir = lab("rb-drop");
+        let mut plan = plan_from(&dir, "c2");
+        set(&mut plan, "c3", Act::Drop);
+        assert_eq!(plan.counts(), (4, 3));
+        rebase(&dir, &plan).unwrap();
+        assert_eq!(subjects(&dir), ["c1", "c2", "c4", "c5"]);
+        assert!(!dir.join("f3.txt").exists());
+        clean(&dir);
+    }
+
+    #[test]
+    fn reword_changes_the_message_inline() {
+        let dir = lab("rb-reword");
+        let mut plan = plan_from(&dir, "c2");
+        let i = row(&plan, "c4");
+        plan.steps[i].act = Act::Reword;
+        plan.steps[i].message = "c4 reworded\n\nwith a body".into();
+        let j = row(&plan, "c2");
+        plan.steps[j].act = Act::Reword;
+        plan.steps[j].message = "c2 reworded".into();
+        rebase(&dir, &plan).unwrap();
+        assert_eq!(subjects(&dir), ["c1", "c2 reworded", "c3", "c4 reworded", "c5"]);
+        assert_eq!(message_of(&dir, "HEAD~1"), "c4 reworded\n\nwith a body");
+        clean(&dir);
+    }
+
+    #[test]
+    fn edit_stops_and_continue_finishes() {
+        let dir = lab("rb-edit");
+        let mut plan = plan_from(&dir, "c2");
+        set(&mut plan, "c3", Act::Edit);
+        let said = rebase(&dir, &plan).unwrap();
+        assert!(said.starts_with("Stopped at 2 of 4 to edit"), "{said}");
+        let op = operation(&dir).unwrap().expect("a rebase is waiting");
+        assert_eq!(op.kind, OpType::Rebase);
+        assert!(op.editing);
+        assert_eq!(op.step, Some((2, 4)));
+        assert_eq!(head_subject(&dir), "c3");
+        // Change the commit while it waits.
+        std::fs::write(dir.join("extra.txt"), "more\n").unwrap();
+        stage(&dir, &["extra.txt".into()]).unwrap();
+        commit(&dir, "c3 with extra", true).unwrap();
+        continue_operation(&dir, OpType::Rebase, None).unwrap();
+        assert!(operation(&dir).unwrap().is_none());
+        assert_eq!(subjects(&dir), ["c1", "c2", "c3 with extra", "c4", "c5"]);
+        assert!(dir.join("extra.txt").exists() && dir.join("f5.txt").exists());
+        assert!(!dir.join(".git").join("headway-rebase").exists());
+        clean(&dir);
+    }
+
+    fn head_subject(dir: &Path) -> String {
+        message_of(dir, "HEAD").lines().next().unwrap_or("").to_string()
+    }
+
+    /// c1 base, then c2 and c3 both edit shared.txt (so swapping them conflicts), c4 and c5 are free.
+    fn clashing(name: &str) -> PathBuf {
+        let dir = temp_repo(name);
+        commit_file_with(&dir, "shared.txt", "base\n", "c1");
+        commit_file_with(&dir, "shared.txt", "from c2\n", "c2");
+        commit_file_with(&dir, "shared.txt", "from c3\n", "c3");
+        commit_file_with(&dir, "f4.txt", "4\n", "c4");
+        commit_file_with(&dir, "f5.txt", "5\n", "c5");
+        dir
+    }
+
+    #[test]
+    fn a_conflict_stops_and_abort_puts_everything_back() {
+        let dir = clashing("rb-conflict-abort");
+        run(&dir, &["branch", "tip", "HEAD"]).unwrap();
+        run(&dir, &["branch", "on-c3", &commit_id(&dir, "c3")]).unwrap();
+        let before = snapshot(&dir);
+        let mut plan = plan_from(&dir, "c2");
+        let (a, b) = (row(&plan, "c2"), row(&plan, "c3"));
+        plan.move_to(b, a);
+        let said = rebase(&dir, &plan).unwrap();
+        assert!(said.contains("has conflicts"), "{said}");
+        let op = operation(&dir).unwrap().unwrap();
+        assert_eq!((op.kind, op.editing, op.step), (OpType::Rebase, false, Some((1, 4))));
+        abort_operation(&dir, OpType::Rebase).unwrap();
+        assert!(operation(&dir).unwrap().is_none());
+        assert_eq!(snapshot(&dir), before);
+        assert!(!dir.join(".git").join("headway-rebase").exists());
+        clean(&dir);
+    }
+
+    #[test]
+    fn resolving_conflicts_and_continuing_keeps_every_message_where_it_belongs() {
+        let dir = clashing("rb-conflict-continue");
+        let mut plan = plan_from(&dir, "c2");
+        let (a, b) = (row(&plan, "c2"), row(&plan, "c3"));
+        plan.move_to(b, a);
+        // git also opens the editor for a commit resumed after a conflict: it must keep its
+        // own message, and the reword after it must still get the one chosen for it.
+        let i = row(&plan, "c5");
+        plan.steps[i].act = Act::Reword;
+        plan.steps[i].message = "c5 renamed".into();
+        rebase(&dir, &plan).unwrap();
+        for round in 0..4 {
+            if operation(&dir).unwrap().is_none() {
+                break;
+            }
+            assert!(round < 3, "it keeps stopping");
+            std::fs::write(dir.join("shared.txt"), format!("resolved {round}\n")).unwrap();
+            stage(&dir, &["shared.txt".into()]).unwrap();
+            continue_operation(&dir, OpType::Rebase, None).unwrap();
+        }
+        assert!(operation(&dir).unwrap().is_none());
+        assert_eq!(subjects(&dir), ["c1", "c3", "c2", "c4", "c5 renamed"]);
+        assert!(!dir.join(".git").join("headway-rebase").exists());
+        clean(&dir);
+    }
+
+    #[test]
+    fn skipping_a_reword_does_not_shift_the_next_one() {
+        let dir = clashing("rb-skip-reword");
+        let mut plan = plan_from(&dir, "c2");
+        let (a, b) = (row(&plan, "c2"), row(&plan, "c3"));
+        plan.move_to(b, a);
+        for (s, m) in [("c3", "c3 renamed"), ("c5", "c5 renamed")] {
+            let i = row(&plan, s);
+            plan.steps[i].act = Act::Reword;
+            plan.steps[i].message = m.into();
+        }
+        // The reworded c3 comes first and conflicts: leave it out.
+        rebase(&dir, &plan).unwrap();
+        assert!(operation(&dir).unwrap().is_some());
+        skip_operation(&dir, OpType::Rebase).unwrap();
+        assert!(operation(&dir).unwrap().is_none());
+        assert_eq!(subjects(&dir), ["c1", "c2", "c4", "c5 renamed"]);
+        clean(&dir);
+    }
+
+    #[test]
+    fn branches_on_commits_in_the_range_move_along() {
+        let dir = lab("rb-branches");
+        run(&dir, &["branch", "at-c3", &commit_id(&dir, "c3")]).unwrap();
+        run(&dir, &["branch", "at-c4", &commit_id(&dir, "c4")]).unwrap();
+        run(&dir, &["branch", "before", &commit_id(&dir, "c1")]).unwrap();
+        let c1 = commit_id(&dir, "c1");
+        let mut plan = plan_from(&dir, "c2");
+        // c3 melts into c2; c4 and c5 swap.
+        set(&mut plan, "c3", Act::Fixup);
+        let (a, b) = (row(&plan, "c4"), row(&plan, "c5"));
+        plan.move_to(b, a);
+        rebase(&dir, &plan).unwrap();
+        assert_eq!(subjects(&dir), ["c1", "c2", "c5", "c4"]);
+        let at = |b: &str| message_of(&dir, b);
+        assert_eq!(at("at-c3"), "c2", "a branch on a melted commit ends up on the result");
+        assert_eq!(at("at-c4"), "c4", "and one on a moved commit goes with it");
+        assert_eq!(run(&dir, &["rev-parse", "before"]).unwrap().trim(), c1, "branches outside the range stay");
+        clean(&dir);
+    }
+
+    #[test]
+    fn a_branch_checked_out_in_another_worktree_is_left_alone() {
+        let dir = lab("rb-worktree-branch");
+        let other = dir.with_file_name(format!("{}-other", dir.file_name().unwrap().to_string_lossy()));
+        let _ = std::fs::remove_dir_all(&other);
+        run(&dir, &["branch", "elsewhere", &commit_id(&dir, "c4")]).unwrap();
+        run(&dir, &["worktree", "add", "-q", &other.to_string_lossy(), "elsewhere"]).unwrap();
+        let tip = run(&dir, &["rev-parse", "elsewhere"]).unwrap();
+        let r = rebase_range(&dir, &commit_id(&dir, "c2")).unwrap();
+        assert!(r.plan.steps.iter().all(|s| s.branches.is_empty()), "not offered for moving");
+        let mut plan = r.plan;
+        let (a, b) = (row(&plan, "c3"), row(&plan, "c4"));
+        plan.move_to(b, a);
+        rebase(&dir, &plan).unwrap();
+        assert_eq!(run(&dir, &["rev-parse", "elsewhere"]).unwrap(), tip);
+        clean(&dir);
+        clean(&other);
+    }
+
+    #[test]
+    fn a_rebase_inside_a_linked_worktree_keeps_its_session_in_that_worktrees_folder() {
+        let dir = lab("rb-linked");
+        let other = dir.with_file_name(format!("{}-linked", dir.file_name().unwrap().to_string_lossy()));
+        let _ = std::fs::remove_dir_all(&other);
+        run(&dir, &["worktree", "add", "-q", "-b", "feature", &other.to_string_lossy()]).unwrap();
+        commit_file_with(&other, "g1.txt", "1\n", "g1");
+        commit_file_with(&other, "g2.txt", "2\n", "g2");
+        commit_file_with(&other, "g3.txt", "3\n", "g3");
+        let mut plan = plan_from(&other, "g1");
+        set(&mut plan, "g2", Act::Edit);
+        let i = row(&plan, "g3");
+        plan.steps[i].act = Act::Reword;
+        plan.steps[i].message = "g3 renamed".into();
+        rebase(&other, &plan).unwrap();
+        assert!(operation(&other).unwrap().unwrap().editing);
+        assert!(operation(&dir).unwrap().is_none(), "the main folder isn't rebasing");
+        continue_operation(&other, OpType::Rebase, None).unwrap();
+        assert_eq!(subjects(&other).last().unwrap(), "g3 renamed");
+        clean(&dir);
+        let _ = run(&dir, &["worktree", "prune"]);
+        clean(&other);
+    }
+
+    #[test]
+    fn a_merge_in_the_range_is_refused_with_the_reason() {
+        let dir = lab("rb-merge");
+        run(&dir, &["checkout", "-q", "-b", "side", &commit_id(&dir, "c3")]).unwrap();
+        commit_file_with(&dir, "s.txt", "s\n", "side work");
+        run(&dir, &["checkout", "-q", "main"]).unwrap();
+        run(&dir, &["merge", "--no-ff", "-q", "-m", "Merge side", "side"]).unwrap();
+        let err = rebase_range(&dir, &commit_id(&dir, "c2")).err().expect("refused");
+        assert!(err.contains("merge commit") && err.contains("Merge side") && err.contains("flatten"), "{err}");
+        // After the merge there's nothing in the way.
+        commit_file_with(&dir, "after.txt", "x\n", "after");
+        assert!(rebase_range(&dir, &commit_id(&dir, "after")).is_ok());
+        clean(&dir);
+    }
+
+    #[test]
+    fn only_commits_on_the_current_branch_and_no_other_operation() {
+        let dir = lab("rb-refuse");
+        run(&dir, &["checkout", "-q", "-b", "other", &commit_id(&dir, "c3")]).unwrap();
+        commit_file_with(&dir, "o.txt", "o\n", "only on other");
+        let other_only = commit_id(&dir, "only on other");
+        run(&dir, &["checkout", "-q", "main"]).unwrap();
+        assert!(rebase_range(&dir, &other_only).err().unwrap().contains("current branch"));
+        assert!(rebase_range(&dir, "nonsense").err().unwrap().contains("can't be found"));
+        let mut plan = plan_from(&dir, "c4");
+        set(&mut plan, "c5", Act::Squash);
+        set(&mut plan, "c4", Act::Squash);
+        assert!(rebase(&dir, &plan).unwrap_err().contains("no commit above"));
+        clean(&dir);
+    }
+
+    #[test]
+    fn a_dirty_tree_needs_autostash_and_gets_its_changes_back() {
+        let dir = lab("rb-dirty");
+        std::fs::write(dir.join("f1.txt"), "changed\n").unwrap();
+        let r = rebase_range(&dir, &commit_id(&dir, "c4")).unwrap();
+        assert!(r.dirty);
+        let mut plan = r.plan;
+        let (a, b) = (row(&plan, "c4"), row(&plan, "c5"));
+        plan.move_to(b, a);
+        let err = rebase(&dir, &plan).unwrap_err();
+        assert!(err.contains("unstaged changes"), "{err}");
+        assert!(!dir.join(".git").join("headway-rebase").exists(), "a rebase that never started leaves nothing");
+        rebase_interactive(&dir, &plan, true).unwrap();
+        assert_eq!(subjects(&dir), ["c1", "c2", "c3", "c5", "c4"]);
+        assert_eq!(read(&dir, "f1.txt").as_deref(), Some("changed\n"));
+        clean(&dir);
+    }
+
+    #[test]
+    fn autosquash_orders_fixup_commits_like_git_does() {
+        let dir = lab("rb-autosquash");
+        commit_file_with(&dir, "f6.txt", "6\n", "fixup! c2");
+        commit_file_with(&dir, "f7.txt", "7\n", "squash! c4");
+        let mut plan = plan_from(&dir, "c2");
+        assert_eq!(plan.autosquash_count(), 2);
+        plan.autosquash();
+        assert_eq!(plan.steps.iter().map(|s| (s.summary.as_str(), s.act)).collect::<Vec<_>>(), [
+            ("c2", Act::Pick),
+            ("fixup! c2", Act::Fixup),
+            ("c3", Act::Pick),
+            ("c4", Act::Pick),
+            ("squash! c4", Act::Squash),
+            ("c5", Act::Pick)
+        ]);
+        rebase(&dir, &plan).unwrap();
+        assert_eq!(subjects(&dir).len(), 5, "c1, c2, c3, c4 and c5 remain");
+        assert!(dir.join("f6.txt").exists() && dir.join("f7.txt").exists());
+        clean(&dir);
+    }
+
+    #[test]
+    fn fixup_into_folds_staged_changes_into_an_older_commit_in_one_go() {
+        let dir = lab("rb-fixup-into");
+        run(&dir, &["branch", "at-c4", &commit_id(&dir, "c4")]).unwrap();
+        std::fs::write(dir.join("f2.txt"), "2 fixed\n").unwrap();
+        stage(&dir, &["f2.txt".into()]).unwrap();
+        std::fs::write(dir.join("f5.txt"), "unstaged edit\n").unwrap();
+        fixup_into(&dir, &commit_id(&dir, "c2")).unwrap();
+        assert_eq!(subjects(&dir), ["c1", "c2", "c3", "c4", "c5"]);
+        run(&dir, &["show", "HEAD~3:f2.txt"]).map(|t| assert_eq!(t, "2 fixed\n")).unwrap();
+        assert_eq!(read(&dir, "f5.txt").as_deref(), Some("unstaged edit\n"), "unstaged work comes back");
+        assert!(status(&dir).unwrap().staged.is_empty());
+        assert_eq!(message_of(&dir, "at-c4"), "c4");
+        assert_eq!(run(&dir, &["rev-list", "--count", "at-c4"]).unwrap().trim(), "4");
+        clean(&dir);
+    }
+
+    #[test]
+    fn fixup_into_refuses_nothing_staged_and_merges_before_it_commits_anything() {
+        let dir = lab("rb-fixup-refuse");
+        assert!(fixup_into(&dir, &commit_id(&dir, "c2")).unwrap_err().contains("Nothing is staged"));
+        run(&dir, &["checkout", "-q", "-b", "side", &commit_id(&dir, "c3")]).unwrap();
+        commit_file_with(&dir, "s.txt", "s\n", "side work");
+        run(&dir, &["checkout", "-q", "main"]).unwrap();
+        run(&dir, &["merge", "--no-ff", "-q", "-m", "Merge side", "side"]).unwrap();
+        std::fs::write(dir.join("f2.txt"), "x\n").unwrap();
+        stage(&dir, &["f2.txt".into()]).unwrap();
+        let before = head(&dir);
+        let err = fixup_into(&dir, &commit_id(&dir, "c2")).unwrap_err();
+        assert!(err.contains("merge commit"), "{err}");
+        assert_eq!(head(&dir), before, "no fixup commit was made");
+        assert_eq!(status(&dir).unwrap().staged.len(), 1);
+        clean(&dir);
+    }
+
+    #[test]
+    fn aborting_a_fixup_into_that_conflicts_stages_the_changes_again() {
+        let dir = clashing("rb-fixup-abort");
+        let before = snapshot(&dir);
+        let before_head = head(&dir);
+        // This change to c2's file conflicts with c3 when it's folded into c2.
+        std::fs::write(dir.join("shared.txt"), "folded into c2\n").unwrap();
+        stage(&dir, &["shared.txt".into()]).unwrap();
+        let said = fixup_into(&dir, &commit_id(&dir, "c2")).unwrap();
+        assert!(said.contains("has conflicts"), "{said}");
+        abort_operation(&dir, OpType::Rebase).unwrap();
+        assert_eq!(head(&dir), before_head, "the fixup commit is gone again");
+        assert_eq!(snapshot(&dir).commits, before.commits);
+        assert_eq!(index_text(&dir, "shared.txt"), "folded into c2\n", "and its changes are staged as before");
+        clean(&dir);
+    }
+
+    #[test]
+    fn a_stale_session_from_a_rebase_that_ended_elsewhere_is_ignored() {
+        let dir = lab("rb-stale");
+        let mut plan = plan_from(&dir, "c2");
+        set(&mut plan, "c3", Act::Edit);
+        rebase(&dir, &plan).unwrap();
+        // Finished from a terminal: Headway never hears about it.
+        run(&dir, &["rebase", "--abort"]).unwrap();
+        assert!(dir.join(".git").join("headway-rebase").exists());
+        // A different rebase, started outside Headway, must not use the old session.
+        run_env(&dir, &["rebase", "-i", &format!("{}^", commit_id(&dir, "c4"))], &[("GIT_SEQUENCE_EDITOR", "sed -i.bak s/^pick/edit/")]).unwrap();
+        assert!(operation(&dir).unwrap().is_some());
+        assert!(current_session(&dir).is_none());
+        assert!(!dir.join(".git").join("headway-rebase").exists(), "the leftover is deleted");
+        abort_operation(&dir, OpType::Rebase).unwrap();
+        clean(&dir);
+    }
+
+    #[test]
+    fn undo_takes_back_a_rebase_that_stopped_and_was_continued() {
+        let dir = lab("rb-undo");
+        run(&dir, &["branch", "at-c3", &commit_id(&dir, "c3")]).unwrap();
+        let original = head(&dir);
+        let at_c3 = run(&dir, &["rev-parse", "at-c3"]).unwrap();
+        let mut plan = plan_from(&dir, "c2");
+        set(&mut plan, "c3", Act::Edit);
+        let (a, b) = (row(&plan, "c4"), row(&plan, "c5"));
+        plan.move_to(b, a);
+        let (_, entry) = crate::oplog::run_recorded(&dir, &Undoable::Rebase { save_work: false }, "interactive rebase", |r| rebase(r, &plan)).unwrap();
+        assert!(entry.is_none(), "nothing to undo until it's finished");
+        assert!(crate::oplog::latest(&dir).is_none());
+        commit(&dir, "c3 amended", true).unwrap();
+        continue_operation(&dir, OpType::Rebase, None).unwrap();
+        let e = crate::oplog::latest(&dir).expect("finishing made the entry");
+        assert_eq!(e.what, "interactive rebase");
+        assert!(e.refs.iter().any(|m| m.name == "refs/heads/at-c3"), "branches that moved along are in it");
+        assert_ne!(head(&dir), original);
+        crate::oplog::undo(&dir, None).unwrap();
+        assert_eq!(head(&dir), original);
+        assert_eq!(run(&dir, &["rev-parse", "at-c3"]).unwrap(), at_c3);
+        assert_eq!(status(&dir).unwrap().unstaged.len() + status(&dir).unwrap().staged.len(), 0);
+        clean(&dir);
+    }
+
+    #[test]
+    fn undo_takes_back_a_rebase_that_finished_at_once_and_an_aborted_one_leaves_no_entry() {
+        let dir = clashing("rb-undo-direct");
+        let original = head(&dir);
+        let mut plan = plan_from(&dir, "c4");
+        let (a, b) = (row(&plan, "c4"), row(&plan, "c5"));
+        plan.move_to(b, a);
+        let (_, entry) = crate::oplog::run_recorded(&dir, &Undoable::Rebase { save_work: false }, "interactive rebase", |r| rebase(r, &plan)).unwrap();
+        assert!(entry.is_some());
+        crate::oplog::undo(&dir, None).unwrap();
+        assert_eq!(head(&dir), original);
+        // Now one that conflicts and is aborted.
+        let mut plan = plan_from(&dir, "c2");
+        let (a, b) = (row(&plan, "c2"), row(&plan, "c3"));
+        plan.move_to(b, a);
+        crate::oplog::run_recorded(&dir, &Undoable::Rebase { save_work: false }, "interactive rebase", |r| rebase(r, &plan)).unwrap();
+        abort_operation(&dir, OpType::Rebase).unwrap();
+        assert!(crate::oplog::latest(&dir).is_none_or(|e| e.undone), "an aborted rebase changed nothing, so there's nothing to undo");
+        clean(&dir);
+    }
+
+    #[test]
+    fn a_message_line_starting_with_a_hash_survives_a_reword() {
+        let dir = lab("rb-hash");
+        let mut plan = plan_from(&dir, "c5");
+        plan.steps[0].act = Act::Reword;
+        plan.steps[0].message = "Fix the cart\n\n#12 is the ticket\nSecond line".into();
+        rebase(&dir, &plan).unwrap();
+        assert_eq!(message_of(&dir, "HEAD"), "Fix the cart\n\n#12 is the ticket\nSecond line");
+        clean(&dir);
+    }
+
+    #[test]
+    fn a_conflict_inside_a_squash_chain_still_gets_the_combined_message() {
+        let dir = clashing("rb-squash-conflict");
+        let mut plan = plan_from(&dir, "c2");
+        set(&mut plan, "c2", Act::Drop);
+        let (a, b) = (row(&plan, "c4"), row(&plan, "c2"));
+        plan.move_to(a, b); // c4 first
+        let i = row(&plan, "c3");
+        let from = i;
+        plan.move_to(from, row(&plan, "c4") + 1);
+        set(&mut plan, "c3", Act::Squash);
+        let chain = plan.chains()[0].clone();
+        plan.set_combined(&chain, "Merged c4 and c3".into());
+        // c3 melts into c4, but its change needs c2's, which is gone: it conflicts.
+        let said = rebase(&dir, &plan).unwrap();
+        assert!(said.contains("has conflicts"), "{said}");
+        std::fs::write(dir.join("shared.txt"), "resolved\n").unwrap();
+        stage(&dir, &["shared.txt".into()]).unwrap();
+        continue_operation(&dir, OpType::Rebase, None).unwrap();
+        assert!(operation(&dir).unwrap().is_none());
+        assert_eq!(subjects(&dir), ["c1", "Merged c4 and c3", "c5"]);
+        clean(&dir);
+    }
+
+    #[test]
+    fn a_rebase_can_start_from_the_root_commit() {
+        let dir = lab("rb-root");
+        run(&dir, &["branch", "at-c2", &commit_id(&dir, "c2")]).unwrap();
+        let mut plan = plan_from(&dir, "c1");
+        assert_eq!(plan.steps.len(), 5);
+        let (a, b) = (row(&plan, "c2"), row(&plan, "c3"));
+        plan.move_to(b, a);
+        set(&mut plan, "c1", Act::Reword);
+        plan.steps[0].message = "c1 renamed".into();
+        rebase(&dir, &plan).unwrap();
+        assert_eq!(subjects(&dir), ["c1 renamed", "c3", "c2", "c4", "c5"]);
+        assert_eq!(message_of(&dir, "at-c2"), "c2");
+        clean(&dir);
+    }
+
+    #[test]
+    fn autostash_brings_changes_back_after_an_edit_stop_is_continued() {
+        let dir = lab("rb-autostash-edit");
+        std::fs::write(dir.join("f1.txt"), "changed\n").unwrap();
+        let mut plan = rebase_range(&dir, &commit_id(&dir, "c4")).unwrap().plan;
+        set(&mut plan, "c4", Act::Edit);
+        rebase_interactive(&dir, &plan, true).unwrap();
+        assert!(operation(&dir).unwrap().unwrap().editing);
+        continue_operation(&dir, OpType::Rebase, None).unwrap();
+        assert!(operation(&dir).unwrap().is_none());
+        assert_eq!(read(&dir, "f1.txt").as_deref(), Some("changed\n"));
+        clean(&dir);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_hook_that_stops_a_reword_still_leaves_one_undo_entry_when_it_finishes() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = lab("rb-hook");
+        let original = head(&dir);
+        let hook = dir.join(".git").join("hooks").join("commit-msg");
+        std::fs::create_dir_all(hook.parent().unwrap()).unwrap();
+        std::fs::write(&hook, "#!/bin/sh\ngrep -q REJECT \"$1\" && exit 1\nexit 0\n").unwrap();
+        std::fs::set_permissions(&hook, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let mut plan = plan_from(&dir, "c4");
+        let i = row(&plan, "c4");
+        plan.steps[i].act = Act::Reword;
+        plan.steps[i].message = "REJECT this".into();
+        let run_it = || crate::oplog::run_recorded(&dir, &Undoable::Rebase { save_work: false }, "interactive rebase", |r| rebase(r, &plan));
+        assert!(run_it().is_err(), "git reports the rejected message");
+        assert!(operation(&dir).unwrap().is_some(), "and the rebase waits");
+        assert!(crate::oplog::latest(&dir).is_none());
+        // Say it differently, and carry on.
+        commit(&dir, "c4 accepted", true).unwrap();
+        continue_operation(&dir, OpType::Rebase, None).unwrap();
+        let e = crate::oplog::latest(&dir).expect("finishing made the entry");
+        assert_eq!(e.what, "interactive rebase");
+        crate::oplog::undo(&dir, None).unwrap();
+        assert_eq!(head(&dir), original);
+        clean(&dir);
+    }
+
+    #[test]
+    fn skip_is_not_offered_at_an_edit_step() {
+        let dir = lab("rb-skip-edit");
+        let mut plan = plan_from(&dir, "c4");
+        set(&mut plan, "c4", Act::Edit);
+        rebase(&dir, &plan).unwrap();
+        assert!(!operation(&dir).unwrap().unwrap().can_skip());
+        clean(&dir);
+    }
+
+    #[test]
+    fn undoing_a_fixup_into_with_unstaged_work_brings_back_just_the_staged_changes() {
+        let dir = lab("rb-fixup-undo");
+        let original = head(&dir);
+        std::fs::write(dir.join("f2.txt"), "2 fixed\n").unwrap();
+        stage(&dir, &["f2.txt".into()]).unwrap();
+        std::fs::write(dir.join("f5.txt"), "unstaged edit\n").unwrap();
+        let target = commit_id(&dir, "c2");
+        crate::oplog::run_recorded(&dir, &Undoable::Rebase { save_work: true }, "fix up into c2", |r| fixup_into(r, &target)).unwrap();
+        assert_ne!(head(&dir), original);
+        crate::oplog::undo(&dir, None).unwrap();
+        assert_eq!(head(&dir), original);
+        assert_eq!(index_text(&dir, "f2.txt"), "2 fixed\n", "the staged change is staged again");
+        assert_eq!(read(&dir, "f5.txt").as_deref(), Some("unstaged edit\n"), "the unstaged one was never touched");
+        assert_eq!(status(&dir).unwrap().staged.len(), 1);
+        clean(&dir);
+    }
+
+    #[test]
+    fn a_plan_for_other_commits_than_are_checked_out_is_refused() {
+        let dir = lab("rb-stale-plan");
+        let mut plan = plan_from(&dir, "c4");
+        let (a, b) = (row(&plan, "c4"), row(&plan, "c5"));
+        plan.move_to(b, a);
+        // A commit made elsewhere while the editor was open.
+        commit_file_with(&dir, "late.txt", "x\n", "late");
+        let err = rebase(&dir, &plan).unwrap_err();
+        assert!(err.contains("changed since the editor was opened"), "{err}");
+        assert_eq!(subjects(&dir).last().unwrap(), "late");
+        clean(&dir);
+    }
+
+    #[test]
+    fn an_edit_step_that_conflicts_is_a_conflict_not_an_edit() {
+        let dir = clashing("rb-edit-conflict");
+        let mut plan = plan_from(&dir, "c2");
+        let (a, b) = (row(&plan, "c2"), row(&plan, "c3"));
+        plan.move_to(b, a);
+        set(&mut plan, "c3", Act::Edit);
+        let said = rebase(&dir, &plan).unwrap();
+        assert!(said.contains("has conflicts"), "{said}");
+        assert!(!operation(&dir).unwrap().unwrap().editing);
+        abort_operation(&dir, OpType::Rebase).unwrap();
+        clean(&dir);
     }
 }

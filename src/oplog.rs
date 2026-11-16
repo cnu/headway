@@ -74,7 +74,15 @@ pub fn latest(repo: &Path) -> Option<UndoEntry> {
 pub fn run_recorded(repo: &Path, what: &Undoable, label: &str, op: impl FnOnce(&Path) -> GitResult<String>) -> GitResult<(String, Option<UndoEntry>)> {
     // If the copies can't be made, don't run the action at all.
     let prep = git::prepare_undo(repo, what).map_err(|e| format!("Couldn't save what this changes, so it wasn't done.\n\n{e}"))?;
-    let out = op(repo)?;
+    let result = op(repo);
+    // An interactive rebase that stopped (to edit, on a conflict, or because a hook said
+    // no) isn't over, whatever git's exit code: keep what Undo needs with it, and let the
+    // step that finishes it make the entry.
+    if matches!(what, Undoable::Rebase { .. }) && git::rebase_stopped(repo) {
+        git::keep_undo_for_later(repo, prep, label);
+        return result.map(|out| (out, None));
+    }
+    let out = result?;
     let entry = match git::finish_undo(repo, prep, label) {
         Ok(Some(e)) => push(repo, e).ok(),
         _ => None,

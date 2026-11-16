@@ -1531,7 +1531,8 @@ fn deleted_and_binary_conflicts_abort_and_skip() {
     git_ok(&r, &["checkout", "-q", "other"]);
     assert!(git::run(&r, &["rebase", "main"]).is_err());
     ctrl(&mut h, egui::Key::R);
-    assert!(shows(&h, "Rebasing other onto main · commit 1 of 1 · 2 conflicted files"));
+    assert!(shows_containing(&h, "Rebasing other onto main · Stopped at 1 of 1 · "));
+    assert!(shows_containing(&h, "2 conflicted files"));
     click(&mut h, "Resolve conflicts");
     assert!(shows(&h, "Conflict 1 of 2"));
     assert!(disabled(&h, "Open in merge tool"), "no merge.tool is set");
@@ -3175,4 +3176,142 @@ fn rerun_is_refused_with_a_reason_without_permission() {
     h.get_by_label("Re-run failed").click();
     settle(&mut h);
     assert!(shows(&h, "Failing 1"), "nothing ran");
+}
+
+// ---- Interactive rebase
+
+/// c1..c5, each adding its own file.
+fn five_commits(s: &Scratch) -> PathBuf {
+    let r = new_repo(&s.root, "shop");
+    for n in 1..=5 {
+        commit(&r, &format!("f{n}.txt"), &format!("{n}\n"), &format!("c{n}"));
+    }
+    r
+}
+
+#[test]
+fn interactively_rebase_from_the_history_menu_then_undo() {
+    let s = scratch("rebase-editor");
+    let r = five_commits(&s);
+    let original = git_ok(&r, &["rev-parse", "HEAD"]);
+    let mut h = app(&s, &[&r], true);
+
+    right_click_row(&mut h, "c2");
+    click(&mut h, "Interactively rebase from here…");
+    assert!(shows(&h, "Interactively rebase main"));
+    assert!(shows(&h, "4 commits → 4"));
+    // Nothing to do yet.
+    assert!(disabled(&h, "Start rebase"));
+
+    // The last row is selected: Alt+Up moves it above c4, F melts it into the row above (c3).
+    alt(&mut h, egui::Key::ArrowUp);
+    key(&mut h, egui::Key::F);
+    assert!(shows(&h, "4 commits → 3"));
+    // Select c3 (one up) and drop it: c5's changes now melt into c2.
+    key(&mut h, egui::Key::ArrowUp);
+    key(&mut h, egui::Key::D);
+    assert!(shows(&h, "4 commits → 2"));
+    click(&mut h, "Start rebase");
+
+    assert_eq!(subjects(&r, "main"), ["c4", "c2", "c1"]);
+    assert!(!r.join("f3.txt").exists() && r.join("f5.txt").exists());
+    assert!(shows_containing(&h, "Interactive rebase: done"));
+
+    ctrl(&mut h, egui::Key::Z);
+    assert_eq!(git_ok(&r, &["rev-parse", "HEAD"]), original);
+    assert!(r.join("f3.txt").exists());
+    assert!(shows(&h, "Undid interactive rebase"));
+}
+
+#[test]
+fn a_row_can_be_dragged_to_reorder() {
+    let s = scratch("rebase-drag");
+    let r = five_commits(&s);
+    let mut h = app(&s, &[&r], true);
+    right_click_row(&mut h, "c2");
+    click(&mut h, "Interactively rebase from here…");
+    // The handles, top to bottom: drag the first (c2) below the last row.
+    let mut handles: Vec<egui::Rect> = h.get_all_by_label("⠿").map(|n| n.rect()).collect();
+    handles.sort_by(|a, b| a.top().total_cmp(&b.top()));
+    assert_eq!(handles.len(), 4);
+    drag(&mut h, handles[0].center(), egui::pos2(handles[3].center().x, handles[3].bottom() + 6.0));
+    click(&mut h, "Start rebase");
+    assert_eq!(subjects(&r, "main"), ["c2", "c5", "c4", "c3", "c1"]);
+}
+
+#[test]
+fn an_edit_step_stops_with_a_banner_and_continue_finishes() {
+    let s = scratch("rebase-edit");
+    let r = five_commits(&s);
+    let mut h = app(&s, &[&r], true);
+    right_click_row(&mut h, "c2");
+    click(&mut h, "Interactively rebase from here…");
+    // c5 is selected: up twice for c3, then E.
+    key(&mut h, egui::Key::ArrowUp);
+    key(&mut h, egui::Key::ArrowUp);
+    key(&mut h, egui::Key::E);
+    click(&mut h, "Start rebase");
+
+    assert!(shows_containing(&h, "Stopped at 2 of 4"), "the banner says where it stopped");
+    assert!(shows_containing(&h, "amend it if you like, then Continue"));
+    assert_eq!(head_subject(&r), "c3");
+    assert!(shows(&h, "Abort") && shows(&h, "Continue"));
+    assert!(!shows(&h, "Skip"), "skipping an edit step would only throw your changes away");
+    click(&mut h, "Continue");
+    assert!(!shows(&h, "Abort"), "the banner is gone");
+    assert_eq!(subjects(&r, "main"), ["c5", "c4", "c3", "c2", "c1"]);
+
+    // Abort puts everything back as it was.
+    let before = git_ok(&r, &["rev-parse", "HEAD"]);
+    right_click_row(&mut h, "c2");
+    click(&mut h, "Interactively rebase from here…");
+    key(&mut h, egui::Key::E);
+    click(&mut h, "Start rebase");
+    assert!(shows_containing(&h, "Stopped at 4 of 4"));
+    click(&mut h, "Abort");
+    click_last(&mut h, "Abort rebase");
+    assert_eq!(git_ok(&r, &["rev-parse", "HEAD"]), before);
+    assert!(!shows(&h, "Skip"));
+}
+
+#[test]
+fn merges_are_refused_with_the_reason_and_other_branches_commits_are_not_offered() {
+    let s = scratch("rebase-merge");
+    let r = five_commits(&s);
+    git_ok(&r, &["checkout", "-q", "-b", "side", "main~2"]);
+    commit(&r, "s.txt", "s\n", "side work");
+    git_ok(&r, &["checkout", "-q", "main"]);
+    git_ok(&r, &["merge", "--no-ff", "-q", "-m", "Merge side", "side"]);
+    git_ok(&r, &["checkout", "-q", "-b", "elsewhere", "main~4"]);
+    commit(&r, "e.txt", "e\n", "only elsewhere");
+    git_ok(&r, &["checkout", "-q", "main"]);
+    let mut h = app(&s, &[&r], true);
+    right_click_row(&mut h, "c2");
+    click(&mut h, "Interactively rebase from here…");
+    assert!(shows(&h, "Can't rebase from here"));
+    assert!(shows_containing(&h, "flatten it into plain commits"));
+    click(&mut h, "OK");
+    // A commit that isn't on the checked-out branch can't be a starting point.
+    right_click_row(&mut h, "only elsewhere");
+    assert!(disabled(&h, "Interactively rebase from here…"));
+}
+
+#[test]
+fn fixup_into_folds_staged_changes_into_a_picked_commit() {
+    let s = scratch("fixup-into");
+    let r = five_commits(&s);
+    write(&r, "f2.txt", "2 fixed\n");
+    git_ok(&r, &["add", "f2.txt"]);
+    let mut h = app(&s, &[&r], true);
+    click(&mut h, "Uncommitted changes");
+    click(&mut h, "Fixup into…");
+    assert!(shows(&h, "Fix up into…"));
+    // Filter to one commit, pick it, go.
+    type_text(&mut h, "c2");
+    click_control(&mut h, "Fix up");
+    assert_eq!(subjects(&r, "main"), ["c5", "c4", "c3", "c2", "c1"]);
+    assert_eq!(git_ok(&r, &["show", "main~3:f2.txt"]), "2 fixed\n");
+    assert!(git_ok(&r, &["status", "--porcelain"]).trim().is_empty());
+    ctrl(&mut h, egui::Key::Z);
+    assert_eq!(git_ok(&r, &["status", "--porcelain"]).trim(), "M  f2.txt", "undo brings the staged change back");
 }

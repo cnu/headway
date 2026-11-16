@@ -8,7 +8,7 @@ use crate::workspace::{Config, Workspace};
 use crate::fileview::{self, FileView, Mode};
 use crate::resolver::Resolver;
 use crate::forge::{self, cache::Reason};
-use crate::{cmdlog, diffmodel, highlight, inbox, markdown, newpr, overview, preview, prmerge, prview, views};
+use crate::{cmdlog, diffmodel, highlight, inbox, markdown, newpr, overview, preview, prmerge, prview, rebaseview, views};
 use egui::{Align, Color32, CornerRadius, Id, Layout, Margin, RichText, Sense, Stroke, Ui};
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
@@ -37,6 +37,8 @@ pub struct RepoData {
     pub submodules: Vec<git::Submodule>,
     /// Loaded commits your branches or tags reach (their messages can be edited).
     pub on_branch: std::collections::HashSet<String>,
+    /// Loaded commits the checked-out commit reaches (the ones an interactive rebase can start from).
+    pub on_head: std::collections::HashSet<String>,
     /// Loaded commits that some remote branch already has.
     pub pushed: std::collections::HashSet<String>,
     /// Branches hidden from the history (full ref names).
@@ -88,8 +90,9 @@ fn load_repo(path: &Path, limit: usize, hidden: Vec<String>) -> Result<RepoData,
         let remote_tips: Vec<&str> =
             commits.iter().filter(|c| c.refs.iter().any(|r| r.kind == git::RefKind::Remote)).map(|c| c.hash.as_str()).collect();
         let pushed = reachable(&commits, remote_tips.into_iter());
+        let on_head = reachable(&commits, status.head.oid.iter().map(|s| s.as_str()));
         let undo = crate::oplog::latest(path);
-        Ok(RepoData { status, commits, graph, branches, tags, stashes, remotes, worktrees, remote_urls, submodules, on_branch, pushed, hidden: hidden.clone(), limit, operation, undo })
+        Ok(RepoData { status, commits, graph, branches, tags, stashes, remotes, worktrees, remote_urls, submodules, on_branch, on_head, pushed, hidden: hidden.clone(), limit, operation, undo })
     })
 }
 
@@ -807,6 +810,8 @@ enum Msg {
     LastMessage(PathBuf, String),
     /// A commit's full message, read to open the "Edit commit message" dialog.
     EditMessage { repo: PathBuf, hash: String, message: Result<String, String> },
+    /// The commits an interactive rebase from a commit would replay (or why it can't).
+    RebaseRange { repo: PathBuf, result: Result<git::RebaseRange, String> },
     /// A pull request's head and its commits, for "Show commits" (`fetched`: the
     /// head had to be fetched, so the history needs reloading first).
     PrCommits { repo: PathBuf, number: u64, result: Result<(String, Vec<String>, bool), String> },
@@ -903,6 +908,10 @@ pub enum Action {
     Undo { repo: PathBuf, id: Option<u64> },
     /// Open the "Edit commit message" dialog for this commit of the open repository.
     EditMessage(String),
+    /// Open the interactive rebase editor from this commit (up to HEAD) of the open repository.
+    RebaseFrom(String),
+    /// Open the picker for "Fixup into…" the open repository's staged changes.
+    FixupInto,
     LoadMore,
     PickRepo,
     PickFolder,
@@ -1047,6 +1056,10 @@ pub enum Dialog {
         path_edited: bool,
     },
     Confirm { title: String, body: String, button: String, danger: bool, then: Option<Box<Action>> },
+    /// The interactive rebase editor.
+    Rebase(Box<rebaseview::Editor>),
+    /// Pick the commit staged changes are folded into.
+    FixupInto(Box<rebaseview::FixupPicker>),
     CreatePr(Box<newpr::PrDraft>),
     MergePr(Box<prmerge::MergeDraft>),
     /// Find a file or folder by name, to blame it or see its history.
@@ -2665,6 +2678,12 @@ impl HeadwayApp {
                     }
                     Err(e) => self.toast(format!("Couldn't read that commit's message\n{e}"), true),
                 },
+                Msg::RebaseRange { repo, result } => match result {
+                    Ok(r) => self.dialog = Some(Dialog::Rebase(Box::new(rebaseview::Editor::new(repo, r)))),
+                    Err(e) => {
+                        self.dialog = Some(Dialog::Confirm { title: "Can't rebase from here".into(), body: e, button: "OK".into(), danger: false, then: None });
+                    }
+                },
                 Msg::LastMessage(path, msg) => {
                     if let Some(rv) = self.tabs.get_mut(&path) {
                         if rv.amend && rv.commit_msg.trim().is_empty() {
@@ -2782,6 +2801,9 @@ impl HeadwayApp {
                                     "Commit message updated".to_string()
                                 } else if kind == OpKind::Undo {
                                     out.trim().to_string()
+                                } else if extra.starts_with("Stopped at ") {
+                                    // A rebase that stopped to edit or on a conflict: not "done".
+                                    extra.trim().to_string()
                                 } else if extra.len() < 90 && !extra.is_empty() && kind != OpKind::Commit && kind != OpKind::Quiet {
                                     format!("{label}: done — {}", extra.trim())
                                 } else {
@@ -3357,6 +3379,19 @@ impl HeadwayApp {
                     let message = git::run(&p, &["log", "-1", "--format=%B", &hash]).map(|m| m.trim_end().to_string());
                     Msg::EditMessage { repo: p, hash, message }
                 });
+            }
+            Action::RebaseFrom(hash) => {
+                let Some(p) = active else { return };
+                self.spawn(move || {
+                    let result = git::rebase_range(&p, &hash);
+                    Msg::RebaseRange { repo: p, result }
+                });
+            }
+            Action::FixupInto => {
+                let Some(p) = active else { return };
+                if let Some(data) = self.tabs.get(&p).and_then(|rv| rv.data.as_ref()) {
+                    self.dialog = Some(Dialog::FixupInto(Box::new(rebaseview::FixupPicker::new(p, data))));
+                }
             }
             Action::ShowAllBranches => {
                 let Some(p) = active else { return };
@@ -4030,6 +4065,16 @@ impl HeadwayApp {
                     newpr::Outcome::BaseChanged => actions.push(Action::PrPrepare),
                     newpr::Outcome::Create => actions.push(Action::SubmitPr),
                 },
+                Dialog::Rebase(ed) => {
+                    if !ed.ui(ui, actions) {
+                        keep = false;
+                    }
+                }
+                Dialog::FixupInto(p) => {
+                    if !p.ui(ui, actions) {
+                        keep = false;
+                    }
+                }
                 Dialog::Confirm { title, body, button, danger, then } => {
                     ui.heading(title.as_str());
                     ui.add_space(4.0);
@@ -4314,7 +4359,7 @@ fn name_dialog(ui: &mut Ui, title: &str, name: &mut String, enter: bool, keep: &
     valid && (ok || enter)
 }
 
-fn dialog_buttons(ui: &mut Ui, ok_label: &str, enabled: bool, danger: bool) -> (bool, bool) {
+pub(crate) fn dialog_buttons(ui: &mut Ui, ok_label: &str, enabled: bool, danger: bool) -> (bool, bool) {
     let mut ok = false;
     let mut cancel = false;
     ui.with_layout(Layout::right_to_left(Align::Center), |ui| {

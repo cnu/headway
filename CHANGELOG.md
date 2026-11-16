@@ -9,6 +9,34 @@ workflow uses that version's section as the GitHub release notes.
 
 ## [Unreleased]
 
+### Added
+
+- **Interactive rebase**: right-click a commit and choose *Interactively
+  rebase from here…* to edit the commits from it up to HEAD. Each row has an
+  action (pick, reword, edit, squash, fixup, drop); drag rows or press
+  Alt+↑/↓ to reorder them, and P R E S F D to set the action. Squash and
+  fixup rows sit under the row above, rewords and squashed commits have their
+  message editable in place, and a live count says "5 commits → 3". It runs
+  `git rebase -i --update-refs` (with `--autostash` when you have uncommitted
+  changes), so branches pointing into the range move along; branches checked
+  out in another worktree stay put. If it stops for an `edit` step or a
+  conflict, the banner says "Stopped at 3 of 7" with Continue, Skip and Abort,
+  and the whole rebase is one entry in Undo. `fixup!` and `squash!` commits in
+  the range can be placed under their commits with one button. Ranges that
+  contain merge commits are refused with an explanation. git runs Headway
+  itself as its editor for this, through the hidden `--write-rebase-todo` and
+  `--write-rebase-message` options.
+- **Fixup into…** in the commit box: pick an earlier commit, and the staged
+  changes are committed as a fixup and folded into it in one step. Aborting a
+  conflict puts the changes back in the staging area.
+- A *rebase-lab* sample project (development builds) with `fixup!` commits, a
+  WIP commit, a conflicting pair and a branch in the middle of its history.
+
+### Changed
+
+- The banner for a rebase that stopped says "Stopped at 3 of 7", counting only
+  commits (not the `update-ref` and `drop` lines in git's list).
+
 ## [0.3.0] - 2026-11-16
 
 ### Added

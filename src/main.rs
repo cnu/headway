@@ -19,6 +19,8 @@ mod overview;
 mod preview;
 mod prmerge;
 mod prview;
+mod rebase;
+mod rebaseview;
 mod resolver;
 mod samples;
 mod theme;
@@ -34,6 +36,15 @@ fn main() -> eframe::Result {
     let mut export: Option<PathBuf> = None;
     let mut days = 2;
     let all: Vec<String> = std::env::args().skip(1).collect();
+    // git runs Headway as its editor during an interactive rebase (see rebase.rs):
+    // do that one small job and leave, without a window or a log.
+    if let Some(done) = rebase::run_helper(&all) {
+        if let Err(e) = done {
+            attach_console();
+            fail(&e);
+        }
+        return Ok(());
+    }
     if all.iter().any(|a| matches!(a.as_str(), "--help" | "-h" | "--version" | "-V" | "--log-path" | "--export-log")) {
         attach_console();
     }
@@ -84,7 +95,7 @@ fn main() -> eframe::Result {
                     println!();
                     println!("Development builds only:");
                     println!("headway --screenshot <file.png>          save a picture of the window once it has loaded, then quit");
-                    println!("headway --reset-sample <name>            rebuild a sample project: web-shop|api-server|design-tokens|price-rules|diff-showcase");
+                    println!("headway --reset-sample <name>            rebuild a sample project: web-shop|api-server|design-tokens|price-rules|diff-showcase|rebase-lab");
                     println!("HEADWAY_FAKE_FORGE=<folder>              answer GitHub and GitLab questions from <folder>/forge.json instead of gh and glab");
                 }
                 println!();

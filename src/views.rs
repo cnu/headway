@@ -1777,6 +1777,11 @@ fn commit_menu(ui: &mut Ui, path: &Path, data: &RepoData, c: &git::Commit, curre
     if ui.add_enabled(editable, egui::Button::new("Edit commit message…")).on_hover_text(tip).on_disabled_hover_text(tip).clicked() {
         actions.push(Action::EditMessage(hash.clone()));
     }
+    let on_head = data.on_head.contains(&hash);
+    let tip = if on_head { "Reorder, squash, reword, edit or drop this commit and the ones after it" } else { "Only commits on the checked-out branch can be rebased" };
+    if ui.add_enabled(on_head, egui::Button::new("Interactively rebase from here…")).on_hover_text(tip).on_disabled_hover_text(tip).clicked() {
+        actions.push(Action::RebaseFrom(hash.clone()));
+    }
     ui.separator();
     if ui.button("New tag here…").clicked() {
         actions.push(Action::Dialog(Dialog::CreateTag {
@@ -2399,6 +2404,12 @@ fn staging_panel(ui: &mut Ui, rv: &mut RepoView, prefs: &mut DiffPrefs, actions:
                             kind: OpKind::Commit,
                             record: Some(Record { undo: git::Undoable::Refs, what }),
                         });
+                    }
+                    if staged_n > 0 && !rv.amend && !conflicts {
+                        let tip = "Fold the staged changes into an earlier commit: a fixup commit is made and squashed in";
+                        if ui.button("Fixup into…").on_hover_text(tip).clicked() {
+                            actions.push(Action::FixupInto);
+                        }
                     }
                     if staged_n == 0 && unstaged_n > 0 && !rv.amend {
                         let msg = rv.commit_msg.clone();

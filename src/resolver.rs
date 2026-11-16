@@ -372,6 +372,19 @@ pub fn abort_warning(op: &Operation, resolved_files: usize, unsaved: &[&str]) ->
     format!("{verb}\n\n{back} You'll lose:{list}\n\nThis can't be undone.")
 }
 
+/// The banner's first words: a rebase says where it stopped ("Stopped at 3 of 7").
+fn banner_title(op: &Operation) -> String {
+    match (op.kind, op.step) {
+        (OpType::Rebase, Some((n, of)))  => {
+            let branch = op.branch.clone().unwrap_or_else(|| "detached HEAD".into());
+            let at = format!("Stopped at {n} of {of}");
+            let commit = op.commit.as_deref().map(|c| format!(" · {c}")).unwrap_or_default();
+            format!("Rebasing {branch} onto {} · {at}{commit}", op.ours)
+        }
+        _ => op.title(),
+    }
+}
+
 /// The bar under the toolbar while an operation waits: what's happening, and
 /// Abort / Skip / Continue.
 pub fn banner(ui: &mut Ui, rv: &RepoView, actions: &mut Vec<Action>) {
@@ -386,9 +399,15 @@ pub fn banner(ui: &mut Ui, rv: &RepoView, actions: &mut Vec<Action>) {
         .frame(egui::Frame::new().fill(color.gamma_multiply(0.14)).inner_margin(Margin::symmetric(14, 0)).stroke(Stroke::new(1.0, color.gamma_multiply(0.5))))
         .show(ui, |ui| {
             ui.horizontal_centered(|ui| {
-                let state = if ready { "all conflicts resolved".to_string() } else { files.clone() };
+                let state = if op.editing {
+                    "amend it if you like, then Continue".to_string()
+                } else if ready {
+                    "all conflicts resolved".to_string()
+                } else {
+                    files.clone()
+                };
                 ui.label(RichText::new(if ready { "✓" } else { "⚠" }).color(color).strong());
-                ui.label(RichText::new(format!("{} · {state}", op.title())).color(TEXT).strong());
+                ui.label(RichText::new(format!("{} · {state}", banner_title(op))).color(TEXT).strong());
                 ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
                     let cont = ui.add_enabled(ready, egui::Button::new(RichText::new("Continue").strong()).fill(ACCENT_DIM));
                     if cont.on_hover_text(format!("Finish the {}", op.kind.command())).on_disabled_hover_text(format!("Resolve {files} first")).clicked() {
@@ -1320,7 +1339,7 @@ mod tests {
         assert_eq!([None, Some(12), Some(2048), Some(3 << 20)].map(size_text), ["none", "12 bytes", "2.0 KB", "3.0 MB"]);
         assert_eq!(pick_name(&Pick::TheirsFirst, "o", "t"), "took both, t first");
         assert_eq!(pick_name(&Pick::Open, "o", "t"), "");
-        let revert = Operation { kind: OpType::Revert, branch: None, ours: "HEAD".into(), theirs: "before abc".into(), commit: None, step: None, remaining: 0, before: None, merge_tool: None };
+        let revert = Operation { kind: OpType::Revert, branch: None, ours: "HEAD".into(), theirs: "before abc".into(), commit: None, step: None, remaining: 0, before: None, merge_tool: None, editing: false };
         assert!(abort_warning(&revert, 0, &[]).starts_with("Stop reverting this commit?\n\nHEAD goes back to where it was before the revert."));
         // A file that couldn't be read has nothing to choose, and nothing to save.
         let mut broken = FileState::new("x".into(), ConflictKind::BothModified);
@@ -1342,6 +1361,7 @@ mod tests {
             remaining: 0,
             before: Some("c1d4809".into()),
             merge_tool: None,
+            editing: false,
         };
         let w = abort_warning(&op, 2, &["src/cart.js"]);
         assert!(w.starts_with("Stop rebasing feature/search onto main?"), "{w}");
@@ -1350,7 +1370,7 @@ mod tests {
         assert!(w.contains("your resolutions of 2 files"));
         assert!(w.contains("unsaved choices in src/cart.js"));
         assert!(abort_warning(&op, 0, &["a", "b"]).contains("unsaved choices in 2 files"));
-        let merge = Operation { kind: OpType::Merge, branch: Some("main".into()), ours: "main".into(), theirs: "feature/x".into(), commit: None, step: None, remaining: 0, before: None, merge_tool: None };
+        let merge = Operation { kind: OpType::Merge, branch: Some("main".into()), ours: "main".into(), theirs: "feature/x".into(), commit: None, step: None, remaining: 0, before: None, merge_tool: None, editing: false };
         let w = abort_warning(&merge, 0, &[]);
         assert!(w.starts_with("Stop merging feature/x into main?") && w.contains("the changes it made so far"), "{w}");
         let pick = Operation { kind: OpType::CherryPick, remaining: 2, commit: Some("abc “x”".into()), ..merge };

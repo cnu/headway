@@ -87,12 +87,13 @@ mod imp {
     /// Fills a fresh repository with a sample project.
     type Make = fn(&mut Builder);
 
-    const SAMPLES: [(&str, Make); 5] = [
+    const SAMPLES: [(&str, Make); 6] = [
         ("web-shop", build_web_shop),
         ("api-server", build_api),
         ("design-tokens", build_tokens),
         ("price-rules", build_price_rules),
         ("diff-showcase", build_diff_showcase),
+        ("rebase-lab", build_rebase_lab),
     ];
 
     pub fn sample_workspace() -> Workspace {
@@ -611,9 +612,50 @@ mod imp {
         );
     }
 
+    /// A branch of messy commits to tidy with an interactive rebase: two fixups, a
+    /// squash, a WIP commit to drop, two commits that conflict when swapped, and a
+    /// branch pointing into the middle of the range.
+    fn build_rebase_lab(b: &mut Builder) {
+        let cart = |total: &str| format!("pub struct Line {{\n    pub price: u64,\n    pub count: u32,\n}}\n\npub fn total(lines: &[Line]) -> u64 {{\n    let sum: u64 = lines.iter().map(|l| l.price * l.count as u64).sum();\n    {total}\n}}\n");
+        b.write("README.md", "# Rebase lab\n\nTidy this branch with Interactively rebase from here…\n");
+        b.write("src/cart.rs", &cart("sum"));
+        b.commit(ALEX, "Start the cart", 0);
+        b.write("src/search.rs", "pub fn search(items: &[&str], q: &str) -> Vec<String> {\n    items.iter().filter(|i| i.contains(q)).map(|i| i.to_string()).collect()\n}\n");
+        b.commit(SAM, "Add search", 3);
+        b.git(&["branch", "search-ready"]);
+        b.write("src/cart.rs", &cart("sum + sum / 5"));
+        b.commit(ALEX, "Add tax to the cart total", 5);
+        b.write("src/cart.rs", &cart("(sum + sum / 5 + 50) / 100 * 100"));
+        b.commit(ALEX, "Round totals to whole units", 2);
+        b.write("src/footer.html", "<footer>Thanks for shopping.</footer>\n");
+        b.commit(JO, "Add a footer", 4);
+        b.write("src/search.rs", "pub fn search(items: &[&str], q: &str) -> Vec<String> {\n    let q = q.to_lowercase();\n    items.iter().filter(|i| i.to_lowercase().contains(&q)).map(|i| i.to_string()).collect()\n}\n");
+        b.commit(SAM, "fixup! Add search", 1);
+        b.write("src/footer.html", "<footer>Thanks for shopping with us.</footer>\n");
+        b.commit(JO, "squash! Add a footer", 1);
+        b.write("notes.txt", "remember to remove this\n");
+        b.commit(ALEX, "WIP: don't ship", 1);
+        b.write("src/cart.rs", &format!("{}\n// TODO: coupons\n", cart("(sum + sum / 5 + 50) / 100 * 100")));
+        b.commit(ALEX, "Note the coupon idea", 1);
+    }
+
     #[cfg(test)]
     mod tests {
         use super::*;
+
+        #[test]
+        fn the_rebase_lab_has_what_an_interactive_rebase_demo_needs() {
+            use crate::git;
+            let dir = std::env::temp_dir().join(format!("headway-sample-rebase-lab-{}", std::process::id()));
+            let _ = std::fs::remove_dir_all(&dir);
+            build_one(&dir, build_rebase_lab);
+            let start = git::run(&dir, &["rev-list", "--max-parents=0", "HEAD"]).unwrap();
+            let range = git::rebase_range(&dir, start.trim()).unwrap();
+            assert_eq!(range.plan.steps.len(), 9);
+            assert_eq!(range.plan.autosquash_count(), 2);
+            assert!(range.plan.steps.iter().any(|s| s.branches == ["refs/heads/search-ready"]));
+            let _ = std::fs::remove_dir_all(&dir);
+        }
 
         #[test]
         fn only_sample_repositories_count_as_missing_samples() {
