@@ -1,0 +1,9 @@
+{"data":{"project":{"mergeRequest":{"discussions":{"nodes":[
+{"notes":{"nodes":[{"author":{"username":"tanuki-user"},"body":"added 2 commits","createdAt":"2026-11-10T09:00:00Z","system":true,"url":null,"position":null}]}},
+{"notes":{"nodes":[
+ {"author":{"username":"reviewer-1"},"body":"Rounds too early here.","createdAt":"2026-11-10T10:00:00Z","system":false,"url":"https://gitlab.com/acme/shop/-/merge_requests/13#note_1","position":{"newPath":"shop/cart.py","newLine":42,"oldPath":"shop/cart.py","oldLine":40}},
+ {"author":{"username":"tanuki-user"},"body":"Fixed, thanks.","createdAt":"2026-11-10T10:30:00Z","system":false,"url":"https://gitlab.com/acme/shop/-/merge_requests/13#note_2","position":{"newPath":"shop/cart.py","newLine":null,"oldPath":"shop/cart.py","oldLine":40}}
+]}},
+{"notes":{"nodes":[{"author":{"username":"reviewer-1"},"body":"approved this merge request","createdAt":"2026-11-10T11:00:00Z","system":true,"url":null,"position":null}]}},
+{"notes":{"nodes":[{"author":{"username":"tanuki-user"},"body":"Ready for **review**.","createdAt":"2026-11-10T09:05:00Z","system":false,"url":"https://gitlab.com/acme/shop/-/merge_requests/13#note_0","position":null}]}}
+]}}}}}

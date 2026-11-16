@@ -304,8 +304,12 @@ pub fn load(repo: &Path, f: &DiffFile, mode: DiffMode, commit: Option<&str>) -> 
     let old_path = f.old_path.as_deref().unwrap_or(&f.path);
     let (old, new) = match mode {
         DiffMode::Commit => {
+            // The blobs the diff names, when it names them (a pull request's
+            // changes span many commits, so `<commit>^` isn't the old side).
             let c = commit?;
-            (Source::Object(format!("{c}^:{old_path}")), Source::Object(format!("{c}:{}", f.path)))
+            let old = f.old_id.clone().unwrap_or_else(|| format!("{c}^:{old_path}"));
+            let new = f.new_id.clone().unwrap_or_else(|| format!("{c}:{}", f.path));
+            (Source::Object(old), Source::Object(new))
         }
         DiffMode::Staged => (Source::Object(format!("HEAD:{old_path}")), Source::Object(format!(":{}", f.path))),
         DiffMode::Unstaged | DiffMode::Untracked => (Source::Object(format!(":{old_path}")), Source::Disk(f.path.clone())),

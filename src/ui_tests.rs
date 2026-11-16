@@ -2629,8 +2629,11 @@ fn the_web_shop_card_shows_the_failing_check_and_its_merged_branch() {
     // Badges on the other branches: open with checks passing, a draft still running.
     assert!(shows_containing(&h, "○ #12 ✔"));
     assert!(shows_containing(&h, "◌ #14 draft ●"));
-    // The toolbar says it in words too, and a click opens it on GitHub.
-    h.get_by_label("○ ✖ #13 · checks failing · changes requested").click();
+    // The toolbar says it in words too, and a click opens it in the window;
+    // "Open on GitHub" there opens it in the browser.
+    click(&mut h, "○ ✖ #13 · checks failing · changes requested");
+    assert_eq!(h.state().tabs.get(&r).unwrap().pr_view.as_ref().map(|v| v.pr.number), Some(13));
+    h.get_by_label("Open on GitHub").click();
     h.step();
     let opened: Vec<String> = h.output().platform_output.commands.iter().filter_map(|c| match c {
         egui::OutputCommand::OpenUrl(u) => Some(u.url.clone()),
@@ -2743,16 +2746,10 @@ fn the_pull_request_list_works_with_the_keyboard_and_shows_a_pull_requests_commi
     h.step();
     assert_eq!(h.state().tabs.get(&r).unwrap().pr_selected, Some(12));
     assert_eq!(h.state().tabs.get(&r).unwrap().selection, selected_before, "the arrows were the list's");
-    // (The output read is the frame's that saw the key go down.)
-    h.key_down(egui::Key::Enter);
-    h.step();
-    let opened: Vec<String> = h.output().platform_output.commands.iter().filter_map(|c| match c {
-        egui::OutputCommand::OpenUrl(u) => Some(u.url.clone()),
-        _ => None,
-    }).collect();
-    assert_eq!(opened, ["https://github.com/headway-samples/web-shop/pull/12"]);
-    h.key_up(egui::Key::Enter);
-    h.step();
+    key(&mut h, egui::Key::Enter);
+    assert_eq!(h.state().tabs.get(&r).unwrap().pr_view.as_ref().map(|v| v.pr.number), Some(12), "Enter opens it in the window");
+    key(&mut h, egui::Key::Escape);
+    assert!(h.state().tabs.get(&r).unwrap().pr_view.is_none(), "Esc closes it");
 
     // Show commits: fetched under origin/pr/12, selected, and its commits marked.
     right_click(&mut h, twelve);
@@ -2894,4 +2891,81 @@ fn pushing_a_new_branch_offers_a_pull_request_and_a_rejected_push_stops_creating
     assert!(shows_containing(&h, "rejected"), "git's error, in the dialog");
     let key = crate::forge::RepoKey { host: "github.com".into(), path: "headway-samples/web-shop".into() };
     assert!(h.state().forge_cache().repo(&key).unwrap().prs.get("feature/gift-cards").is_none_or(|v| v.is_empty()), "nothing created");
+}
+
+#[test]
+fn a_failing_pull_request_opens_in_the_window_shows_its_failed_log_and_reruns() {
+    let s = scratch("pr-view");
+    let r = web_shop(&s, "main");
+    serve_web_shop(&s, &r);
+    let mut h = app_with_forge(&s, &r, true, web_shop_forge());
+
+    // A click on its row opens it over the history.
+    click(&mut h, "#13 Round cart totals to cents by alex-rivera, checks failing, changes requested");
+    assert!(shows(&h, "Round cart totals to cents  #13"));
+    assert!(shows(&h, "main ← fix/tax-rounding"));
+    assert!(shows(&h, "· changes requested"));
+    // The description as markdown: a heading, a link, a code block, a task list.
+    assert!(shows(&h, "What changed"));
+    assert!(shows(&h, "support forum"));
+    assert!(shows(&h, "return Math.round(sum * 100) / 100;"));
+    assert!(shows(&h, "☑") && shows(&h, "☐"));
+    // The conversation, oldest first, with the line comment's file and line.
+    assert!(shows_containing(&h, "alex-rivera commented · "));
+    assert!(shows_containing(&h, "sam-okafor commented on src/cart.js:3 · "));
+    assert!(shows_containing(&h, "sam-okafor requested changes · "));
+
+    // Its commits, and what they change, from the local copy of its branch.
+    // (The sample's origin/main is a commit behind, so the branch brings that one too.)
+    click(&mut h, "Commits 2");
+    h.get_all_by_label("Round cart totals to cents").find(|n| n.accesskit_node().role() == egui::Role::Button).expect("the commit's row").click();
+    settle(&mut h);
+    let pv = h.state().tabs.get(&r).unwrap().pr_view.as_ref().unwrap();
+    assert_eq!(pv.commit.as_deref(), Some(git_ok(&r, &["rev-parse", "fix/tax-rounding"]).trim()));
+    let paths: Vec<&str> = pv.commit_diff.as_ref().unwrap().as_ref().unwrap().files.iter().map(|f| f.path.as_str()).collect();
+    assert_eq!(paths, ["src/cart.js"], "the commit's changes");
+    click(&mut h, "Files changed 1");
+    assert!(shows(&h, "1 file"));
+    let pv = h.state().tabs.get(&r).unwrap().pr_view.as_ref().unwrap();
+    assert_eq!(pv.files.as_ref().unwrap().as_ref().unwrap().files[0].path, "src/cart.js");
+    assert!(shows(&h, "Showing origin/fix/tax-rounding as last fetched"), "the fixtures name no head commit");
+
+    // Checks: failing first, the passing ones after, the neutral one last.
+    click(&mut h, "Checks ✖ 1");
+    assert!(shows(&h, "Failing 1") && shows(&h, "Passing 2") && shows(&h, "Skipped or neutral 1"));
+    assert!(shows(&h, "2m 05s"), "how long the failed job took");
+    click(&mut h, "Show log of test (node 20)");
+    let node = h.get_by_label_contains("##[error]");
+    let log = node.accesskit_node().label().filter(|l| !l.is_empty()).or(node.accesskit_node().value()).unwrap_or_default().to_string();
+    assert!(log.ends_with("##[error]Process completed with exit code 1."), "the end of the log: {:?}", &log[log.len().saturating_sub(200)..]);
+    assert_eq!(log.lines().count(), crate::forge::LOG_LINES, "cut to its last lines");
+    assert!(shows(&h, "The last 300 lines of the failed steps"));
+
+    // Run it again: it's running now, and the log of a check that isn't failing goes.
+    click(&mut h, "Re-run failed");
+    assert!(shows_containing(&h, "Started the failed checks of #13 again (1 workflow run)"));
+    assert!(shows(&h, "Running 1") && !shows(&h, "Failing 1"));
+    assert!(!shows(&h, "Show log of test (node 20)") && !shows_containing(&h, "##[error]"));
+    assert!(shows(&h, "No checks have failed"), "nothing left to run again, and it says why");
+    assert!(shows_containing(&h, "Still running · checking again every 30 s"));
+
+    // Esc closes it, back to the history.
+    key(&mut h, egui::Key::Escape);
+    assert!(h.state().tabs.get(&r).unwrap().pr_view.is_none());
+    assert!(!shows(&h, "main ← fix/tax-rounding"));
+}
+
+#[test]
+fn rerun_is_refused_with_a_reason_without_permission() {
+    let s = scratch("pr-view-denied");
+    let r = web_shop(&s, "main");
+    let mut data = crate::samples::web_shop_forge(crate::forge::now_secs());
+    data.repos.values_mut().for_each(|repo| repo.details.values_mut().for_each(|d| d.can_rerun = false));
+    let mut h = app_with_forge(&s, &r, true, std::sync::Arc::new(crate::forge::fake::FakeForges::new(data)));
+    click(&mut h, "#13 Round cart totals to cents by alex-rivera, checks failing, changes requested");
+    click(&mut h, "Checks ✖ 1");
+    assert!(shows(&h, "You don't have permission to run checks again in this repository"));
+    h.get_by_label("Re-run failed").click();
+    settle(&mut h);
+    assert!(shows(&h, "Failing 1"), "nothing ran");
 }

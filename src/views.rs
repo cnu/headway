@@ -30,6 +30,7 @@ pub fn repo(
         .frame(egui::Frame::new().fill(PANEL).inner_margin(Margin::symmetric(14, 0)).stroke(Stroke::new(1.0, BORDER)))
         .show(ui, |ui| toolbar(ui, rv, busy, &mut view.sidebar_open, actions));
     crate::resolver::banner(ui, rv, actions);
+    crate::prview::banner(ui, rv, actions);
     crate::fileview::banner(ui, rv, actions);
 
     egui::Panel::left("sidebar")
@@ -66,7 +67,13 @@ pub fn repo(
         return;
     }
 
-    // So do blame and file history.
+    // So does a pull request.
+    if rv.pr_view.as_ref().is_some_and(|p| p.shown) {
+        egui::CentralPanel::default().frame(egui::Frame::new().fill(BG)).show(ui, |ui| crate::prview::show(ui, rv, &mut view.diff, actions));
+        return;
+    }
+
+    // And blame and file history.
     if rv.file_view.as_ref().is_some_and(|f| f.shown) {
         egui::CentralPanel::default().frame(egui::Frame::new().fill(BG)).show(ui, |ui| crate::fileview::show(ui, rv, view, actions));
         return;
@@ -160,8 +167,10 @@ fn toolbar(ui: &mut Ui, rv: &mut RepoView, busy: &[String], sidebar_open: &mut b
             });
         let branch_label = format!("Current branch: {current}");
         switcher.response.widget_info(|| egui::WidgetInfo::labeled(egui::Role::ComboBox, true, &branch_label));
-        if let Some(st) = head.branch.as_ref().and_then(|b| rv.prs.get(b)) {
-            pr_badge(ui, st, false);
+        if let Some(st) = head.branch.as_ref().and_then(|b| rv.prs.get(b))
+            && pr_badge(ui, st, false).clicked()
+        {
+            actions.push(open_pr(&path, &st.pr));
         }
         ui.add_space(6.0);
 
@@ -257,9 +266,9 @@ fn repo_menu(ui: &mut Ui, path: &Path, data: &RepoData, forge: Option<&crate::fo
 // ---------------------------------------------------------------------------
 // Pull request badges
 
-/// Open a pull request. Every badge goes through here (in the browser for now).
-pub fn open_pr(ctx: &egui::Context, pr: &crate::forge::PullRequest) {
-    ctx.open_url(egui::OpenUrl::new_tab(&pr.url));
+/// Open a pull request in its view. Every badge and row goes through here.
+pub fn open_pr(path: &Path, pr: &crate::forge::PullRequest) -> Action {
+    Action::OpenPr { repo: path.to_path_buf(), pr: Box::new(pr.clone()) }
 }
 
 const BADGE_FONT: f32 = 11.5;
@@ -291,7 +300,8 @@ pub fn paint_pr_badge(p: &egui::Painter, x: f32, y: f32, st: &PrStatus, dark: bo
 }
 
 /// The click area over a painted badge: named for screen readers (and tests),
-/// the pull request's details on hover, opens it on click.
+/// the pull request's details on hover; a click opens it (the caller's part,
+/// with [`open_pr`]).
 pub fn pr_badge_area(ui: &Ui, rect: Rect, id: egui::Id, st: &PrStatus) -> egui::Response {
     let r = ui.interact(rect, id, Sense::click());
     let label = match st.check_mark() {
@@ -299,9 +309,6 @@ pub fn pr_badge_area(ui: &Ui, rect: Rect, id: egui::Id, st: &PrStatus) -> egui::
         None => st.badge(),
     };
     r.widget_info(|| egui::WidgetInfo::labeled(egui::Role::Link, true, &label));
-    if r.clicked() {
-        open_pr(ui.ctx(), &st.pr);
-    }
     r.on_hover_cursor(egui::CursorIcon::PointingHand).on_hover_text(st.tooltip(theme::relative))
 }
 
@@ -322,14 +329,9 @@ pub fn pr_badge(ui: &mut Ui, st: &PrStatus, loud: bool) -> egui::Response {
         let c = theme::pr_color(st.pr.state, dark);
         (c, c.gamma_multiply(0.16))
     };
-    let r = ui
-        .add(egui::Button::new(RichText::new(text).size(12.0).color(fg)).fill(fill).corner_radius(9.0))
+    ui.add(egui::Button::new(RichText::new(text).size(12.0).color(fg)).fill(fill).corner_radius(9.0))
         .on_hover_cursor(egui::CursorIcon::PointingHand)
-        .on_hover_text(st.tooltip(theme::relative));
-    if r.clicked() {
-        open_pr(ui.ctx(), &st.pr);
-    }
-    r
+        .on_hover_text(st.tooltip(theme::relative))
 }
 
 /// Delete a branch whose pull request is done with, undoably. A merged branch
@@ -709,6 +711,11 @@ fn sidebar(
                     Some(p) => format!("\nChecked out in the worktree at {}\nDouble-click to open it", p.display()),
                     None => "\nDouble-click to switch to it".to_string(),
                 };
+                if let (Some(b), Some(st)) = (&badge, pr)
+                    && b.clicked()
+                {
+                    actions.push(open_pr(&path, &st.pr));
+                }
                 // The branch's menu opens from its badge too.
                 let menu_area = match badge {
                     Some(b) => resp.on_hover_text(tip).union(b),
@@ -1244,8 +1251,8 @@ fn pull_requests(
                 // So the arrows and Enter work from here.
                 resp.request_focus();
             }
-            if resp.double_clicked() {
-                open_pr(ui.ctx(), pr);
+            if resp.clicked() {
+                actions.push(open_pr(path, pr));
             }
             if resp.has_focus() {
                 focused = Some(rows.len());
@@ -1272,7 +1279,7 @@ fn pull_requests(
                 None => *selected = Some(rows[fi].2.number),
             }
             if enter {
-                open_pr(ui.ctx(), rows[fi].2);
+                actions.push(open_pr(path, rows[fi].2));
             }
         }
         if tab == PrTab::Open && lists.open_total > lists.open.len() {
@@ -1358,7 +1365,7 @@ fn pr_row(ui: &mut Ui, st: &PrStatus, selected: bool, path: &Path, actions: &mut
         ui.painter().text(br.center(), Align2::CENTER_CENTER, "⋯", theme::prop(14.0), if more.hovered() { TEXT } else { DIM });
     }
     egui::Popup::menu(&more).show(|ui| pr_menu(ui, st, path, actions));
-    let hint = format!("Double-click or Enter to open on {} · right-click for more", st.kind.name());
+    let hint = "Click or Enter to open · right-click for more".to_string();
     let resp = resp.on_hover_text(format!("{}\n{hint}", st.details(theme::relative)));
     resp.context_menu(|ui| pr_menu(ui, st, path, actions));
     resp
@@ -1389,7 +1396,7 @@ fn pr_menu(ui: &mut Ui, st: &PrStatus, path: &Path, actions: &mut Vec<Action>) {
     }
     ui.separator();
     if ui.button(format!("Open on {}", st.kind.name())).clicked() {
-        open_pr(ui.ctx(), pr);
+        ui.ctx().open_url(egui::OpenUrl::new_tab(&pr.url));
         ui.close();
     }
     if ui.button("Copy link").clicked() {
@@ -1685,7 +1692,9 @@ fn commit_list(ui: &mut Ui, rv: &mut RepoView, actions: &mut Vec<Action>) {
 
                 // Badges have their own click areas, on top of the row's.
                 for (i, (br, st)) in badges.iter().enumerate() {
-                    pr_badge_area(ui, *br, resp.id.with(("pr", i)), st);
+                    if pr_badge_area(ui, *br, resp.id.with(("pr", i)), st).clicked() {
+                        actions.push(open_pr(&path, &st.pr));
+                    }
                 }
                 if resp.clicked() {
                     actions.push(Action::SelectCommit(c.hash.clone()));
@@ -2785,7 +2794,7 @@ fn discard_note(f: &FileChange) -> &'static str {
 }
 
 /// "N files · +a −r" with Collapse all / Expand all. Returns Some(fold everything?) when clicked.
-fn fold_bar(ui: &mut Ui, doc: &DiffDoc, prefs: &mut DiffPrefs, actions: &mut Vec<Action>) -> Option<bool> {
+pub(crate) fn fold_bar(ui: &mut Ui, doc: &DiffDoc, prefs: &mut DiffPrefs, actions: &mut Vec<Action>) -> Option<bool> {
     // In a narrow pane the diff options get a line of their own.
     let narrow = ui.available_width() < DIFF_OPTIONS_INLINE;
     let (rect, _) = ui.allocate_exact_size(vec2(ui.available_width(), if narrow { 56.0 } else { 30.0 }), Sense::hover());
@@ -2818,7 +2827,7 @@ fn fold_bar(ui: &mut Ui, doc: &DiffDoc, prefs: &mut DiffPrefs, actions: &mut Vec
 const DIFF_OPTIONS_INLINE: f32 = 640.0;
 
 /// How diffs are shown (laid out right to left, next to the fold buttons).
-fn diff_options(ui: &mut Ui, prefs: &mut DiffPrefs, actions: &mut Vec<Action>) {
+pub(crate) fn diff_options(ui: &mut Ui, prefs: &mut DiffPrefs, actions: &mut Vec<Action>) {
     let before = *prefs;
     ui.checkbox(&mut prefs.ignore_whitespace, "Ignore whitespace")
         .on_hover_text("Leave out changes to spaces and indentation (-w). Lines and hunks can't be staged while it's on.");
@@ -2834,7 +2843,7 @@ fn diff_options(ui: &mut Ui, prefs: &mut DiffPrefs, actions: &mut Vec<Action>) {
 }
 
 /// The "Collapse all" and "Expand all" buttons. Returns Some(true) to fold all, Some(false) to unfold all.
-fn fold_buttons(ui: &mut Ui, doc: &DiffDoc) -> Option<bool> {
+pub(crate) fn fold_buttons(ui: &mut Ui, doc: &DiffDoc) -> Option<bool> {
     let mut out = None;
     let all_open = doc.collapsed.is_empty();
     let all_folded = doc.collapsed.len() == doc.files.len();

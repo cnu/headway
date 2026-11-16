@@ -11,7 +11,10 @@
 //!
 //! A host with `"user": null` is signed out, one with `"installed": false` has no
 //! CLI. `pulls` are [`PullRequest`]s as serde writes them; `users` and `labels`
-//! are what a new pull request can name. Pull requests created here are kept
+//! are what a new pull request can name. `details` holds, by number, what a
+//! pull request's view shows: its description, checks, conversation and the
+//! logs of failed checks (by check name). Checks run again turn pending and are
+//! listed in `reruns`. Pull requests created here are kept
 //! until the app quits. Development builds use it when
 //! `HEADWAY_FAKE_FORGE=<folder>` is set (and for the sample projects).
 
@@ -46,6 +49,20 @@ pub struct FakeRepo {
     pub pulls: Vec<PullRequest>,
     pub users: Vec<String>,
     pub labels: Vec<String>,
+    pub details: HashMap<u64, FakeDetails>,
+    /// The checks run again (by name), in order.
+    pub reruns: Vec<String>,
+}
+
+#[derive(Clone, Debug, Default, Serialize, Deserialize)]
+#[serde(default)]
+pub struct FakeDetails {
+    pub body: String,
+    pub can_rerun: bool,
+    pub checks: Vec<Check>,
+    pub conversation: Vec<PrComment>,
+    /// Failed checks' logs, by check name.
+    pub logs: HashMap<String, String>,
 }
 
 pub struct FakeForges {
@@ -165,6 +182,46 @@ impl Forge for FakeForge {
     fn pr_meta(&self, repo: &RepoKey) -> ForgeResult<PrMeta> {
         let r = self.repo(repo)?;
         Ok(PrMeta { users: r.users, labels: r.labels })
+    }
+
+    fn pr_details(&self, repo: &RepoKey, number: u64) -> ForgeResult<PrDetails> {
+        let r = self.repo(repo)?;
+        let pr = r.pulls.iter().find(|p| p.number == number).cloned().ok_or(ForgeError::NotFound)?;
+        let d = r.details.get(&number).cloned().unwrap_or_default();
+        Ok(PrDetails { pr, body: d.body, can_rerun: d.can_rerun })
+    }
+
+    fn pr_checks(&self, repo: &RepoKey, number: u64) -> ForgeResult<Vec<Check>> {
+        Ok(self.repo(repo)?.details.get(&number).map(|d| d.checks.clone()).unwrap_or_default())
+    }
+
+    fn conversation(&self, repo: &RepoKey, number: u64) -> ForgeResult<Vec<PrComment>> {
+        Ok(in_time_order(self.repo(repo)?.details.get(&number).map(|d| d.conversation.clone()).unwrap_or_default()))
+    }
+
+    fn check_log(&self, repo: &RepoKey, check: &Check) -> ForgeResult<String> {
+        let r = self.repo(repo)?;
+        let log = r.details.values().find_map(|d| d.logs.get(&check.name)).ok_or(ForgeError::NotFound)?;
+        Ok(trim_log(log, LOG_LINES).0)
+    }
+
+    fn rerun_failed_checks(&self, repo: &RepoKey, number: u64, _checks: &[Check]) -> ForgeResult<usize> {
+        self.repo(repo)?;
+        let mut data = self.data.write().unwrap();
+        let r = data.repos.get_mut(&repo.to_string()).ok_or(ForgeError::NotFound)?;
+        let d = r.details.get_mut(&number).ok_or(ForgeError::NotFound)?;
+        if let Some(why) = rerun_blocked(self.kind, d.can_rerun, &d.checks) {
+            return Err(ForgeError::Other(why));
+        }
+        let mut names = Vec::new();
+        for c in d.checks.iter_mut().filter(|c| c.state == CheckState::Failing && c.has_log()) {
+            c.state = CheckState::Pending;
+            c.finished = None;
+            names.push(c.name.clone());
+        }
+        let n = names.len();
+        r.reruns.extend(names);
+        Ok(n)
     }
 }
 

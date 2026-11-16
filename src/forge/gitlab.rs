@@ -81,6 +81,62 @@ impl Forge for GitLab {
         labels.sort_by_key(|l| l.to_lowercase());
         Ok(PrMeta { users, labels })
     }
+
+    fn pr_details(&self, repo: &RepoKey, number: u64) -> ForgeResult<PrDetails> {
+        let q = format!("query={}", details_query(number));
+        let path = format!("path={}", repo.path);
+        parse_details(self.json(&["api", "graphql", "-f", &q, "-f", &path])?)
+    }
+
+    fn pr_checks(&self, repo: &RepoKey, number: u64) -> ForgeResult<Vec<Check>> {
+        let q = format!("query={}", checks_query(number));
+        let path = format!("path={}", repo.path);
+        parse_checks(self.json(&["api", "graphql", "-f", &q, "-f", &path])?, &self.host)
+    }
+
+    fn conversation(&self, repo: &RepoKey, number: u64) -> ForgeResult<Vec<PrComment>> {
+        let q = format!("query={}", conversation_query(number));
+        let path = format!("path={}", repo.path);
+        parse_conversation(self.json(&["api", "graphql", "-f", &q, "-f", &path])?)
+    }
+
+    /// The job's trace, through the REST API.
+    fn check_log(&self, repo: &RepoKey, check: &Check) -> ForgeResult<String> {
+        let CheckKind::GitLabJob { job, .. } = check.kind else { return Err(ForgeError::NotFound) };
+        let endpoint = format!("projects/{}/jobs/{job}/trace", encode_path(&repo.path));
+        let text = run_text(self.cli.as_ref(), ForgeKind::GitLab, &self.host, self.dir.as_deref(), &["api", &endpoint, "--hostname", &self.host])?;
+        Ok(trim_log(&text, LOG_LINES).0)
+    }
+
+    /// Retry the pipeline (GitLab runs its failed jobs again).
+    fn rerun_failed_checks(&self, repo: &RepoKey, _number: u64, checks: &[Check]) -> ForgeResult<usize> {
+        let all = rerun_commands(&self.host, repo, checks);
+        for args in &all {
+            let args: Vec<&str> = args.iter().map(String::as_str).collect();
+            run_write(self.cli.as_ref(), ForgeKind::GitLab, &self.host, self.dir.as_deref(), &args)?;
+        }
+        Ok(all.len())
+    }
+}
+
+/// One `glab api -X POST …/pipelines/<id>/retry` per pipeline with a failed job
+/// (which retries that pipeline's failed jobs).
+pub fn rerun_commands(host: &str, repo: &RepoKey, checks: &[Check]) -> Vec<Vec<String>> {
+    let mut pipelines: Vec<u64> = checks
+        .iter()
+        .filter(|c| c.state == CheckState::Failing)
+        .filter_map(|c| match c.kind {
+            CheckKind::GitLabJob { pipeline, .. } => Some(pipeline),
+            _ => None,
+        })
+        .collect();
+    pipelines.sort_unstable();
+    pipelines.dedup();
+    let project = encode_path(&repo.path);
+    pipelines
+        .into_iter()
+        .map(|p| ["api", "-X", "POST", &format!("projects/{project}/pipelines/{p}/retry"), "--hostname", host].map(String::from).to_vec())
+        .collect()
 }
 
 /// `glab mr create` for `pr`, never asking anything. Values are written
@@ -360,6 +416,198 @@ fn mr_from(n: &MrNode) -> PullRequest {
     }
 }
 
+/// The merge request with its description, and whether the user may retry its pipeline.
+pub fn details_query(number: u64) -> String {
+    format!(
+        "query($path: ID!) {{ project(fullPath: $path) {{ mergeRequest(iid: \"{number}\") {{ ...mr description rerun: headPipeline {{ userPermissions {{ updatePipeline }} }} }} }} }} {MR_FRAGMENT}"
+    )
+}
+
+/// The jobs of the merge request's latest pipeline (not the ones retried since).
+pub fn checks_query(number: u64) -> String {
+    format!(
+        "query($path: ID!) {{ project(fullPath: $path) {{ mergeRequest(iid: \"{number}\") {{ headPipeline {{ id jobs(first: 100, retried: false) {{ nodes {{ id name status allowFailure webPath startedAt finishedAt }} }} }} }} }} }}"
+    )
+}
+
+/// Every note, in its threads; with the file and line for notes on the diff.
+pub fn conversation_query(number: u64) -> String {
+    format!(
+        "query($path: ID!) {{ project(fullPath: $path) {{ mergeRequest(iid: \"{number}\") {{ discussions(first: 100) {{ nodes {{ notes {{ nodes {{ \
+author {{ username }} body createdAt system url position {{ newPath newLine oldPath oldLine }} }} }} }} }} }} }} }}"
+    )
+}
+
+#[derive(Deserialize)]
+pub struct Reply<T> {
+    data: Option<ProjectOf<T>>,
+    #[serde(default)]
+    errors: Vec<GqlError>,
+}
+
+#[derive(Deserialize)]
+struct ProjectOf<T> {
+    project: Option<MrOf<T>>,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct MrOf<T> {
+    merge_request: Option<T>,
+}
+
+fn merge_request<T>(reply: Reply<T>) -> ForgeResult<T> {
+    gql_error(&reply.errors)?;
+    reply.data.and_then(|d| d.project).and_then(|p| p.merge_request).ok_or(ForgeError::NotFound)
+}
+
+#[derive(Deserialize)]
+pub struct DetailsMr {
+    #[serde(flatten)]
+    mr: MrNode,
+    #[serde(default)]
+    description: Option<String>,
+    rerun: Option<RerunPipeline>,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct RerunPipeline {
+    user_permissions: Option<PipelinePermissions>,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct PipelinePermissions {
+    #[serde(default)]
+    update_pipeline: bool,
+}
+
+pub fn parse_details(reply: Reply<DetailsMr>) -> ForgeResult<PrDetails> {
+    let d = merge_request(reply)?;
+    let can_rerun = d.rerun.and_then(|r| r.user_permissions).is_some_and(|p| p.update_pipeline);
+    Ok(PrDetails { pr: mr_from(&d.mr), body: d.description.unwrap_or_default(), can_rerun })
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ChecksMr {
+    head_pipeline: Option<ChecksPipeline>,
+}
+
+#[derive(Deserialize)]
+struct ChecksPipeline {
+    id: String,
+    jobs: Option<Nodes<JobNode>>,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct JobNode {
+    id: Option<String>,
+    name: String,
+    status: String,
+    #[serde(default)]
+    allow_failure: bool,
+    web_path: Option<String>,
+    started_at: Option<String>,
+    finished_at: Option<String>,
+}
+
+/// The number at the end of a global id ("gid://gitlab/Ci::Build/123" → 123).
+pub fn gid_number(gid: &str) -> Option<u64> {
+    gid.rsplit('/').next()?.parse().ok()
+}
+
+pub fn parse_checks(reply: Reply<ChecksMr>, host: &str) -> ForgeResult<Vec<Check>> {
+    let Some(p) = merge_request(reply)?.head_pipeline else { return Ok(Vec::new()) };
+    let pipeline = gid_number(&p.id);
+    let time = |t: &Option<String>| t.as_deref().and_then(parse_time);
+    Ok(p.jobs
+        .map(|j| j.nodes)
+        .unwrap_or_default()
+        .into_iter()
+        .flatten()
+        .map(|j| {
+            let kind = match (j.id.as_deref().and_then(gid_number), pipeline) {
+                (Some(job), Some(pipeline)) => CheckKind::GitLabJob { job, pipeline },
+                _ => CheckKind::Other,
+            };
+            Check {
+                state: job_state(&j.status, j.allow_failure),
+                url: j.web_path.as_ref().map(|w| format!("https://{host}{w}")),
+                started: time(&j.started_at),
+                finished: time(&j.finished_at),
+                name: j.name,
+                kind,
+            }
+        })
+        .collect())
+}
+
+#[derive(Deserialize)]
+pub struct ConversationMr {
+    discussions: Nodes<Discussion>,
+}
+
+#[derive(Deserialize)]
+struct Discussion {
+    notes: Nodes<Note>,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct Note {
+    author: Option<Username>,
+    #[serde(default)]
+    body: String,
+    created_at: String,
+    #[serde(default)]
+    system: bool,
+    url: Option<String>,
+    position: Option<Position>,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct Position {
+    new_path: Option<String>,
+    new_line: Option<u32>,
+    old_path: Option<String>,
+    old_line: Option<u32>,
+}
+
+/// Notes oldest first. GitLab's own notes ("added 2 commits") are left out,
+/// except approvals and requests for changes, which read like reviews.
+pub fn parse_conversation(reply: Reply<ConversationMr>) -> ForgeResult<Vec<PrComment>> {
+    let mr = merge_request(reply)?;
+    let mut out = Vec::new();
+    for n in mr.discussions.nodes.into_iter().flatten().flat_map(|d| d.notes.nodes).flatten() {
+        let kind = match (n.system, &n.position) {
+            (true, _) if n.body.starts_with("approved this merge request") => CommentKind::Approved,
+            (true, _) if n.body.starts_with("requested changes") => CommentKind::ChangesRequested,
+            (true, _) => continue,
+            (false, Some(_)) => CommentKind::Line,
+            (false, None) => CommentKind::Comment,
+        };
+        let (path, line) = match n.position {
+            Some(p) => (p.new_path.or(p.old_path), p.new_line.or(p.old_line)),
+            None => (None, None),
+        };
+        let body = if n.system { String::new() } else { n.body };
+        out.push(PrComment {
+            kind,
+            author: n.author.map_or_else(|| "ghost".to_string(), |a| a.username),
+            time: parse_time(&n.created_at).unwrap_or(0),
+            body,
+            path,
+            line,
+            url: n.url,
+        });
+    }
+    Ok(in_time_order(out))
+}
+
 #[cfg(test)]
 mod tests {
     use super::super::testing::{Answer, StubCli};
@@ -501,5 +749,67 @@ mod tests {
         assert_eq!(job_state("failed", true), CheckState::None);
         assert_eq!(job_state("MANUAL", false), CheckState::None);
         assert_eq!(job_state("RUNNING", false), CheckState::Pending);
+    }
+
+    const MR_DETAILS: &str = include_str!("fixtures/glab-mr-details.json");
+    const MR_CHECKS: &str = include_str!("fixtures/glab-mr-checks.json");
+    const MR_CONVERSATION: &str = include_str!("fixtures/glab-mr-conversation.json");
+
+    fn shop() -> RepoKey {
+        RepoKey { host: "gitlab.com".into(), path: "acme/shop".into() }
+    }
+
+    #[test]
+    fn a_merge_requests_details_jobs_and_notes_are_read() {
+        let d = parse_details(serde_json::from_str(MR_DETAILS).unwrap()).unwrap();
+        assert_eq!((d.pr.number, d.pr.state, d.can_rerun), (13, PrState::Draft, false));
+        assert!(d.body.starts_with("Fixes rounding."));
+
+        let checks = parse_checks(serde_json::from_str(MR_CHECKS).unwrap(), "gitlab.com").unwrap();
+        let shape: Vec<(&str, CheckState)> = checks.iter().map(|c| (c.name.as_str(), c.state)).collect();
+        assert_eq!(
+            shape,
+            [("lint", CheckState::Passing), ("test", CheckState::Failing), ("flaky-e2e", CheckState::None), ("deploy-review", CheckState::None), ("package", CheckState::Pending)],
+            "a job allowed to fail doesn't fail"
+        );
+        assert_eq!(checks[1].kind, CheckKind::GitLabJob { job: 8802, pipeline: 5501 });
+        assert_eq!(checks[1].url.as_deref(), Some("https://gitlab.com/acme/shop/-/jobs/8802"));
+        assert_eq!(checks[1].duration(0), Some(180));
+
+        let conv = parse_conversation(serde_json::from_str(MR_CONVERSATION).unwrap()).unwrap();
+        let shape: Vec<(CommentKind, &str, Option<u32>)> = conv.iter().map(|c| (c.kind, c.author.as_str(), c.line)).collect();
+        assert_eq!(
+            shape,
+            [(CommentKind::Comment, "tanuki-user", None), (CommentKind::Line, "reviewer-1", Some(42)), (CommentKind::Line, "tanuki-user", Some(40)), (CommentKind::Approved, "reviewer-1", None)],
+            "oldest first, GitLab's own notes left out but approvals kept"
+        );
+        assert_eq!(conv[1].path.as_deref(), Some("shop/cart.py"));
+        assert_eq!(gid_number("gid://gitlab/Ci::Build/123"), Some(123));
+        assert_eq!(gid_number("nope"), None);
+    }
+
+    #[test]
+    fn the_failed_jobs_trace_and_pipeline_retry() {
+        let long: String = (1..=400).map(|i| format!("\x1b[0Ksection {i}\n")).collect();
+        let leaked: &'static str = Box::leak(long.into_boxed_str());
+        let cli = Arc::new(
+            StubCli::default()
+                .on(Tool::Glab, &["api", "projects/acme%2Fshop/jobs/8802/trace"], Answer::Ok(leaked))
+                .on(Tool::Glab, &["api", "-X", "POST"], Answer::Ok("{}")),
+        );
+        let gl = forge(cli.clone());
+        let checks = parse_checks(serde_json::from_str(MR_CHECKS).unwrap(), "gitlab.com").unwrap();
+        let log = gl.check_log(&shop(), &checks[1]).unwrap();
+        let lines: Vec<&str> = log.lines().collect();
+        assert_eq!((lines.len(), lines[0], lines[299]), (300, "section 101", "section 400"));
+        assert_eq!(gl.check_log(&shop(), &Check { kind: CheckKind::Other, ..checks[1].clone() }), Err(ForgeError::NotFound));
+
+        let key = RepoKey { host: "git.corp".into(), path: "group/sub/app".into() };
+        let two = vec![checks[1].clone(), Check { kind: CheckKind::GitLabJob { job: 1, pipeline: 5501 }, ..checks[1].clone() }, checks[2].clone()];
+        assert_eq!(rerun_commands("git.corp", &key, &two), [["api", "-X", "POST", "projects/group%2Fsub%2Fapp/pipelines/5501/retry", "--hostname", "git.corp"]], "one retry per pipeline");
+        assert!(rerun_commands("git.corp", &key, &checks[..1]).is_empty(), "nothing failed");
+        assert_eq!(gl.rerun_failed_checks(&shop(), 13, &checks), Ok(1));
+        let calls = cli.calls();
+        assert_eq!(calls.last().unwrap().1, ["api", "-X", "POST", "projects/acme%2Fshop/pipelines/5501/retry", "--hostname", "gitlab.example.org"]);
     }
 }

@@ -343,15 +343,157 @@ pub struct PullRequest {
 
 /// One check (a GitHub check run or status, a GitLab job).
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
-#[allow(dead_code)] // Ahead of the UI: the pull request features to come use it.
 pub struct Check {
     pub name: String,
     pub state: CheckState,
+    #[serde(default)]
     pub url: Option<String>,
+    /// Unix seconds.
+    #[serde(default)]
     pub started: Option<i64>,
+    #[serde(default)]
     pub finished: Option<i64>,
-    /// The job or run id, to rerun it.
-    pub id: Option<String>,
+    /// What ran it, which says how to read its log and run it again.
+    #[serde(default)]
+    pub kind: CheckKind,
+}
+
+/// What ran a check.
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case", tag = "type")]
+pub enum CheckKind {
+    /// A GitHub Actions job (`job`) in workflow run `run`.
+    Actions { run: u64, job: Option<u64> },
+    /// A GitLab CI job in pipeline `pipeline`.
+    GitLabJob { job: u64, pipeline: u64 },
+    /// Anything else (a commit status, another app's check): no log, no rerun here.
+    #[default]
+    Other,
+}
+
+impl Check {
+    /// How long it ran (or has been running, at `now`), in seconds.
+    pub fn duration(&self, now: i64) -> Option<i64> {
+        let start = self.started?;
+        let end = self.finished.unwrap_or(now);
+        Some((end - start).max(0))
+    }
+
+    /// Its log can be read here.
+    pub fn has_log(&self) -> bool {
+        !matches!(self.kind, CheckKind::Other)
+    }
+}
+
+/// Checks in groups, failing first, then running, passing, and skipped or
+/// neutral; by name within a group. Empty groups are left out.
+pub fn group_checks(checks: &[Check]) -> Vec<(CheckState, Vec<&Check>)> {
+    [CheckState::Failing, CheckState::Pending, CheckState::Passing, CheckState::None]
+        .into_iter()
+        .filter_map(|state| {
+            let mut group: Vec<&Check> = checks.iter().filter(|c| c.state == state).collect();
+            group.sort_by(|a, b| a.name.to_lowercase().cmp(&b.name.to_lowercase()).then(a.name.cmp(&b.name)));
+            (!group.is_empty()).then_some((state, group))
+        })
+        .collect()
+}
+
+/// Lines a check log is cut to (its end, where the failure is).
+pub const LOG_LINES: usize = 300;
+
+/// The last `max` lines of a log, with colour codes and carriage-return
+/// progress lines tidied away. Returns the text and how many lines were left out.
+pub fn trim_log(text: &str, max: usize) -> (String, usize) {
+    let lines: Vec<String> = text
+        .lines()
+        .map(|l| strip_ansi(l.rsplit('\r').find(|s| !s.is_empty()).unwrap_or("")))
+        .collect();
+    let mut end = lines.len();
+    while end > 0 && lines[end - 1].trim().is_empty() {
+        end -= 1;
+    }
+    let start = end.saturating_sub(max);
+    (lines[start..end].join("\n"), start)
+}
+
+/// Text without terminal colour codes (`ESC [ … letter`).
+fn strip_ansi(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    let mut chars = s.chars().peekable();
+    while let Some(c) = chars.next() {
+        if c == '\x1b' {
+            if chars.peek() == Some(&'[') {
+                chars.next();
+                for d in chars.by_ref() {
+                    if d.is_ascii_alphabetic() {
+                        break;
+                    }
+                }
+            }
+            continue;
+        }
+        out.push(c);
+    }
+    out
+}
+
+/// Why "Re-run failed" can't be used now, or `None` when it can.
+pub fn rerun_blocked(kind: ForgeKind, can_rerun: bool, checks: &[Check]) -> Option<String> {
+    let failed: Vec<&Check> = checks.iter().filter(|c| c.state == CheckState::Failing).collect();
+    if failed.is_empty() {
+        return Some("No checks have failed".into());
+    }
+    if !failed.iter().any(|c| c.has_log()) {
+        return Some(match kind {
+            ForgeKind::GitHub => "The failed checks aren't GitHub Actions jobs: run them again where they ran".into(),
+            ForgeKind::GitLab => "The failed checks aren't GitLab CI jobs: run them again where they ran".into(),
+        });
+    }
+    if !can_rerun {
+        return Some(format!("You don't have permission to run checks again in this {}", match kind {
+            ForgeKind::GitHub => "repository",
+            ForgeKind::GitLab => "project",
+        }));
+    }
+    None
+}
+
+/// A review's verdict, or a plain comment.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum CommentKind {
+    Comment,
+    Approved,
+    ChangesRequested,
+    /// A review left with comments only.
+    Reviewed,
+    /// A comment on a line of a file.
+    Line,
+}
+
+/// One entry of a pull request's conversation.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct PrComment {
+    pub kind: CommentKind,
+    pub author: String,
+    /// Unix seconds.
+    pub time: i64,
+    /// Markdown.
+    #[serde(default)]
+    pub body: String,
+    /// For a line comment: the file and line it's on.
+    #[serde(default)]
+    pub path: Option<String>,
+    #[serde(default)]
+    pub line: Option<u32>,
+    #[serde(default)]
+    pub url: Option<String>,
+}
+
+/// Sort a conversation oldest first (stable, so replies keep their order).
+pub fn in_time_order(mut list: Vec<PrComment>) -> Vec<PrComment> {
+    list.sort_by_key(|c| c.time);
+    list
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -403,12 +545,6 @@ pub struct PrFilter {
     pub limit: usize,
 }
 
-#[allow(dead_code)] // Ahead of the UI: the pull request features to come use it.
-pub enum CheckTarget {
-    Pr(u64),
-    Commit(String),
-}
-
 /// A pull request to open.
 #[derive(Clone, Debug, Default, PartialEq)]
 pub struct NewPr {
@@ -444,13 +580,16 @@ pub enum Verdict {
     Comment,
 }
 
-/// Everything about one pull request, for its details view.
-#[derive(Clone, Debug, PartialEq)]
-#[allow(dead_code)] // Ahead of the UI: the pull request features to come use it.
+/// One pull request, for its view: what the lists know, plus its description
+/// and whether the signed-in user may run its checks again.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct PrDetails {
     pub pr: PullRequest,
+    /// Markdown.
+    #[serde(default)]
     pub body: String,
-    pub checks: Vec<Check>,
+    #[serde(default)]
+    pub can_rerun: bool,
 }
 
 
@@ -512,8 +651,17 @@ pub trait Forge: Send + Sync {
     fn pr_details(&self, _repo: &RepoKey, _number: u64) -> ForgeResult<PrDetails> {
         Err(ForgeError::NotYet("show pull request details"))
     }
-    fn checks(&self, _repo: &RepoKey, _target: &CheckTarget) -> ForgeResult<Vec<Check>> {
+    /// The checks on a pull request's latest commit.
+    fn pr_checks(&self, _repo: &RepoKey, _number: u64) -> ForgeResult<Vec<Check>> {
         Err(ForgeError::NotYet("list checks"))
+    }
+    /// Reviews and comments, oldest first.
+    fn conversation(&self, _repo: &RepoKey, _number: u64) -> ForgeResult<Vec<PrComment>> {
+        Err(ForgeError::NotYet("show conversations"))
+    }
+    /// The end of a failed check's log ([`LOG_LINES`] lines at most, see [`trim_log`]).
+    fn check_log(&self, _repo: &RepoKey, _check: &Check) -> ForgeResult<String> {
+        Err(ForgeError::NotYet("show check logs"))
     }
     /// Open a pull request; `me` is its author (the signed-in user).
     fn create_pr(&self, _repo: &RepoKey, _pr: &NewPr, _me: &str) -> ForgeResult<PullRequest> {
@@ -538,7 +686,9 @@ pub trait Forge: Send + Sync {
     fn review(&self, _repo: &RepoKey, _number: u64, _verdict: Verdict, _body: &str) -> ForgeResult<()> {
         Err(ForgeError::NotYet("review pull requests"))
     }
-    fn rerun_failed_checks(&self, _repo: &RepoKey, _number: u64) -> ForgeResult<()> {
+    /// Run the failed ones of `checks` again; returns how many runs (or
+    /// pipelines) were restarted.
+    fn rerun_failed_checks(&self, _repo: &RepoKey, _number: u64, _checks: &[Check]) -> ForgeResult<usize> {
         Err(ForgeError::NotYet("rerun checks"))
     }
 }
@@ -589,6 +739,15 @@ pub fn run_json<T: serde::de::DeserializeOwned>(cli: &dyn Cli, kind: ForgeKind, 
 /// Run a CLI call that changes something on the forge; returns what it printed.
 pub fn run_write(cli: &dyn Cli, kind: ForgeKind, host: &str, dir: Option<&Path>, args: &[&str]) -> ForgeResult<String> {
     let out = cli.run(kind.tool(), dir, args, true).map_err(|e| io_error(kind, &e))?;
+    if out.code == Some(0) {
+        return Ok(String::from_utf8_lossy(&out.stdout).into_owned());
+    }
+    Err(classify_failure(kind, host, &out))
+}
+
+/// Run a read-only CLI call that prints text (a log), and return it.
+pub fn run_text(cli: &dyn Cli, kind: ForgeKind, host: &str, dir: Option<&Path>, args: &[&str]) -> ForgeResult<String> {
+    let out = cli.run(kind.tool(), dir, args, false).map_err(|e| io_error(kind, &e))?;
     if out.code == Some(0) {
         return Ok(String::from_utf8_lossy(&out.stdout).into_owned());
     }
@@ -1079,6 +1238,59 @@ mod tests {
         assert_eq!(parse_time("2026-11-10T04:00:12.5-05:30"), Some(1_794_303_012));
         assert_eq!(parse_time("2024-02-29T00:00:00Z"), Some(1_709_164_800));
         assert_eq!(parse_time("yesterday"), None);
+    }
+
+    fn check(name: &str, state: CheckState, kind: CheckKind) -> Check {
+        Check { name: name.into(), state, url: None, started: Some(100), finished: None, kind }
+    }
+
+    #[test]
+    fn checks_are_grouped_failing_first_and_by_name() {
+        use CheckState::*;
+        let actions = CheckKind::Actions { run: 1, job: Some(2) };
+        let checks = vec![
+            check("lint", Passing, actions.clone()),
+            check("Build", Passing, actions.clone()),
+            check("docs", None, CheckKind::Other),
+            check("test (macos)", Failing, actions.clone()),
+            check("e2e", Pending, actions.clone()),
+            check("audit", Failing, CheckKind::Other),
+        ];
+        let groups = group_checks(&checks);
+        let shape: Vec<(CheckState, Vec<&str>)> = groups.iter().map(|(s, g)| (*s, g.iter().map(|c| c.name.as_str()).collect())).collect();
+        assert_eq!(
+            shape,
+            [(Failing, vec!["audit", "test (macos)"]), (Pending, vec!["e2e"]), (Passing, vec!["Build", "lint"]), (None, vec!["docs"])]
+        );
+        assert!(group_checks(&[]).is_empty());
+        // Still running: timed up to now. Finished: start to end.
+        assert_eq!(checks[4].duration(160), Some(60));
+        assert_eq!(Check { finished: Some(130), ..checks[0].clone() }.duration(999), Some(30));
+        assert_eq!(Check { started: Option::None, ..checks[0].clone() }.duration(999), Option::None);
+    }
+
+    #[test]
+    fn logs_keep_their_last_lines_without_colours() {
+        let long: String = (1..=500).map(|i| format!("line {i}\n")).collect();
+        let (text, cut) = trim_log(&(long + "\n\n"), LOG_LINES);
+        let lines: Vec<&str> = text.lines().collect();
+        assert_eq!((lines.len(), cut, lines[0], lines[299]), (300, 200, "line 201", "line 500"), "the end is kept, blank tail dropped");
+        let (short, cut) = trim_log("\x1b[31merror\x1b[0m: boom\r\ndownloading 10%\rdownloading 100%\n", LOG_LINES);
+        assert_eq!((short.as_str(), cut), ("error: boom\ndownloading 100%", 0));
+        assert_eq!(trim_log("", 10), (String::new(), 0));
+    }
+
+    #[test]
+    fn rerun_says_why_not() {
+        use CheckState::*;
+        let gh = ForgeKind::GitHub;
+        let failed_job = check("test", Failing, CheckKind::Actions { run: 7, job: Some(8) });
+        let failed_status = check("ci/jenkins", Failing, CheckKind::Other);
+        assert_eq!(rerun_blocked(gh, true, std::slice::from_ref(&failed_job)), Option::None);
+        assert_eq!(rerun_blocked(gh, true, &[check("ok", Passing, CheckKind::Other)]).as_deref(), Some("No checks have failed"));
+        assert!(rerun_blocked(gh, true, std::slice::from_ref(&failed_status)).unwrap().contains("aren't GitHub Actions"));
+        assert!(rerun_blocked(ForgeKind::GitLab, true, &[failed_status]).unwrap().contains("aren't GitLab CI"));
+        assert_eq!(rerun_blocked(gh, false, &[failed_job]).as_deref(), Some("You don't have permission to run checks again in this repository"));
     }
 
     #[test]

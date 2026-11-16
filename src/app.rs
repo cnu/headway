@@ -8,7 +8,7 @@ use crate::workspace::{Config, Workspace};
 use crate::fileview::{self, FileView, Mode};
 use crate::resolver::Resolver;
 use crate::forge::{self, cache::Reason};
-use crate::{cmdlog, diffmodel, highlight, newpr, overview, preview, views};
+use crate::{cmdlog, diffmodel, highlight, markdown, newpr, overview, preview, prview, views};
 use egui::{Align, Color32, CornerRadius, Id, Layout, Margin, RichText, Sense, Stroke, Ui};
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
@@ -197,6 +197,18 @@ pub struct WorktreeInfo {
     pub locked: bool,
     /// Uncommitted changes, ahead, behind (when it could be read).
     pub status: Option<(usize, u32, u32)>,
+}
+
+/// From a background worker: send a diff that was just read, then colour its
+/// code, repainting as files are done. `doc` finds the diff in what's sent.
+/// Returns the worker's last message.
+fn send_diff<T, E>(send: &dyn Fn(Msg), repo: &Path, value: Result<T, E>, doc: impl Fn(&T) -> &DiffDoc, msg: impl FnOnce(Result<T, E>) -> Msg) -> Msg {
+    let job = value.as_ref().ok().map(|v| doc(v).highlighter(repo));
+    send(msg(value));
+    if let Some(job) = job {
+        job.run(&|| send(Msg::Highlighted));
+    }
+    Msg::Highlighted
 }
 
 fn load_summary(path: &Path) -> Result<Summary, String> {
@@ -538,6 +550,16 @@ impl DiffDoc {
         }
     }
 
+    /// Get a diff that was just read ready to show: the whitespace and split
+    /// settings, and the pictures and sizes of binary files (slow: call it in
+    /// the background).
+    pub fn prepared(mut self, repo: &Path, commit: Option<&str>, ignore_whitespace: bool, split: bool) -> Self {
+        self.whitespace_ignored = ignore_whitespace;
+        self.set_split(split);
+        self.load_binaries(repo, commit);
+        self
+    }
+
     /// Show the changes side by side, or unified.
     pub fn set_split(&mut self, split: bool) {
         if self.split != split {
@@ -669,6 +691,8 @@ pub struct RepoView {
     pub pr_highlight: Option<PrHighlight>,
     /// Select this commit once the history has it (it was just fetched).
     pr_reveal: Option<String>,
+    /// A pull request opened in the window, when one is.
+    pub pr_view: Option<prview::PrView>,
 }
 
 impl RepoView {
@@ -714,6 +738,7 @@ impl RepoView {
             pr_keys: false,
             pr_highlight: None,
             pr_reveal: None,
+            pr_view: None,
         }
     }
 
@@ -795,6 +820,21 @@ enum Msg {
     PrPrep { repo: PathBuf, generation: u64, base: String, result: Result<git::PrPrep, String> },
     /// The people and labels a new pull request can name.
     PrMeta { key: forge::RepoKey, result: Result<forge::PrMeta, String> },
+    /// A part of an open pull request view (`id`: which opening it's for).
+    PrPart { repo: PathBuf, id: u64, part: PrPart },
+}
+
+/// One section of a pull request view, read on a worker.
+enum PrPart {
+    Details(Result<(forge::PrDetails, markdown::Doc), String>),
+    Checks(Result<Vec<forge::Check>, String>),
+    Conversation(Result<Vec<(forge::PrComment, markdown::Doc)>, String>),
+    Head(Result<(String, Option<String>), String>),
+    Commits(Result<Vec<git::Commit>, String>),
+    Files(Result<DiffDoc, String>),
+    CommitDiff(String, Result<DiffDoc, String>),
+    Log(String, Result<String, String>),
+    Rerun(Result<usize, String>),
 }
 
 #[derive(Clone, Copy, PartialEq)]
@@ -870,6 +910,10 @@ pub enum Action {
     Pr { repo: PathBuf, number: u64, what: PrAction },
     /// Stop marking a pull request's commits in the history.
     ClearPrHighlight,
+    /// Open a pull request in the repository's window.
+    OpenPr { repo: PathBuf, pr: Box<forge::PullRequest> },
+    /// Something for the open repository's pull request view.
+    PrView(prview::PrOp),
     /// Open the "Create pull request" dialog for a branch (`None`: the current one).
     NewPr { repo: PathBuf, branch: Option<String> },
     /// The dialog's base changed: compare again.
@@ -1195,19 +1239,10 @@ impl HeadwayApp {
         self.spawn_stream(move |send| {
             // Parsing and flattening a big diff can take a while: do it here, not in the UI.
             let d = git::commit_detail(&p, &hash, ws).map(|mut info| {
-                let files = std::mem::take(&mut info.files);
-                let mut doc = DiffDoc::new(files, true);
-                doc.whitespace_ignored = ws;
-                doc.set_split(split);
-                doc.load_binaries(&p, Some(&info.hash));
+                let doc = DiffDoc::new(std::mem::take(&mut info.files), true).prepared(&p, Some(&info.hash), ws, split);
                 Detail { info, doc }
             });
-            let job = d.as_ref().ok().map(|d| d.doc.highlighter(&p));
-            send(Msg::Detail(p, hash, d));
-            if let Some(job) = job {
-                job.run(&|| send(Msg::Highlighted));
-            }
-            Msg::Highlighted
+            send_diff(send, &p.clone(), d, |d| &d.doc, |d| Msg::Detail(p, hash, d))
         });
     }
 
@@ -1230,21 +1265,13 @@ impl HeadwayApp {
                         })
                         .collect::<Vec<_>>()
                 };
-                let mut doc = DiffDoc::working(vec![
+                DiffDoc::working(vec![
                     ("UNSTAGED".to_string(), views::DiffMode::Unstaged, with_sub(unstaged, &st.unstaged)),
                     ("STAGED".to_string(), views::DiffMode::Staged, with_sub(staged, &st.staged)),
-                ]);
-                doc.whitespace_ignored = ws;
-                doc.set_split(split);
-                doc.load_binaries(&p, None);
-                doc
+                ])
+                .prepared(&p, None, ws, split)
             });
-            let job = doc.as_ref().ok().map(|d| d.highlighter(&p));
-            send(Msg::WorkDiff(p, generation, doc));
-            if let Some(job) = job {
-                job.run(&|| send(Msg::Highlighted));
-            }
-            Msg::Highlighted
+            send_diff(send, &p.clone(), doc, |d| d, |d| Msg::WorkDiff(p, generation, d))
         });
     }
 
@@ -1402,19 +1429,8 @@ impl HeadwayApp {
         let p = path.to_path_buf();
         let (ws, split) = (self.cfg.view.diff.ignore_whitespace, self.cfg.view.diff.split);
         self.spawn_stream(move |send| {
-            let doc = git::commit_files(&p, &c.hash, &paths, ws).map(|files| {
-                let mut doc = DiffDoc::new(files, true);
-                doc.whitespace_ignored = ws;
-                doc.set_split(split);
-                doc.load_binaries(&p, Some(&c.hash));
-                doc
-            });
-            let job = doc.as_ref().ok().map(|d| d.highlighter(&p));
-            send(Msg::FileDiff(p, generation, doc));
-            if let Some(job) = job {
-                job.run(&|| send(Msg::Highlighted));
-            }
-            Msg::Highlighted
+            let doc = git::commit_files(&p, &c.hash, &paths, ws).map(|files| DiffDoc::new(files, true).prepared(&p, Some(&c.hash), ws, split));
+            send_diff(send, &p.clone(), doc, |d| d, |d| Msg::FileDiff(p, generation, d))
         });
     }
 
@@ -1663,8 +1679,10 @@ impl HeadwayApp {
     fn find_pr(&self, path: &Path, number: u64) -> Option<(forge::PullRequest, git::PrSource, &ForgeRepo)> {
         let r = self.forge_repos.get(path)?;
         let section = self.pr_section(path)?;
-        let lists = section.lists?;
-        let pr = lists.mine.iter().chain(&lists.review_requested).chain(&lists.open).find(|p| p.number == number)?.clone();
+        // Listed in the sidebar, or open in the view (a merged one, from a badge).
+        let listed = section.lists.and_then(|lists| lists.mine.iter().chain(&lists.review_requested).chain(&lists.open).find(|p| p.number == number).cloned());
+        let viewed = || self.tabs.get(path)?.pr_view.as_ref().filter(|v| v.pr.number == number).map(|v| v.pr.clone());
+        let pr = listed.or_else(viewed)?;
         let src = forge::status::pr_source(&pr, section.kind, &r.remotes, &r.urls);
         Some((pr, src, r))
     }
@@ -1722,6 +1740,247 @@ impl HeadwayApp {
                     Msg::PrCommits { repo: r2, number, result }
                 });
             }
+        }
+    }
+
+    // -----------------------------------------------------------------------
+    // The pull request view
+
+    /// Open a pull request in its repository's window (opening the repository
+    /// first, from an overview card). Without a signed-in forge, the browser.
+    fn open_pr_view(&mut self, repo: PathBuf, pr: forge::PullRequest) {
+        let Some((kind, _)) = self.signed_in_forge(&repo) else {
+            self.ctx.open_url(egui::OpenUrl::new_tab(&pr.url));
+            return;
+        };
+        if self.active_path().as_deref() != Some(repo.as_path()) {
+            self.do_action(Action::OpenRepo(repo.clone()));
+        }
+        self.next_id += 1;
+        let id = self.next_id;
+        let Some(rv) = self.tabs.get_mut(&repo) else { return };
+        if let Some(fv) = rv.file_view.as_mut() {
+            fv.shown = false;
+        }
+        // The same one again (a second click): just bring it to the front.
+        if let Some(pv) = rv.pr_view.as_mut().filter(|v| v.pr.number == pr.number) {
+            pv.shown = true;
+            return;
+        }
+        rv.pr_view = Some(prview::PrView::new(pr, kind, id));
+        self.pr_view_load(&repo, true);
+    }
+
+    /// Read the view's sections, each on its own worker: the description, the
+    /// checks and the conversation from the forge, and (`changes`) the commits
+    /// and changes from git, fetching the head first if it isn't here.
+    fn pr_view_load(&mut self, repo: &Path, changes: bool) {
+        let Some(r) = self.forge_repos.get(repo) else { return };
+        let Some(pv) = self.tabs.get(repo).and_then(|rv| rv.pr_view.as_ref()) else { return };
+        let (id, number, kind) = (pv.id, pv.pr.number, pv.kind);
+        let key = r.remotes.key();
+        let f = self.forges.forge(kind, &key.host, Some(repo));
+        let now = self.ctx.input(|i| i.time);
+        if let Some(pv) = self.tabs.get_mut(repo).and_then(|rv| rv.pr_view.as_mut()) {
+            pv.checks_asked = now;
+        }
+        let send = |this: &Self, name: &'static str, job: Box<dyn FnOnce() -> PrPart + Send>| {
+            let repo = repo.to_path_buf();
+            this.spawn(move || {
+                let _name = cmdlog::named(name);
+                Msg::PrPart { repo, id, part: job() }
+            });
+        };
+        let (f1, k1) = (f.clone(), key.clone());
+        send(self, "pull request details", Box::new(move || PrPart::Details(f1.pr_details(&k1, number).map(|d| { let doc = markdown::parse(&d.body); (d, doc) }).map_err(|e| e.to_string()))));
+        let (f2, k2) = (f.clone(), key.clone());
+        send(self, "pull request checks", Box::new(move || PrPart::Checks(f2.pr_checks(&k2, number).map_err(|e| e.to_string()))));
+        let (f3, k3) = (f, key);
+        send(self, "pull request conversation", Box::new(move || {
+            PrPart::Conversation(f3.conversation(&k3, number).map(|l| l.into_iter().map(|c| { let doc = markdown::parse(&c.body); (c, doc) }).collect()).map_err(|e| e.to_string()))
+        }));
+        if changes {
+            self.pr_view_diffs(repo);
+        }
+    }
+
+    /// Read the pull request's commits and changes again, and the picked
+    /// commit's (in the background): after opening it, a refresh, or a change
+    /// to how diffs are read.
+    fn pr_view_diffs(&mut self, repo: &Path) {
+        let Some(r) = self.forge_repos.get(repo) else { return };
+        let Some(pv) = self.tabs.get(repo).and_then(|rv| rv.pr_view.as_ref()) else { return };
+        let (id, pr, commit) = (pv.id, &pv.pr, pv.commit.clone());
+        let src = forge::status::pr_source(pr, pv.kind, &r.remotes, &r.urls);
+        let base = format!("{}/{}", r.remotes.pr_remote, pr.base_branch);
+        let p = repo.to_path_buf();
+        let known = pr.head_oid.clone();
+        let (ws, split) = (self.cfg.view.diff.ignore_whitespace, self.cfg.view.diff.split);
+        self.spawn_stream(move |send| {
+            let _name = cmdlog::named("pull request changes");
+            let part = |part| Msg::PrPart { repo: p.clone(), id, part };
+            let head = git::resolve_pr_head(&p, &src, known.as_deref());
+            send(part(PrPart::Head(head.clone())));
+            let Ok((head, _)) = head else { return Msg::Highlighted };
+            send(part(PrPart::Commits(git::pr_commit_list(&p, &head, &base, 250))));
+            let doc = git::pr_diff(&p, &base, &head, ws).map(|files| DiffDoc::new(files, true).prepared(&p, Some(&head), ws, split));
+            send_diff(send, &p, doc, |d| d, |d| part(PrPart::Files(d)))
+        });
+        if let Some(h) = commit {
+            self.pr_view_commit(repo, h);
+        }
+    }
+
+    /// One commit's changes, for the view's Commits section.
+    fn pr_view_commit(&mut self, repo: &Path, hash: String) {
+        let Some(pv) = self.tabs.get_mut(repo).and_then(|rv| rv.pr_view.as_mut()) else { return };
+        pv.commit = Some(hash.clone());
+        pv.commit_diff = None;
+        pv.commit_scroll = Some(0);
+        let id = pv.id;
+        let p = repo.to_path_buf();
+        let (ws, split) = (self.cfg.view.diff.ignore_whitespace, self.cfg.view.diff.split);
+        self.spawn_stream(move |send| {
+            let d = git::commit_detail(&p, &hash, ws).map(|mut info| DiffDoc::new(std::mem::take(&mut info.files), true).prepared(&p, Some(&info.hash), ws, split));
+            send_diff(send, &p.clone(), d, |d| d, |d| Msg::PrPart { repo: p, id, part: PrPart::CommitDiff(hash, d) })
+        });
+    }
+
+    fn pr_view_op(&mut self, repo: &Path, o: prview::PrOp) {
+        use prview::PrOp;
+        let forge = self.forge_repos.get(repo).map(|r| r.remotes.key());
+        let Some(rv) = self.tabs.get_mut(repo) else { return };
+        let Some(pv) = rv.pr_view.as_mut() else { return };
+        let (id, number, kind) = (pv.id, pv.pr.number, pv.kind);
+        match o {
+            PrOp::Close => {
+                rv.pr_view = None;
+                // Back to the blame or history it was opened over, if any.
+                if let Some(fv) = rv.file_view.as_mut() {
+                    fv.shown = true;
+                }
+            }
+            PrOp::Show => {
+                pv.shown = true;
+                if let Some(fv) = rv.file_view.as_mut() {
+                    fv.shown = false;
+                }
+            }
+            PrOp::Refresh => {
+                // Keep what's shown until the new answers come.
+                self.pr_view_load(repo, true);
+            }
+            PrOp::SelectCommit(h) => self.pr_view_commit(repo, h),
+            PrOp::HideLog(name) => {
+                pv.logs.remove(&name);
+            }
+            PrOp::ShowLog(name) => {
+                let Some(check) = pv.checks.as_ref().and_then(|c| c.as_ref().ok()).and_then(|c| c.iter().find(|c| c.name == name)).cloned() else { return };
+                let Some(key) = forge else { return };
+                pv.logs.insert(name.clone(), None);
+                let f = self.forges.forge(kind, &key.host, Some(repo));
+                let p = repo.to_path_buf();
+                self.spawn(move || {
+                    let _name = cmdlog::named("check log");
+                    Msg::PrPart { repo: p, id, part: PrPart::Log(name, f.check_log(&key, &check).map_err(|e| e.to_string())) }
+                });
+            }
+            PrOp::Rerun => {
+                if pv.rerun_blocked().is_some() {
+                    return;
+                }
+                let Some(key) = forge else { return };
+                let checks = pv.checks.as_ref().and_then(|c| c.as_ref().ok()).cloned().unwrap_or_default();
+                pv.rerunning = true;
+                let f = self.forges.forge(kind, &key.host, Some(repo));
+                let p = repo.to_path_buf();
+                self.spawn(move || {
+                    let _name = cmdlog::named("re-run failed checks");
+                    Msg::PrPart { repo: p, id, part: PrPart::Rerun(f.rerun_failed_checks(&key, number, &checks).map_err(|e| e.to_string())) }
+                });
+            }
+        }
+    }
+
+    fn on_pr_part(&mut self, repo: PathBuf, id: u64, part: PrPart) {
+        let Some(pv) = self.tabs.get_mut(&repo).and_then(|rv| rv.pr_view.as_mut()).filter(|v| v.id == id) else { return };
+        match part {
+            PrPart::Details(res) => match res {
+                Ok((d, doc)) => {
+                    // The forge's word is newer than the list's (keep the head the list had if it gave none).
+                    let head = d.pr.head_oid.clone().or(pv.pr.head_oid.take());
+                    pv.pr = forge::PullRequest { head_oid: head, ..d.pr };
+                    pv.can_rerun = Some(d.can_rerun);
+                    pv.body = Some(Ok(doc));
+                }
+                // A refresh that failed keeps the description already shown.
+                Err(e) if !matches!(pv.body, Some(Ok(_))) => pv.body = Some(Err(e)),
+                Err(_) => {}
+            },
+            PrPart::Checks(res) => {
+                if res.is_ok() || !matches!(pv.checks, Some(Ok(_))) {
+                    pv.checks = Some(res);
+                }
+                // Logs of checks that aren't failing any more go.
+                if let Some(Ok(c)) = &pv.checks {
+                    pv.logs.retain(|name, _| c.iter().any(|c| &c.name == name && c.state == forge::CheckState::Failing));
+                }
+            }
+            PrPart::Conversation(res) => {
+                if res.is_ok() || !matches!(pv.conversation, Some(Ok(_))) {
+                    pv.conversation = Some(res);
+                }
+            }
+            PrPart::Head(res) => pv.head = Some(res),
+            PrPart::Commits(res) => pv.commits = Some(res),
+            PrPart::Files(res) => {
+                if let (Ok(new), Some(Ok(old))) = (&res, &pv.files)
+                    && new.files.len() == old.files.len()
+                {
+                    // A refresh keeps the place and the files folded by hand.
+                } else {
+                    pv.files_scroll = Some(0);
+                }
+                pv.files = Some(res);
+            }
+            PrPart::CommitDiff(hash, res) => {
+                if pv.commit.as_deref() == Some(hash.as_str()) {
+                    pv.commit_diff = Some(res);
+                }
+            }
+            PrPart::Log(name, res) => {
+                if pv.logs.contains_key(&name) {
+                    pv.logs.insert(name, Some(res));
+                }
+            }
+            PrPart::Rerun(res) => {
+                pv.rerunning = false;
+                match res {
+                    Ok(n) => {
+                        let what = match pv.kind {
+                            forge::ForgeKind::GitHub => if n == 1 { "1 workflow run".to_string() } else { format!("{n} workflow runs") },
+                            forge::ForgeKind::GitLab => if n == 1 { "the pipeline".to_string() } else { format!("{n} pipelines") },
+                        };
+                        let number = pv.number();
+                        self.toast(format!("Started the failed checks of {number} again ({what})"), false);
+                        self.pr_view_load(&repo, false);
+                    }
+                    Err(e) => self.toast(format!("Couldn't run the checks again\n{e}"), true),
+                }
+            }
+        }
+    }
+
+    /// While a pull request is in front and some check is still running, read
+    /// its checks (and description) again every [`prview::AUTO_REFRESH_SECS`].
+    fn pr_view_auto_refresh(&mut self, now: f64) {
+        let Some(p) = self.active_path() else { return };
+        let due = self.tabs.get(&p).and_then(|rv| rv.pr_view.as_ref()).is_some_and(|v| v.shown && v.pending() && now - v.checks_asked >= prview::AUTO_REFRESH_SECS);
+        if due {
+            self.pr_view_load(&p, false);
+        }
+        if self.tabs.get(&p).and_then(|rv| rv.pr_view.as_ref()).is_some_and(|v| v.shown && v.pending()) {
+            self.ctx.request_repaint_after(std::time::Duration::from_secs_f64(prview::AUTO_REFRESH_SECS));
         }
     }
 
@@ -1890,6 +2149,7 @@ impl HeadwayApp {
                         }
                     }
                 }
+                Msg::PrPart { repo, id, part } => self.on_pr_part(repo, id, part),
                 Msg::Forge(res) => {
                     let wall = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map_or(0, |d| d.as_secs() as i64);
                     let repo = res.key.as_ref().and_then(|k| self.forge_repos.iter().find(|(_, r)| r.remotes.key() == *k).map(|(p, _)| p.clone()));
@@ -2314,6 +2574,12 @@ impl HeadwayApp {
                 }
             }
             Action::Pr { repo, number, what } => self.pr_action(repo, number, what),
+            Action::OpenPr { repo, pr } => self.open_pr_view(repo, *pr),
+            Action::PrView(o) => {
+                if let Some(p) = active {
+                    self.pr_view_op(&p, o);
+                }
+            }
             Action::NewPr { repo, branch } => self.open_new_pr(repo, branch),
             Action::PrPrepare => self.pr_prepare(),
             Action::SubmitPr => self.submit_pr(),
@@ -2391,7 +2657,11 @@ impl HeadwayApp {
                 let split = self.cfg.view.diff.split;
                 for rv in self.tabs.values_mut() {
                     let history = rv.file_view.as_mut().and_then(|f| f.history.as_mut()).and_then(|h| h.diff.as_mut()).and_then(|d| d.as_mut().ok());
-                    for doc in [rv.detail.as_mut().map(|d| &mut d.doc), rv.wd_doc.as_mut(), history].into_iter().flatten() {
+                    let (pr_files, pr_commit) = match rv.pr_view.as_mut() {
+                        Some(pv) => (pv.files.as_mut().and_then(|d| d.as_mut().ok()), pv.commit_diff.as_mut().and_then(|d| d.as_mut().ok())),
+                        None => (None, None),
+                    };
+                    for doc in [rv.detail.as_mut().map(|d| &mut d.doc), rv.wd_doc.as_mut(), history, pr_files, pr_commit].into_iter().flatten() {
                         doc.set_split(split);
                     }
                 }
@@ -2399,6 +2669,8 @@ impl HeadwayApp {
                     return;
                 }
                 let Some(p) = active else { return };
+                // Only the diffs change: nothing to ask the forge again.
+                self.pr_view_diffs(&p);
                 let Some(rv) = self.tabs.get(&p) else { return };
                 let commit = match &rv.selection {
                     Some(Selection::Commit(h)) => Some(h.clone()),
@@ -2480,12 +2752,19 @@ impl HeadwayApp {
             }
             Action::File(op) => {
                 if let Some(p) = active {
+                    // Blame or history opened from the pull request view goes in front of it.
+                    if let Some(pv) = self.tabs.get_mut(&p).and_then(|rv| rv.pr_view.as_mut()) {
+                        pv.shown = false;
+                    }
                     self.file_action(&p, op);
                 }
             }
             Action::CloseFile => {
                 if let Some(rv) = active.and_then(|p| self.tabs.get_mut(&p)) {
                     rv.file_view = None;
+                    if let Some(pv) = rv.pr_view.as_mut() {
+                        pv.shown = true;
+                    }
                 }
             }
             Action::ShowCommit(hash) => {
@@ -3364,6 +3643,9 @@ impl eframe::App for HeadwayApp {
         }
         if focused && !self.forge_repos.is_empty() {
             ctx.request_repaint_after(std::time::Duration::from_secs(30));
+        }
+        if focused {
+            self.pr_view_auto_refresh(now);
         }
 
         let mut actions = Vec::new();

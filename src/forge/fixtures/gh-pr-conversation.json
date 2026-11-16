@@ -1,0 +1,12 @@
+{"data":{"repository":{"pullRequest":{
+"comments":{"nodes":[
+{"author":{"login":"user-1"},"body":"Ready for a look. The **receipts** test covers it.","createdAt":"2026-11-10T09:40:00Z","url":"https://github.com/acme/shop/pull/13#issuecomment-1"},
+{"author":null,"body":"Thanks!","createdAt":"2026-11-10T12:00:00Z","url":"https://github.com/acme/shop/pull/13#issuecomment-2"}
+]},
+"reviews":{"nodes":[
+{"author":{"login":"user-2"},"state":"CHANGES_REQUESTED","body":"Close, but discounts still round early.","submittedAt":"2026-11-10T10:15:00Z","url":"https://github.com/acme/shop/pull/13#pullrequestreview-1",
+ "comments":{"nodes":[{"author":{"login":"user-2"},"body":"This rounds before the discount:\n\n```python\nprice.quantize(CENT)\n```","createdAt":"2026-11-10T10:14:00Z","path":"shop/cart.py","line":42,"originalLine":40,"url":"https://github.com/acme/shop/pull/13#discussion_r1"}]}},
+{"author":{"login":"user-3"},"state":"COMMENTED","body":"","submittedAt":"2026-11-10T11:00:00Z","url":"https://github.com/acme/shop/pull/13#pullrequestreview-2",
+ "comments":{"nodes":[{"author":{"login":"user-3"},"body":"Nit: name this `cents`.","createdAt":"2026-11-10T11:00:00Z","path":"shop/tax.py","line":null,"originalLine":7,"url":"https://github.com/acme/shop/pull/13#discussion_r2"}]}},
+{"author":{"login":"octo-user"},"state":"PENDING","body":"draft thoughts","submittedAt":null,"url":null,"comments":{"nodes":[]}}
+]}}}}}

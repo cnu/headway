@@ -9,6 +9,7 @@ pub use imp::*;
 mod imp {
     use crate::workspace::Workspace;
     use std::path::{Path, PathBuf};
+    use std::collections::HashMap;
     use std::process::Command;
 
     fn samples_dir() -> PathBuf {
@@ -303,8 +304,92 @@ mod imp {
         data.hosts.insert("github.com".into(), FakeHost { kind: ForgeKind::GitHub, user: Some("alex-rivera".into()), installed: true });
         let users = ["alex-rivera", "jo-lindqvist", "sam-okafor"].map(String::from).to_vec();
         let labels = ["bug", "checkout", "design", "documentation", "enhancement"].map(String::from).to_vec();
-        data.repos.insert("github.com/headway-samples/web-shop".into(), FakeRepo { info: Some(info), pulls, users, labels });
+        let details = web_shop_details(now);
+        data.repos.insert("github.com/headway-samples/web-shop".into(), FakeRepo { info: Some(info), pulls, users, labels, details, ..Default::default() });
         data
+    }
+
+    /// What the web-shop's pull request views show: #13 has a failing Actions
+    /// job (with a log) and changes requested, #14 has checks still running.
+    fn web_shop_details(now: i64) -> HashMap<u64, crate::forge::fake::FakeDetails> {
+        use crate::forge::fake::FakeDetails;
+        use crate::forge::*;
+        let ago = |mins: i64| now - mins * 60;
+        let job = |name: &str, state: CheckState, run: u64, job: u64, started: i64, took: Option<i64>| Check {
+            name: name.into(),
+            state,
+            url: Some(format!("https://github.com/headway-samples/web-shop/actions/runs/{run}/job/{job}")),
+            started: Some(ago(started)),
+            finished: took.map(|t| ago(started) + t),
+            kind: CheckKind::Actions { run, job: Some(job) },
+        };
+        let neutral = Check {
+            name: "codecov/patch".into(),
+            state: CheckState::None,
+            url: Some("https://app.codecov.io/gh/headway-samples/web-shop/pull/13".into()),
+            started: Some(ago(100)),
+            finished: Some(ago(100) + 2),
+            kind: CheckKind::Other,
+        };
+        let comment = |kind: CommentKind, author: &str, mins: i64, body: &str, at: Option<(&str, u32)>| PrComment {
+            kind,
+            author: author.into(),
+            time: ago(mins),
+            body: body.into(),
+            path: at.map(|a| a.0.to_string()),
+            line: at.map(|a| a.1),
+            url: Some("https://github.com/headway-samples/web-shop/pull/13".into()),
+        };
+        let mut log: Vec<String> = vec!["── Set up job ──".into(), "Runner image: ubuntu-24.04".into(), "── Run npm test ──".into(), "> web-shop@1.0.0 test".into(), "> node --test".into()];
+        log.extend((1..=330).map(|i| format!("ok {i} - cart › case {i}")));
+        log.extend([
+            "not ok 331 - cart › total rounds to cents".to_string(),
+            "  ---".into(),
+            "  expected: 10.01".into(),
+            "  actual:   10.000000000000002".into(),
+            "  at: src/cart.test.js:42:5".into(),
+            "  ...".into(),
+            "# tests 331".into(),
+            "# pass 330".into(),
+            "# fail 1".into(),
+            "##[error]Process completed with exit code 1.".into(),
+        ]);
+        let failing = FakeDetails {
+            body: "Totals like `10.000000000000002` showed up at checkout.\n\n## What changed\n\n- Round the cart total to cents once, at the end\n- Keep quantities in the sum\n\n```js\nreturn Math.round(sum * 100) / 100;\n```\n\n> Found by a shopper on the [support forum](https://example.com/forum/42).\n\n- [x] Unit test\n- [ ] Check taxes per line\n".into(),
+            can_rerun: true,
+            checks: vec![
+                job("lint", CheckState::Passing, 4401, 9101, 110, Some(38)),
+                job("build", CheckState::Passing, 4401, 9102, 110, Some(71)),
+                job("test (node 20)", CheckState::Failing, 4401, 9103, 110, Some(125)),
+                neutral,
+            ],
+            conversation: vec![
+                comment(CommentKind::Comment, "alex-rivera", 115, "Ready for a look. The **rounding** test covers the case from the forum.", None),
+                comment(CommentKind::Line, "sam-okafor", 70, "This rounds after summing, but taxes are added per line. Round each line too?", Some(("src/cart.js", 3))),
+                comment(CommentKind::ChangesRequested, "sam-okafor", 69, "Close! Two things:\n\n1. the test still fails on node 20\n2. see my note on `cart.js`", None),
+            ],
+            logs: [("test (node 20)".to_string(), log.join("\n"))].into(),
+        };
+        let running = FakeDetails {
+            body: "Shows the average star rating under each product.\n\n*Work in progress:* the layout isn't final.".into(),
+            can_rerun: true,
+            checks: vec![
+                job("lint", CheckState::Passing, 4410, 9201, 20, Some(35)),
+                job("build", CheckState::Passing, 4410, 9202, 20, Some(64)),
+                job("test (node 20)", CheckState::Pending, 4410, 9203, 18, None),
+                job("e2e", CheckState::Pending, 4411, 9204, 15, None),
+            ],
+            conversation: vec![],
+            logs: HashMap::new(),
+        };
+        let passing = FakeDetails {
+            body: "Adds a search box over the product list.".into(),
+            can_rerun: true,
+            checks: ["lint", "build", "test (node 20)", "e2e"].iter().enumerate().map(|(i, n)| job(n, CheckState::Passing, 4390, 9000 + i as u64, 200, Some(40 + 20 * i as i64))).collect(),
+            conversation: vec![comment(CommentKind::Approved, "jo-lindqvist", 150, "Looks good.", None)],
+            logs: HashMap::new(),
+        };
+        [(13, failing), (14, running), (12, passing)].into()
     }
 
     /// Save the fixtures as `<samples>/fake-forge/forge.json`, for

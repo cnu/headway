@@ -118,6 +118,104 @@ impl Forge for GitHub {
         let data: MetaData = self.graphql(q, &[("owner".into(), url.owner()), ("name".into(), url.name())])?;
         parse_meta(data)
     }
+
+    fn pr_details(&self, repo: &RepoKey, number: u64) -> ForgeResult<PrDetails> {
+        let url = RemoteUrl { host: repo.host.clone(), path: repo.path.clone() };
+        let data: DetailsData = self.graphql(&details_query(number), &[("owner".into(), url.owner()), ("name".into(), url.name())])?;
+        parse_details(data)
+    }
+
+    fn pr_checks(&self, repo: &RepoKey, number: u64) -> ForgeResult<Vec<Check>> {
+        let url = RemoteUrl { host: repo.host.clone(), path: repo.path.clone() };
+        let data: ChecksData = self.graphql(&checks_query(number), &[("owner".into(), url.owner()), ("name".into(), url.name())])?;
+        parse_checks(data)
+    }
+
+    fn conversation(&self, repo: &RepoKey, number: u64) -> ForgeResult<Vec<PrComment>> {
+        let url = RemoteUrl { host: repo.host.clone(), path: repo.path.clone() };
+        let data: ConversationData = self.graphql(&conversation_query(number), &[("owner".into(), url.owner()), ("name".into(), url.name())])?;
+        parse_conversation(data)
+    }
+
+    /// `gh run view <run> --log-failed`, cut to the failed job's lines.
+    fn check_log(&self, repo: &RepoKey, check: &Check) -> ForgeResult<String> {
+        let CheckKind::Actions { run, .. } = check.kind else { return Err(ForgeError::NotFound) };
+        let args = log_args(repo, run);
+        let args: Vec<&str> = args.iter().map(String::as_str).collect();
+        let text = run_text(self.cli.as_ref(), ForgeKind::GitHub, &self.host, self.dir.as_deref(), &args)?;
+        Ok(trim_log(&failed_job_log(&text, &check.name), LOG_LINES).0)
+    }
+
+    /// `gh run rerun <run> --failed` for each workflow run with a failed job.
+    fn rerun_failed_checks(&self, repo: &RepoKey, _number: u64, checks: &[Check]) -> ForgeResult<usize> {
+        let all = rerun_commands(repo, checks);
+        for args in &all {
+            let args: Vec<&str> = args.iter().map(String::as_str).collect();
+            run_write(self.cli.as_ref(), ForgeKind::GitHub, &self.host, self.dir.as_deref(), &args)?;
+        }
+        Ok(all.len())
+    }
+}
+
+/// `-R` for gh's own commands: `HOST/OWNER/REPO` (they don't take `--hostname`).
+fn repo_flag(repo: &RepoKey) -> String {
+    format!("{}/{}", repo.host, repo.path)
+}
+
+/// `gh run view <run> --log-failed` for a workflow run.
+pub fn log_args(repo: &RepoKey, run: u64) -> Vec<String> {
+    ["run", "view", &run.to_string(), "--log-failed", "-R", &repo_flag(repo)].map(String::from).to_vec()
+}
+
+/// One `gh run rerun <run> --failed` per workflow run that has a failed job
+/// (each run once, in order). Other checks can't be run again from here.
+pub fn rerun_commands(repo: &RepoKey, checks: &[Check]) -> Vec<Vec<String>> {
+    let mut runs: Vec<u64> = checks
+        .iter()
+        .filter(|c| c.state == CheckState::Failing)
+        .filter_map(|c| match c.kind {
+            CheckKind::Actions { run, .. } => Some(run),
+            _ => None,
+        })
+        .collect();
+    runs.sort_unstable();
+    runs.dedup();
+    runs.into_iter().map(|run| ["run", "rerun", &run.to_string(), "--failed", "-R", &repo_flag(repo)].map(String::from).to_vec()).collect()
+}
+
+/// What `gh run view --log-failed` printed for one job. Its lines are
+/// `job<TAB>step<TAB>timestamp text`; this keeps `text`, with a heading at each
+/// step. A job name that matches nothing keeps every job's lines.
+pub fn failed_job_log(text: &str, job: &str) -> String {
+    let rows: Vec<(&str, &str, &str)> = text
+        .lines()
+        .filter_map(|l| {
+            let mut f = l.splitn(3, '\t');
+            Some((f.next()?, f.next()?, f.next()?))
+        })
+        .collect();
+    let mine: Vec<&(&str, &str, &str)> = rows.iter().filter(|r| r.0 == job).collect();
+    let picked: Vec<&(&str, &str, &str)> = if mine.is_empty() { rows.iter().collect() } else { mine };
+    if picked.is_empty() {
+        return text.to_string();
+    }
+    let mut out = String::new();
+    let mut step = None;
+    for (j, s, rest) in picked {
+        let heading = if *j == job { s.to_string() } else { format!("{j} › {s}") };
+        if step.as_ref() != Some(&heading) {
+            out += &format!("── {heading} ──\n");
+            step = Some(heading);
+        }
+        // "2026-11-10T09:30:12.1234567Z text": drop the time.
+        let line = match rest.split_once(' ') {
+            Some((t, r)) if parse_time(t).is_some() => r,
+            _ => rest,
+        };
+        out += line;
+        out.push('\n');
+    }
+    out
 }
 
 /// `gh pr create` for `pr`. Every value is written `--flag=value`, so a title
@@ -435,6 +533,234 @@ fn pr_from(n: &PrNode) -> PullRequest {
     }
 }
 
+/// The pull request with its description, and what the viewer may do in the
+/// repository. The number is written into the query (it's a number).
+pub fn details_query(number: u64) -> String {
+    format!("query($owner: String!, $name: String!) {{ repository(owner: $owner, name: $name) {{ viewerPermission pullRequest(number: {number}) {{ ...pr body }} }} }} {PR_FRAGMENT}")
+}
+
+/// Every check on the pull request's latest commit: Actions jobs with their run,
+/// other apps' checks, and commit statuses.
+pub fn checks_query(number: u64) -> String {
+    format!(
+        "query($owner: String!, $name: String!) {{ repository(owner: $owner, name: $name) {{ pullRequest(number: {number}) {{ commits(last: 1) {{ nodes {{ commit {{ statusCheckRollup {{ contexts(first: 100) {{ nodes {{ \
+__typename ... on CheckRun {{ name status conclusion startedAt completedAt detailsUrl databaseId checkSuite {{ workflowRun {{ databaseId }} }} }} \
+... on StatusContext {{ context state targetUrl createdAt }} }} }} }} }} }} }} }} }} }}"
+    )
+}
+
+/// Comments, and reviews with their line comments.
+pub fn conversation_query(number: u64) -> String {
+    format!(
+        "query($owner: String!, $name: String!) {{ repository(owner: $owner, name: $name) {{ pullRequest(number: {number}) {{ \
+comments(first: 100) {{ nodes {{ author {{ login }} body createdAt url }} }} \
+reviews(first: 100) {{ nodes {{ author {{ login }} state body submittedAt url comments(first: 100) {{ nodes {{ author {{ login }} body createdAt path line originalLine url }} }} }} }} }} }} }}"
+    )
+}
+
+#[derive(Deserialize)]
+pub struct DetailsData {
+    repository: Option<DetailsRepo>,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct DetailsRepo {
+    viewer_permission: Option<String>,
+    pull_request: Option<DetailsPr>,
+}
+
+#[derive(Deserialize)]
+struct DetailsPr {
+    #[serde(flatten)]
+    pr: PrNode,
+    #[serde(default)]
+    body: String,
+}
+
+pub fn parse_details(data: DetailsData) -> ForgeResult<PrDetails> {
+    let repo = data.repository.ok_or(ForgeError::NotFound)?;
+    let p = repo.pull_request.ok_or(ForgeError::NotFound)?;
+    let can_rerun = matches!(repo.viewer_permission.as_deref(), Some("ADMIN" | "MAINTAIN" | "WRITE"));
+    Ok(PrDetails { pr: pr_from(&p.pr), body: p.body, can_rerun })
+}
+
+#[derive(Deserialize)]
+pub struct ChecksData {
+    repository: Option<ChecksRepo>,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct ChecksRepo {
+    pull_request: Option<ChecksPr>,
+}
+
+#[derive(Deserialize)]
+struct ChecksPr {
+    commits: Connection<ChecksCommitNode>,
+}
+
+#[derive(Deserialize)]
+struct ChecksCommitNode {
+    commit: ChecksCommit,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct ChecksCommit {
+    status_check_rollup: Option<ChecksRollup>,
+}
+
+#[derive(Deserialize)]
+struct ChecksRollup {
+    contexts: Connection<Context>,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct Context {
+    #[serde(rename = "__typename", default)]
+    typename: String,
+    // CheckRun
+    name: Option<String>,
+    status: Option<String>,
+    conclusion: Option<String>,
+    started_at: Option<String>,
+    completed_at: Option<String>,
+    details_url: Option<String>,
+    database_id: Option<u64>,
+    check_suite: Option<CheckSuite>,
+    // StatusContext
+    context: Option<String>,
+    state: Option<String>,
+    target_url: Option<String>,
+    created_at: Option<String>,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct CheckSuite {
+    workflow_run: Option<WorkflowRun>,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct WorkflowRun {
+    database_id: u64,
+}
+
+pub fn parse_checks(data: ChecksData) -> ForgeResult<Vec<Check>> {
+    let pr = data.repository.and_then(|r| r.pull_request).ok_or(ForgeError::NotFound)?;
+    let Some(rollup) = pr.commits.nodes.into_iter().flatten().last().and_then(|n| n.commit.status_check_rollup) else { return Ok(Vec::new()) };
+    let time = |t: &Option<String>| t.as_deref().and_then(parse_time);
+    Ok(rollup
+        .contexts
+        .nodes
+        .into_iter()
+        .flatten()
+        .map(|c| {
+            if c.typename == "StatusContext" {
+                let state = check_state(c.state.as_deref().unwrap_or(""));
+                return Check { name: c.context.unwrap_or_default(), state, url: c.target_url, started: time(&c.created_at), finished: None, kind: CheckKind::Other };
+            }
+            let state = match (c.status.as_deref(), c.conclusion.as_deref()) {
+                (Some(s), _) if s != "COMPLETED" => CheckState::Pending,
+                (_, Some(done)) => check_state(done),
+                _ => CheckState::None,
+            };
+            let kind = match c.check_suite.and_then(|s| s.workflow_run) {
+                Some(run) => CheckKind::Actions { run: run.database_id, job: c.database_id },
+                None => CheckKind::Other,
+            };
+            Check { name: c.name.unwrap_or_default(), state, url: c.details_url, started: time(&c.started_at), finished: time(&c.completed_at), kind }
+        })
+        .collect())
+}
+
+#[derive(Deserialize)]
+pub struct ConversationData {
+    repository: Option<ConvRepo>,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct ConvRepo {
+    pull_request: Option<ConvPr>,
+}
+
+#[derive(Deserialize)]
+struct ConvPr {
+    comments: Connection<ConvComment>,
+    reviews: Connection<ConvReview>,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct ConvComment {
+    author: Option<Login>,
+    #[serde(default)]
+    body: String,
+    created_at: String,
+    url: Option<String>,
+    path: Option<String>,
+    line: Option<u32>,
+    original_line: Option<u32>,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct ConvReview {
+    author: Option<Login>,
+    state: String,
+    #[serde(default)]
+    body: String,
+    submitted_at: Option<String>,
+    url: Option<String>,
+    comments: Option<Connection<ConvComment>>,
+}
+
+fn login(a: &Option<Login>) -> String {
+    a.as_ref().map_or_else(|| "ghost".to_string(), |a| a.login.clone())
+}
+
+/// Comments and reviews, oldest first. A review that only carries line comments
+/// shows as those comments; unsubmitted (pending) reviews are left out.
+pub fn parse_conversation(data: ConversationData) -> ForgeResult<Vec<PrComment>> {
+    let pr = data.repository.and_then(|r| r.pull_request).ok_or(ForgeError::NotFound)?;
+    let mut out: Vec<PrComment> = pr
+        .comments
+        .nodes
+        .into_iter()
+        .flatten()
+        .map(|c| PrComment { kind: CommentKind::Comment, author: login(&c.author), time: parse_time(&c.created_at).unwrap_or(0), body: c.body, path: None, line: None, url: c.url })
+        .collect();
+    for r in pr.reviews.nodes.into_iter().flatten() {
+        let kind = match r.state.as_str() {
+            "PENDING" => continue,
+            "APPROVED" => CommentKind::Approved,
+            "CHANGES_REQUESTED" => CommentKind::ChangesRequested,
+            _ => CommentKind::Reviewed,
+        };
+        let time = r.submitted_at.as_deref().and_then(parse_time).unwrap_or(0);
+        if kind != CommentKind::Reviewed || !r.body.trim().is_empty() {
+            out.push(PrComment { kind, author: login(&r.author), time, body: r.body, path: None, line: None, url: r.url });
+        }
+        for c in r.comments.into_iter().flat_map(|c| c.nodes).flatten() {
+            out.push(PrComment {
+                kind: CommentKind::Line,
+                author: login(&c.author),
+                time: parse_time(&c.created_at).unwrap_or(time),
+                body: c.body,
+                path: c.path,
+                line: c.line.or(c.original_line),
+                url: c.url,
+            });
+        }
+    }
+    Ok(in_time_order(out))
+}
+
 #[cfg(test)]
 mod tests {
     use super::super::testing::{Answer, StubCli};
@@ -605,5 +931,97 @@ mod tests {
         let blocked = node("OPEN", false, "CHANGES_REQUESTED", "CONFLICTING");
         assert_eq!((blocked.state, blocked.review, blocked.mergeable), (PrState::Open, ReviewDecision::ChangesRequested, Mergeable::Conflicts));
         assert_eq!(node("MERGED", false, "APPROVED", "UNKNOWN").state, PrState::Merged);
+    }
+
+    const DETAILS: &str = include_str!("fixtures/gh-pr-details.json");
+    const CHECKS: &str = include_str!("fixtures/gh-pr-checks.json");
+    const CONVERSATION: &str = include_str!("fixtures/gh-pr-conversation.json");
+    const FAILED_LOG: &str = include_str!("fixtures/gh-run-log-failed.txt");
+
+    fn gql<T: serde::de::DeserializeOwned>(json: &str) -> T {
+        graphql_result(serde_json::from_str::<GraphQl<T>>(json).unwrap()).unwrap()
+    }
+
+    fn shop() -> RepoKey {
+        RepoKey { host: "github.com".into(), path: "acme/shop".into() }
+    }
+
+    #[test]
+    fn a_pull_requests_details_checks_and_conversation_are_read() {
+        let d = parse_details(gql(DETAILS)).unwrap();
+        assert_eq!((d.pr.number, d.pr.review, d.can_rerun), (13, ReviewDecision::ChangesRequested, true));
+        assert!(d.body.starts_with("## Why"));
+
+        let checks = parse_checks(gql(CHECKS)).unwrap();
+        let by = |n: &str| checks.iter().find(|c| c.name == n).unwrap();
+        assert_eq!(checks.len(), 6);
+        assert_eq!((by("test (3.12)").state, &by("test (3.12)").kind), (CheckState::Failing, &CheckKind::Actions { run: 9001, job: Some(7002) }));
+        assert_eq!(by("test (3.12)").duration(0), Some(125));
+        assert_eq!((by("e2e").state, by("e2e").finished), (CheckState::Pending, None));
+        assert_eq!((by("codecov/patch").state, &by("codecov/patch").kind), (CheckState::None, &CheckKind::Other));
+        assert_eq!((by("ci/jenkins").state, by("ci/jenkins").url.as_deref()), (CheckState::Passing, Some("https://jenkins.acme.dev/job/shop/88")));
+        let groups: Vec<CheckState> = group_checks(&checks).iter().map(|g| g.0).collect();
+        assert_eq!(groups, [CheckState::Failing, CheckState::Pending, CheckState::Passing, CheckState::None]);
+
+        let conv = parse_conversation(gql(CONVERSATION)).unwrap();
+        let shape: Vec<(CommentKind, &str, Option<&str>, Option<u32>)> = conv.iter().map(|c| (c.kind, c.author.as_str(), c.path.as_deref(), c.line)).collect();
+        assert_eq!(
+            shape,
+            [
+                (CommentKind::Comment, "user-1", None, None),
+                (CommentKind::Line, "user-2", Some("shop/cart.py"), Some(42)),
+                (CommentKind::ChangesRequested, "user-2", None, None),
+                (CommentKind::Line, "user-3", Some("shop/tax.py"), Some(7)),
+                (CommentKind::Comment, "ghost", None, None),
+            ],
+            "oldest first; the empty review shows as its line comment; the pending one is left out"
+        );
+    }
+
+    #[test]
+    fn the_failed_log_is_the_failed_jobs_end() {
+        let log = failed_job_log(FAILED_LOG, "test (3.12)");
+        assert!(log.starts_with("── Set up job ──\nsetup 0\n"), "a heading per step, times dropped: {}", &log[..60]);
+        assert!(!log.contains("another job"));
+        let (end, cut) = trim_log(&log, LOG_LINES);
+        let lines: Vec<&str> = end.lines().collect();
+        assert_eq!(lines.len(), 300);
+        assert!(cut > 0);
+        assert_eq!(lines[298], "1 failed, 41 passed in 3.2s", "colours are gone");
+        assert_eq!(lines[299], "##[error]Process completed with exit code 1.");
+        // A job that isn't there: every job's lines, named.
+        assert!(failed_job_log(FAILED_LOG, "nope").starts_with("── build › Compile ──\nerror from another job\n"));
+        assert_eq!(failed_job_log("plain text\n", "x"), "plain text\n");
+
+        let cli = Arc::new(StubCli::default().on(Tool::Gh, &["run", "view", "9001", "--log-failed"], Answer::Ok(FAILED_LOG)));
+        let gh = GitHub { cli: cli.clone(), host: "github.com".into(), dir: None };
+        let checks = parse_checks(gql(CHECKS)).unwrap();
+        let failed = checks.iter().find(|c| c.state == CheckState::Failing).unwrap();
+        assert!(gh.check_log(&shop(), failed).unwrap().ends_with("exit code 1."));
+        assert_eq!(cli.calls()[0].1, ["run", "view", "9001", "--log-failed", "-R", "github.com/acme/shop"]);
+        let status = checks.iter().find(|c| c.name == "ci/jenkins").unwrap();
+        assert_eq!(gh.check_log(&shop(), status), Err(ForgeError::NotFound));
+    }
+
+    #[test]
+    fn rerun_runs_each_failed_workflow_run_once() {
+        let failed = |name: &str, run: u64| Check { name: name.into(), state: CheckState::Failing, url: None, started: None, finished: None, kind: CheckKind::Actions { run, job: None } };
+        let checks = vec![
+            failed("test (3.12)", 9001),
+            failed("test (3.11)", 9001),
+            failed("deploy", 8000),
+            Check { kind: CheckKind::Actions { run: 7000, job: None }, state: CheckState::Passing, ..failed("ok", 0) },
+            Check { kind: CheckKind::Other, ..failed("ci/jenkins", 0) },
+        ];
+        let key = RepoKey { host: "github.acme.com".into(), path: "team/app".into() };
+        let cmds = rerun_commands(&key, &checks);
+        assert_eq!(cmds, [["run", "rerun", "8000", "--failed", "-R", "github.acme.com/team/app"], ["run", "rerun", "9001", "--failed", "-R", "github.acme.com/team/app"]]);
+
+        let cli = Arc::new(StubCli::default().on(Tool::Gh, &["run", "rerun"], Answer::Ok("")));
+        let gh = GitHub { cli: cli.clone(), host: "github.acme.com".into(), dir: None };
+        assert_eq!(gh.rerun_failed_checks(&key, 13, &checks), Ok(2));
+        assert_eq!(cli.calls().len(), 2);
+        let denied = GitHub { cli: Arc::new(StubCli::default().on(Tool::Gh, &["run", "rerun"], Answer::Fail(1, "HTTP 403: Must have admin rights to Repository."))), host: "github.com".into(), dir: None };
+        assert!(matches!(denied.rerun_failed_checks(&key, 13, &checks), Err(ForgeError::Other(m)) if m.contains("403")));
     }
 }

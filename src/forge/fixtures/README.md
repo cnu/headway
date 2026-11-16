@@ -17,3 +17,15 @@ Answers from `gh` and `glab`, read by the parsing tests. Tests never call the ne
   Replace them with recordings when it is.
 - `glab-mr-lists.json`: the sidebar's lists query, put together from the open
   merge requests in `glab-mrs-for-branches.json` plus one by `tanuki-user`.
+- `gh-pr-details.json`, `gh-pr-checks.json`, `gh-pr-conversation.json`: a pull
+  request's view (`details_query`, `checks_query`, `conversation_query` in
+  `github.rs`), written by hand in the shape of GitHub's GraphQL schema: a
+  failing Actions job, one still running, a neutral app check and a commit
+  status; a review asking for changes with a line comment, a comments-only
+  review and an unsubmitted one. The description exercises the markdown view.
+- `gh-run-log-failed.txt`: what `gh run view <run> --log-failed` prints
+  (`job<TAB>step<TAB>time text`), 340 lines of one job plus a line of another.
+- `glab-mr-details.json`, `glab-mr-checks.json`, `glab-mr-conversation.json`:
+  the same for a merge request, by hand from GitLab's GraphQL documentation:
+  jobs allowed to fail, a manual one, a running one; notes on the diff and
+  GitLab's own notes.

@@ -1,0 +1,7 @@
+{"data":{"project":{"mergeRequest":{"headPipeline":{"id":"gid://gitlab/Ci::Pipeline/5501","jobs":{"nodes":[
+{"id":"gid://gitlab/Ci::Build/8801","name":"lint","status":"SUCCESS","allowFailure":false,"webPath":"/acme/shop/-/jobs/8801","startedAt":"2026-11-10T09:31:00Z","finishedAt":"2026-11-10T09:31:30Z"},
+{"id":"gid://gitlab/Ci::Build/8802","name":"test","status":"FAILED","allowFailure":false,"webPath":"/acme/shop/-/jobs/8802","startedAt":"2026-11-10T09:31:00Z","finishedAt":"2026-11-10T09:34:00Z"},
+{"id":"gid://gitlab/Ci::Build/8803","name":"flaky-e2e","status":"FAILED","allowFailure":true,"webPath":"/acme/shop/-/jobs/8803","startedAt":"2026-11-10T09:31:00Z","finishedAt":"2026-11-10T09:32:00Z"},
+{"id":"gid://gitlab/Ci::Build/8804","name":"deploy-review","status":"MANUAL","allowFailure":true,"webPath":"/acme/shop/-/jobs/8804","startedAt":null,"finishedAt":null},
+{"id":"gid://gitlab/Ci::Build/8805","name":"package","status":"RUNNING","allowFailure":false,"webPath":"/acme/shop/-/jobs/8805","startedAt":"2026-11-10T09:34:10Z","finishedAt":null}
+]}}}}}}

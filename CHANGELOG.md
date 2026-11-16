@@ -25,7 +25,7 @@ workflow uses that version's section as the GitHub release notes.
   sidebar and the history; the toolbar says it in words ("#13 · checks failing
   · changes requested"), and the overview card shows the current branch's,
   filled red when a check fails. Hover for the title, author, reviews, check
-  counts and how fresh it is; click to open it on GitHub or GitLab. Branches
+  counts and how fresh it is; click to open it. Branches
   are matched by their upstream, forks included.
 - **Merged branches**: a branch whose pull request was merged says so, and its
   menu offers "Delete branch (merged in #123)", undoable as always. The
@@ -53,6 +53,20 @@ workflow uses that version's section as the GitHub release notes.
   naming the files (git 2.38 or later). For a fork, it goes from your copy into
   upstream. The new pull request's badge shows straight away, and the
   notification opens it in the browser.
+- **Pull requests in the window** ("merge requests" on GitLab): clicking a
+  badge or a row in the sidebar opens the pull request over the history (Esc
+  closes it; "Open on GitHub" is still a button). Its header has the title,
+  state, author, `base ← head`, draft and review state, and Check out. The
+  description and the conversation (comments, reviews, and line comments with
+  their file and line) are shown as formatted markdown; the commits each open
+  their diff; the files changed are the whole base-to-head diff in the usual
+  diff view, side by side and coloured, with the head fetched first if it
+  isn't here. Checks are grouped failing first, with how long each took and a
+  link; a failed GitHub Actions job or GitLab job shows the last 300 lines of
+  its log. "Re-run failed" starts the failed Actions runs (or retries the
+  GitLab pipeline) again, and says why when it can't. Each part loads on its
+  own, so a slow log never holds up the description, and the checks are read
+  again every 30 seconds while any is running.
 - `headway --version` (or `-V`) prints the version, and `--help` lists every
   option with what it does.
 

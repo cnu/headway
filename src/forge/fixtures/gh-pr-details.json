@@ -1,0 +1,8 @@
+{"data":{"repository":{"viewerPermission":"WRITE","pullRequest":{
+"number":13,"title":"Round cart totals to cents","state":"OPEN","isDraft":false,"url":"https://github.com/acme/shop/pull/13","updatedAt":"2026-11-10T09:30:12Z",
+"headRefName":"fix/tax-rounding","headRefOid":"4b7c1e0f2a9d3c5b6e8f7a1d2c3b4a5e6f7d8c9b","baseRefName":"main","isCrossRepository":false,
+"author":{"login":"user-1"},"headRepository":{"nameWithOwner":"acme/shop"},"reviewDecision":"CHANGES_REQUESTED","mergeable":"MERGEABLE","mergeStateStatus":"BLOCKED",
+"reviewRequests":{"nodes":[{"requestedReviewer":{"login":"user-2"}}]},
+"commits":{"nodes":[{"commit":{"statusCheckRollup":{"state":"FAILURE","contexts":{"checkRunCountsByState":[{"state":"SUCCESS","count":2},{"state":"FAILURE","count":1},{"state":"IN_PROGRESS","count":1}],"statusContextCountsByState":[{"state":"SUCCESS","count":1}]}}}}]},
+"body":"## Why\r\n\r\nCart totals were off by a cent when **tax** was applied per line. See [the issue](https://github.com/acme/shop/issues/11).\r\n\r\n## What changed\r\n\r\n- Round once, at the end\r\n- Keep `Decimal` all the way through\r\n  - including discounts\r\n1. first\r\n2. second\r\n\r\n```python\r\ntotal = sum(lines).quantize(CENT)\r\n```\r\n\r\n> Tested with the receipts from #11.\r\n\r\n---\r\n\r\n- [x] tests\r\n- [ ] docs\r\n"
+}}}}

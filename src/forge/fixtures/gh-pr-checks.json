@@ -1,0 +1,8 @@
+{"data":{"repository":{"pullRequest":{"commits":{"nodes":[{"commit":{"statusCheckRollup":{"contexts":{"nodes":[
+{"__typename":"CheckRun","name":"lint","status":"COMPLETED","conclusion":"SUCCESS","startedAt":"2026-11-10T09:31:00Z","completedAt":"2026-11-10T09:31:42Z","detailsUrl":"https://github.com/acme/shop/actions/runs/9001/job/7001","databaseId":7001,"checkSuite":{"workflowRun":{"databaseId":9001}}},
+{"__typename":"CheckRun","name":"test (3.12)","status":"COMPLETED","conclusion":"FAILURE","startedAt":"2026-11-10T09:31:00Z","completedAt":"2026-11-10T09:33:05Z","detailsUrl":"https://github.com/acme/shop/actions/runs/9001/job/7002","databaseId":7002,"checkSuite":{"workflowRun":{"databaseId":9001}}},
+{"__typename":"CheckRun","name":"test (3.11)","status":"COMPLETED","conclusion":"SUCCESS","startedAt":"2026-11-10T09:31:00Z","completedAt":"2026-11-10T09:32:50Z","detailsUrl":"https://github.com/acme/shop/actions/runs/9001/job/7003","databaseId":7003,"checkSuite":{"workflowRun":{"databaseId":9001}}},
+{"__typename":"CheckRun","name":"e2e","status":"IN_PROGRESS","conclusion":null,"startedAt":"2026-11-10T09:31:10Z","completedAt":null,"detailsUrl":"https://github.com/acme/shop/actions/runs/9002/job/7010","databaseId":7010,"checkSuite":{"workflowRun":{"databaseId":9002}}},
+{"__typename":"CheckRun","name":"codecov/patch","status":"COMPLETED","conclusion":"NEUTRAL","startedAt":"2026-11-10T09:34:00Z","completedAt":"2026-11-10T09:34:01Z","detailsUrl":"https://app.codecov.io/gh/acme/shop/pull/13","databaseId":7020,"checkSuite":{"workflowRun":null}},
+{"__typename":"StatusContext","context":"ci/jenkins","state":"SUCCESS","targetUrl":"https://jenkins.acme.dev/job/shop/88","createdAt":"2026-11-10T09:35:00Z"}
+]}}}}]}}}}}

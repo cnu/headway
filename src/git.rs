@@ -1016,6 +1016,58 @@ pub fn fetch_pr_for_history(repo: &Path, src: &PrSource) -> GitResult<String> {
     Ok(run(repo, &["rev-parse", "--verify", &format!("{dst}^{{commit}}")])?.trim().to_string())
 }
 
+/// A pull request's head commit, fetching only when it isn't here: the commit
+/// the forge named (`known`) if this repository has it; else, when the forge
+/// didn't name one and the head repository is a remote here, the branch there
+/// as last fetched; else fetched from the forge (see [`fetch_pr_for_history`]). Returns the commit and,
+/// when it's an older copy, a note saying so.
+pub fn resolve_pr_head(repo: &Path, src: &PrSource, known: Option<&str>) -> GitResult<(String, Option<String>)> {
+    let have = |rev: &str| run(repo, &["rev-parse", "--verify", "-q", &format!("{rev}^{{commit}}")]).ok().map(|o| o.trim().to_string());
+    if let Some(oid) = known.and_then(have) {
+        return Ok((oid, None));
+    }
+    if let (None, Some(remote)) = (known, src.head_remote.as_deref()) {
+        let tracking = format!("refs/remotes/{remote}/{}", src.head_branch);
+        if let Some(oid) = have(&tracking) {
+            return Ok((oid, Some(format!("Showing {remote}/{} as last fetched", src.head_branch))));
+        }
+    }
+    Ok((fetch_pr_for_history(repo, src)?, None))
+}
+
+/// The commits a pull request adds, oldest first (as they were made), at most `limit`.
+pub fn pr_commit_list(repo: &Path, head: &str, base: &str, limit: usize) -> GitResult<Vec<Commit>> {
+    let n = format!("-n{limit}");
+    let out = run(repo, &["log", &n, "--reverse", "--format=%H%x1f%P%x1f%an%x1f%ae%x1f%at%x1f%s", head, "--not", base, "--"])?;
+    Ok(out
+        .lines()
+        .filter_map(|l| {
+            let f: Vec<&str> = l.split('\x1f').collect();
+            (f.len() == 6).then(|| Commit {
+                hash: f[0].into(),
+                parents: f[1].split(' ').filter(|s| !s.is_empty()).map(String::from).collect(),
+                author: f[2].into(),
+                email: f[3].into(),
+                time: f[4].parse().unwrap_or(0),
+                summary: f[5].into(),
+                refs: vec![],
+            })
+        })
+        .collect())
+}
+
+/// Everything a pull request changes: from where it left `base` to `head`
+/// (`base...head`, as forges show it).
+pub fn pr_diff(repo: &Path, base: &str, head: &str, ignore_whitespace: bool) -> GitResult<Vec<DiffFile>> {
+    let range = format!("{base}...{head}");
+    let mut args = vec!["diff", "--no-ext-diff", "--no-color", "--full-index", "-M"];
+    args.extend(ws_args(ignore_whitespace));
+    args.extend([range.as_str(), "--"]);
+    let mut files = parse_patch(&run(repo, &args)?);
+    note_whitespace_only(&mut files, ignore_whitespace);
+    Ok(files)
+}
+
 /// The commits a pull request adds: on `head` but not on `base` (newest first, at most `limit`).
 pub fn pr_commits(repo: &Path, head: &str, base: &str, limit: usize) -> GitResult<Vec<String>> {
     let n = format!("-n{limit}");
@@ -6154,6 +6206,48 @@ index 4444444..0000000
         assert_eq!(fetch_pr_for_history(&dir, &pr_src(12, "refs/pull/12/head", "fix-x", None)).unwrap(), oid);
         assert_eq!(run(&dir, &["rev-parse", "origin/pr/12"]).unwrap().trim(), oid);
         assert_eq!(pr_commits(&dir, &oid, "origin/main", 50).unwrap(), std::slice::from_ref(&oid));
+        let _ = std::fs::remove_dir_all(&dir);
+        let _ = std::fs::remove_dir_all(&server);
+    }
+
+    #[test]
+    fn a_pull_requests_head_commits_and_changes_are_read_without_needless_fetches() {
+        let (server, dir, oid) = pr_server("pr-view");
+        let src = pr_src(12, "refs/pull/12/head", "fix-x", Some("origin"));
+        // Named by the forge and here already: used as is.
+        assert_eq!(resolve_pr_head(&dir, &src, Some(&oid)).unwrap(), (oid.clone(), None));
+        // Not named: the branch as last fetched, said so.
+        let (got, note) = resolve_pr_head(&dir, &src, None).unwrap();
+        assert_eq!((got.as_str(), note.as_deref()), (oid.as_str(), Some("Showing origin/fix-x as last fetched")));
+
+        // The pull request moves on, and main too: named but missing here, so fetched.
+        run(&server, &["checkout", "-q", "fix-x"]).unwrap();
+        commit_file(&server, "c.txt", "second\n");
+        let newer = head(&server);
+        run(&server, &["update-ref", "refs/pull/12/head", &newer]).unwrap();
+        run(&server, &["checkout", "-q", "main"]).unwrap();
+        commit_file(&dir, "main-only.txt", "not in the pull request\n");
+        assert_eq!(resolve_pr_head(&dir, &src, Some(&newer)).unwrap(), (newer.clone(), None));
+        assert_eq!(run(&dir, &["rev-parse", "origin/pr/12"]).unwrap().trim(), newer);
+        // Not named and no branch of that name here: fetched too.
+        let gone = pr_src(12, "refs/pull/12/head", "deleted-branch", Some("origin"));
+        assert_eq!(resolve_pr_head(&dir, &gone, None).unwrap().0, newer);
+        // From a fork with no remote here: origin's branch of the same name isn't it.
+        let fork = pr_src(12, "refs/pull/12/head", "main", None);
+        assert_eq!(resolve_pr_head(&dir, &fork, None).unwrap(), (newer.clone(), None));
+        assert!(resolve_pr_head(&dir, &pr_src(99, "refs/pull/99/head", "nope", None), None).is_err());
+
+        // Its commits, oldest first, and everything it changes since it left main
+        // (main's own new commit isn't part of it).
+        let commits = pr_commit_list(&dir, &newer, "main", 50).unwrap();
+        let subjects: Vec<&str> = commits.iter().map(|c| c.summary.as_str()).collect();
+        assert_eq!(subjects, ["write b.txt", "write c.txt"]);
+        assert_eq!((commits[1].hash.as_str(), commits[1].parents[0].as_str()), (newer.as_str(), oid.as_str()));
+        let files = pr_diff(&dir, "main", &newer, false).unwrap();
+        let paths: Vec<&str> = files.iter().map(|f| f.path.as_str()).collect();
+        assert_eq!(paths, ["b.txt", "c.txt"]);
+        assert!(files[0].new_id.is_some(), "full blob ids, for pictures and colours");
+        assert!(pr_diff(&dir, "no-such-base", &newer, false).is_err());
         let _ = std::fs::remove_dir_all(&dir);
         let _ = std::fs::remove_dir_all(&server);
     }

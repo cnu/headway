@@ -244,8 +244,10 @@ fn card(
                         });
                         pill(ui, &format!("⎇ {branch}"), BLUE);
                         // Its pull request, filled red when a check fails so it stands out.
-                        if let Some(st) = forge.and_then(|f| f.current.as_ref()) {
-                            crate::views::pr_badge(ui, st, true);
+                        if let Some(st) = forge.and_then(|f| f.current.as_ref())
+                            && crate::views::pr_badge(ui, st, true).clicked()
+                        {
+                            actions.push(crate::views::open_pr(path, &st.pr));
                         }
                         if s.linked_worktree {
                             pill(ui, "⧉ worktree", BLUE);
