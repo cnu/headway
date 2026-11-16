@@ -9,6 +9,8 @@ workflow uses that version's section as the GitHub release notes.
 
 ## [Unreleased]
 
+## [0.3.0] - 2026-11-16
+
 ### Added
 
 - **Review inbox and alerts**: the workspace overview has an Inbox tab next to
@@ -33,8 +35,7 @@ workflow uses that version's section as the GitHub release notes.
   them through the `gh` and `glab` you're already signed in to, so it never
   asks for or stores a token. Each repository's ⋯ menu says who you're signed
   in as, or exactly what to install or run to connect. Pull request status
-  stays up to date in the background and is the groundwork for the pull
-  request features coming in 0.3.0. Every `gh` and `glab` call is in the
+  stays up to date in the background. Every `gh` and `glab` call is in the
   command log, with tokens taken out. Without either CLI, nothing changes.
 - **Pull request and check status**: branches with a pull request on GitHub or
   GitLab carry its number and state (open, draft, merged or closed, each with
@@ -235,6 +236,7 @@ First release.
   a Homebrew cask (`brew install --cask cnu/tap/headway`) and an AUR package
   (`headway-bin`).
 
-[Unreleased]: https://github.com/cnu/headway/compare/v0.2.0...HEAD
+[Unreleased]: https://github.com/cnu/headway/compare/v0.3.0...HEAD
+[0.3.0]: https://github.com/cnu/headway/compare/v0.2.0...v0.3.0
 [0.2.0]: https://github.com/cnu/headway/compare/v0.1.0...v0.2.0
 [0.1.0]: https://github.com/cnu/headway/releases/tag/v0.1.0
