@@ -310,7 +310,8 @@ mod imp {
     }
 
     /// What the web-shop's pull request views show: #13 has a failing Actions
-    /// job (with a log) and changes requested, #14 has checks still running.
+    /// job (with a log) and changes requested, #14 (someone else's draft) has
+    /// checks still running, #12 is approved and ready to merge.
     fn web_shop_details(now: i64) -> HashMap<u64, crate::forge::fake::FakeDetails> {
         use crate::forge::fake::FakeDetails;
         use crate::forge::*;
@@ -339,6 +340,15 @@ mod imp {
             path: at.map(|a| a.0.to_string()),
             line: at.map(|a| a.1),
             url: Some("https://github.com/headway-samples/web-shop/pull/13".into()),
+        };
+        // The repository allows every method and auto-merge, and deletes merged branches.
+        let facts = |n: u64, status: &str| MergeFacts {
+            node_id: format!("PR_web_shop_{n}"),
+            status: status.into(),
+            can_merge: true,
+            auto_merge_allowed: true,
+            delete_branch: true,
+            ..Default::default()
         };
         let mut log: Vec<String> = vec!["── Set up job ──".into(), "Runner image: ubuntu-24.04".into(), "── Run npm test ──".into(), "> web-shop@1.0.0 test".into(), "> node --test".into()];
         log.extend((1..=330).map(|i| format!("ok {i} - cart › case {i}")));
@@ -369,6 +379,7 @@ mod imp {
                 comment(CommentKind::ChangesRequested, "sam-okafor", 69, "Close! Two things:\n\n1. the test still fails on node 20\n2. see my note on `cart.js`", None),
             ],
             logs: [("test (node 20)".to_string(), log.join("\n"))].into(),
+            merge: facts(13, "BLOCKED"),
         };
         let running = FakeDetails {
             body: "Shows the average star rating under each product.\n\n*Work in progress:* the layout isn't final.".into(),
@@ -381,6 +392,7 @@ mod imp {
             ],
             conversation: vec![],
             logs: HashMap::new(),
+            merge: facts(14, "DRAFT"),
         };
         let passing = FakeDetails {
             body: "Adds a search box over the product list.".into(),
@@ -388,8 +400,10 @@ mod imp {
             checks: ["lint", "build", "test (node 20)", "e2e"].iter().enumerate().map(|(i, n)| job(n, CheckState::Passing, 4390, 9000 + i as u64, 200, Some(40 + 20 * i as i64))).collect(),
             conversation: vec![comment(CommentKind::Approved, "jo-lindqvist", 150, "Looks good.", None)],
             logs: HashMap::new(),
+            merge: facts(12, "CLEAN"),
         };
-        [(13, failing), (14, running), (12, passing)].into()
+        let fork = FakeDetails { body: "A dark look for the storefront, following the system setting.".into(), merge: facts(15, "BLOCKED"), ..Default::default() };
+        [(13, failing), (14, running), (12, passing), (15, fork)].into()
     }
 
     /// Save the fixtures as `<samples>/fake-forge/forge.json`, for

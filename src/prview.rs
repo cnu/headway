@@ -5,8 +5,8 @@
 //! The app fills it section by section from workers (see `app.rs`), so a slow
 //! log or a big diff never holds up the description.
 
-use crate::app::{Action, DiffDoc, PrAction, RepoView};
-use crate::forge::{self, Check, CheckState, CommentKind, ForgeKind, PrComment, PrState, PullRequest, ReviewDecision};
+use crate::app::{Action, DiffDoc, LineSel, PrAction, RepoView};
+use crate::forge::{self, Blocker, Check, CheckState, CommentKind, ForgeKind, LineComment, MergeFacts, PrComment, PrState, PullRequest, ReviewDecision, Side, StateChange, Verdict};
 use crate::git;
 use crate::markdown;
 use crate::theme::{self, *};
@@ -57,6 +57,41 @@ pub struct PrView {
     /// Failed checks' logs shown, by check name (`None` while loading).
     pub logs: HashMap<String, Load<String>>,
     pub rerunning: bool,
+    /// What merging and reviewing need (with the details).
+    pub facts: Option<MergeFacts>,
+    /// The comment being written, and (GitHub) the line comments for the
+    /// review. The app keeps it while the view is closed.
+    pub draft: ReviewDraft,
+    /// The comment's preview, for the text it was made from.
+    pub preview: Option<(String, markdown::Doc)>,
+    /// Lines picked in Files changed, and the comment being written on them.
+    pub files_sel: LineSel,
+    pub line_draft: Option<LineDraft>,
+    /// A comment, review or state change is on its way.
+    pub posting: bool,
+}
+
+/// What's been written but not posted yet.
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct ReviewDraft {
+    pub text: String,
+    /// Showing the preview instead of the text box.
+    pub preview: bool,
+    /// GitHub: line comments waiting to go out with the review.
+    pub pending: Vec<LineComment>,
+}
+
+impl ReviewDraft {
+    pub fn is_empty(&self) -> bool {
+        self.text.trim().is_empty() && self.pending.is_empty()
+    }
+}
+
+/// A comment being written on picked lines (`at` has no body yet).
+#[derive(Clone, Debug, PartialEq)]
+pub struct LineDraft {
+    pub at: LineComment,
+    pub text: String,
 }
 
 impl PrView {
@@ -81,6 +116,37 @@ impl PrView {
             commit_scroll: None,
             logs: HashMap::new(),
             rerunning: false,
+            facts: None,
+            draft: ReviewDraft::default(),
+            preview: None,
+            files_sel: LineSel::default(),
+            line_draft: None,
+            posting: false,
+        }
+    }
+
+    /// What keeps it from being merged now (nothing known until the details come).
+    pub fn blockers(&self) -> Vec<Blocker> {
+        let checks = match &self.checks {
+            Some(Ok(c)) => Some(c.as_slice()),
+            _ => None,
+        };
+        self.facts.as_ref().map(|m| forge::blockers(self.kind, &self.pr, m, checks)).unwrap_or_default()
+    }
+
+    /// Why the comment box can't post with `verdict` now, or `None` when it can.
+    pub fn post_blocked(&self, verdict: Verdict) -> Option<String> {
+        if self.posting {
+            return Some("Posting…".into());
+        }
+        let text = self.draft.text.trim().is_empty();
+        match verdict {
+            Verdict::Comment if text && self.draft.pending.is_empty() => Some("Write something first".into()),
+            Verdict::Comment => None,
+            _ if self.facts.is_none() => Some("Still reading the details".into()),
+            _ if !matches!(self.pr.state, PrState::Open | PrState::Draft) => Some(format!("This {} is {}", self.noun(), state_words(self.pr.state).to_lowercase())),
+            Verdict::RequestChanges if text => Some("Say what should change".into()),
+            _ => None,
         }
     }
 
@@ -129,6 +195,13 @@ pub enum PrOp {
     ShowLog(String),
     HideLog(String),
     Rerun,
+    /// Post what's in the comment box (GitHub: with the line comments, as a review).
+    Post(Verdict),
+    /// The comment written on picked lines: into the review (GitHub) or posted (GitLab).
+    AddLineComment,
+    SetState(StateChange),
+    /// Open the merge dialog.
+    Merge,
 }
 
 fn op(o: PrOp) -> Action {
@@ -161,7 +234,13 @@ pub fn show(ui: &mut Ui, rv: &mut RepoView, prefs: &mut DiffPrefs, actions: &mut
     let path = rv.path.clone();
     let Some(pv) = rv.pr_view.as_mut() else { return };
     if keys && ui.input(|i| i.key_pressed(egui::Key::Escape)) {
-        actions.push(op(PrOp::Close));
+        // Esc lets go of picked lines first.
+        if pv.line_draft.is_some() || !pv.files_sel.lines.is_empty() {
+            pv.line_draft = None;
+            pv.files_sel = LineSel::default();
+        } else {
+            actions.push(op(PrOp::Close));
+        }
     }
     egui::Panel::top("pr_view_header")
         .frame(egui::Frame::new().fill(PANEL).inner_margin(Margin { left: 16, right: 12, top: 10, bottom: 6 }).stroke(Stroke::new(1.0, BORDER)))
@@ -171,7 +250,7 @@ pub fn show(ui: &mut Ui, rv: &mut RepoView, prefs: &mut DiffPrefs, actions: &mut
             tabs(ui, pv);
         });
     match pv.tab {
-        Tab::Conversation => conversation(ui, pv),
+        Tab::Conversation => conversation(ui, pv, actions),
         Tab::Commits => commits(ui, pv, prefs, &path, actions),
         Tab::Files => files(ui, pv, prefs, &path, actions),
         Tab::Checks => checks(ui, pv, actions),
@@ -200,6 +279,10 @@ fn header(ui: &mut Ui, pv: &PrView, path: &Path, actions: &mut Vec<Action>) {
                 actions.push(op(PrOp::Refresh));
             }
             let open = matches!(pr.state, PrState::Open | PrState::Draft);
+            state_menu(ui, pv, actions);
+            if open {
+                merge_button(ui, pv, actions);
+            }
             let tip = format!("Fetch {} and switch to a local branch for it", pv.number());
             if ui.add_enabled(open, egui::Button::new("Check out")).on_hover_text(tip).on_disabled_hover_text(format!("This {} is {}", pv.noun(), state_words(pr.state).to_lowercase())).clicked() {
                 actions.push(Action::Pr { repo: path.to_path_buf(), number: pr.number, what: PrAction::Checkout });
@@ -249,6 +332,65 @@ fn header(ui: &mut Ui, pv: &PrView, path: &Path, actions: &mut Vec<Action>) {
         }
         ui.label(RichText::new(format!("· updated {}", theme::relative(pr.updated))).color(FAINT));
     });
+}
+
+/// The ⋯ menu: draft and ready, close and reopen (closing asks first).
+fn state_menu(ui: &mut Ui, pv: &PrView, actions: &mut Vec<Action>) {
+    let noun = pv.noun();
+    let changes: &[StateChange] = match pv.pr.state {
+        PrState::Draft => &[StateChange::Ready, StateChange::Close],
+        PrState::Open => &[StateChange::Draft, StateChange::Close],
+        PrState::Closed => &[StateChange::Reopen],
+        PrState::Merged => &[],
+    };
+    if changes.is_empty() {
+        return;
+    }
+    let r = ui.add_enabled_ui(!pv.posting, |ui| {
+        ui.menu_button("⋯", |ui| {
+            for &c in changes {
+                let label = match c {
+                    StateChange::Close => format!("Close {noun}…"),
+                    StateChange::Reopen => format!("Reopen {noun}"),
+                    other => other.label().to_string(),
+                };
+                if ui.button(label).clicked() {
+                    actions.push(match c {
+                        StateChange::Close => Action::confirm(
+                            &format!("Close {}?", pv.number()),
+                            format!("Close {} “{}” without merging it? It can be reopened later.", pv.number(), pv.pr.title),
+                            "Close",
+                            true,
+                            op(PrOp::SetState(c)),
+                        ),
+                        _ => op(PrOp::SetState(c)),
+                    });
+                    ui.close();
+                }
+            }
+        })
+    });
+    r.inner.response.on_hover_text(format!("Draft, ready, close or reopen this {noun}"));
+}
+
+/// "Merge" (or "Ready for review" for a draft, which is what's in the way).
+fn merge_button(ui: &mut Ui, pv: &PrView, actions: &mut Vec<Action>) {
+    if pv.pr.state == PrState::Draft {
+        let b = ui.add_enabled(!pv.posting, egui::Button::new("Ready for review")).on_hover_text(format!("Take {} out of draft, so it can be reviewed and merged", pv.number()));
+        if b.clicked() {
+            actions.push(op(PrOp::SetState(StateChange::Ready)));
+        }
+        return;
+    }
+    let tip = match pv.blockers().first() {
+        Some(b) => b.text(pv.kind, &pv.pr.base_branch),
+        None if pv.facts.is_none() => "Still reading the details".to_string(),
+        None => format!("Merge {} into {}", pv.number(), pv.pr.base_branch),
+    };
+    let b = ui.add_enabled(pv.facts.is_some(), egui::Button::new(RichText::new("Merge…").strong()).fill(ACCENT_DIM)).on_hover_text(tip);
+    if b.clicked() {
+        actions.push(op(PrOp::Merge));
+    }
 }
 
 fn tabs(ui: &mut Ui, pv: &mut PrView) {
@@ -316,7 +458,11 @@ fn loading(ui: &mut Ui, load: &Load<impl Sized>, what: &str) -> bool {
 // ---------------------------------------------------------------------------
 // Conversation
 
-fn conversation(ui: &mut Ui, pv: &PrView) {
+fn conversation(ui: &mut Ui, pv: &mut PrView, actions: &mut Vec<Action>) {
+    egui::Panel::bottom("pr_comment_box")
+        .frame(egui::Frame::new().fill(PANEL).inner_margin(Margin::symmetric(16, 10)).stroke(Stroke::new(1.0, BORDER)))
+        .show(ui, |ui| comment_box(ui, pv, actions));
+    let pv = &*pv;
     egui::CentralPanel::default().frame(egui::Frame::new().fill(BG).inner_margin(Margin::symmetric(16, 12))).show(ui, |ui| {
         egui::ScrollArea::vertical().auto_shrink(false).id_salt("pr_conversation").show(ui, |ui| {
             ui.set_max_width(ui.available_width().min(900.0));
@@ -353,6 +499,102 @@ fn conversation(ui: &mut Ui, pv: &PrView) {
                 });
             }
         });
+    });
+}
+
+/// Write a comment (with a preview), then post it as a comment or a review.
+/// On GitHub, line comments from Files changed wait here for the review.
+fn comment_box(ui: &mut Ui, pv: &mut PrView, actions: &mut Vec<Action>) {
+    ui.set_max_width(ui.available_width().min(900.0));
+    let mut drop = None;
+    if !pv.draft.pending.is_empty() {
+        let n = pv.draft.pending.len();
+        ui.label(RichText::new(format!("Your review: {n} line comment{}", if n == 1 { "" } else { "s" })).strong().color(TEXT));
+        for (i, c) in pv.draft.pending.iter().enumerate() {
+            ui.horizontal(|ui| {
+                ui.label(RichText::new(c.place()).monospace().small().color(DIM));
+                ui.add(egui::Label::new(RichText::new(c.body.lines().next().unwrap_or("")).color(TEXT)).truncate());
+                ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                    let r = ui.small_button("✕").on_hover_text("Remove this line comment");
+                    name_it(&r, egui::Role::Button, format!("Remove the comment on {}", c.place()));
+                    if r.clicked() {
+                        drop = Some(i);
+                    }
+                });
+            });
+        }
+        ui.add_space(4.0);
+    }
+    if let Some(i) = drop {
+        pv.draft.pending.remove(i);
+    }
+    ui.horizontal(|ui| {
+        for (preview, label) in [(false, "Write"), (true, "Preview")] {
+            let on = pv.draft.preview == preview;
+            let r = ui.selectable_label(on, RichText::new(label).color(if on { TEXT } else { DIM }));
+            r.widget_info(|| egui::WidgetInfo::selected(egui::Role::Tab, true, on, label));
+            if r.clicked() {
+                pv.draft.preview = preview;
+            }
+        }
+        ui.label(RichText::new("Markdown").small().color(FAINT));
+    });
+    if pv.draft.preview {
+        if pv.preview.as_ref().is_none_or(|(t, _)| *t != pv.draft.text) {
+            pv.preview = Some((pv.draft.text.clone(), markdown::parse(&pv.draft.text)));
+        }
+        egui::Frame::new().fill(BG).stroke(Stroke::new(1.0, BORDER)).corner_radius(4.0).inner_margin(Margin::same(8)).show(ui, |ui| {
+            ui.set_width(ui.available_width());
+            ui.set_min_height(70.0);
+            egui::ScrollArea::vertical().id_salt("pr_comment_preview").max_height(160.0).show(ui, |ui| match &pv.preview {
+                Some((_, doc)) if !doc.is_empty() => markdown::show(ui, doc),
+                _ => {
+                    ui.label(RichText::new("Nothing to preview").italics().color(DIM));
+                }
+            });
+        });
+    } else {
+        egui::ScrollArea::vertical().id_salt("pr_comment_text").max_height(160.0).show(ui, |ui| {
+            let r = ui.add(egui::TextEdit::multiline(&mut pv.draft.text).hint_text("Leave a comment").desired_rows(4).desired_width(f32::INFINITY));
+            name_it(&r, egui::Role::MultilineTextInput, "Comment");
+        });
+    }
+    ui.add_space(6.0);
+    let facts = pv.facts.clone().unwrap_or_default();
+    let mut verdicts = vec![Verdict::Comment];
+    if !facts.viewer_is_author {
+        match pv.kind {
+            ForgeKind::GitHub => verdicts.extend([Verdict::Approve, Verdict::RequestChanges]),
+            ForgeKind::GitLab if facts.viewer_approved => verdicts.push(Verdict::Unapprove),
+            ForgeKind::GitLab => verdicts.push(Verdict::Approve),
+        }
+    }
+    ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+        for v in verdicts.into_iter().rev() {
+            let (label, tip) = match v {
+                Verdict::Comment if !pv.draft.pending.is_empty() => ("Submit review", "Post the comment and the line comments as one review"),
+                Verdict::Comment => ("Comment", "Post a comment"),
+                Verdict::Approve => ("Approve", "Approve the changes (with the comment, if any)"),
+                Verdict::RequestChanges => ("Request changes", "Ask for changes before it's merged"),
+                Verdict::Unapprove => ("Revoke approval", "Take back your approval (with the comment, if any)"),
+            };
+            let blocked = pv.post_blocked(v);
+            let text = if v == Verdict::Approve { RichText::new(label).strong() } else { RichText::new(label) };
+            let mut b = egui::Button::new(text);
+            if v == Verdict::Approve {
+                b = b.fill(ACCENT_DIM);
+            }
+            let r = ui.add_enabled(blocked.is_none(), b).on_hover_text(tip);
+            if let Some(why) = &blocked {
+                r.clone().on_disabled_hover_text(why);
+            }
+            if r.clicked() {
+                actions.push(op(PrOp::Post(v)));
+            }
+        }
+        if pv.posting {
+            ui.add(egui::Spinner::new().size(14.0).color(ACCENT));
+        }
     });
 }
 
@@ -435,16 +677,16 @@ fn commits(ui: &mut Ui, pv: &mut PrView, prefs: &mut DiffPrefs, path: &Path, act
             return;
         }
         if let Some(Ok(doc)) = &mut pv.commit_diff {
-            changes(ui, doc, &mut pv.commit_scroll, prefs, path, actions);
+            changes(ui, doc, &mut pv.commit_scroll, None, prefs, path, actions);
         }
     });
 }
 
 /// A diff with the file counts, fold buttons and diff options above it, as
 /// in the commit view.
-fn changes(ui: &mut Ui, doc: &mut DiffDoc, scroll: &mut Option<usize>, prefs: &mut DiffPrefs, path: &Path, actions: &mut Vec<Action>) {
+fn changes(ui: &mut Ui, doc: &mut DiffDoc, scroll: &mut Option<usize>, sel: Option<&mut LineSel>, prefs: &mut DiffPrefs, path: &Path, actions: &mut Vec<Action>) {
     let fold_all = if doc.files.is_empty() { None } else { views::fold_bar(ui, doc, prefs, actions) };
-    let click = views::diff_view(ui, doc, DiffMode::Commit, scroll, None, path, actions);
+    let click = views::diff_view(ui, doc, DiffMode::Commit, scroll, sel, path, actions);
     if let Some(all) = fold_all {
         doc.set_all_collapsed(all);
     }
@@ -462,7 +704,92 @@ fn files(ui: &mut Ui, pv: &mut PrView, prefs: &mut DiffPrefs, path: &Path, actio
             egui::Frame::new().inner_margin(Margin::symmetric(12, 4)).show(ui, |ui| head_note(ui, &pv.head));
         }
         if let Some(Ok(doc)) = &mut pv.files {
-            changes(ui, doc, &mut pv.files_scroll, prefs, path, actions);
+            line_comment_bar(ui, doc, &mut pv.files_sel, &mut pv.line_draft, pv.kind, pv.posting, actions);
+            changes(ui, doc, &mut pv.files_scroll, Some(&mut pv.files_sel), prefs, path, actions);
+        }
+    });
+}
+
+/// What a comment on the picked lines is placed on: the lines of one file,
+/// numbered after the change when any of them is still there (added or
+/// unchanged), else before it (removed lines).
+pub fn line_target(doc: &DiffDoc, sel: &LineSel) -> Option<LineComment> {
+    let fi = sel.lines.iter().find(|k| doc.line(**k).is_some())?.0;
+    let lines: Vec<&git::DiffLine> = sel.lines.iter().filter(|k| k.0 == fi).filter_map(|k| doc.line(*k)).collect();
+    let after: Vec<&&git::DiffLine> = lines.iter().filter(|l| l.new_no.is_some()).collect();
+    let (side, picked): (Side, Vec<&&git::DiffLine>) = if after.is_empty() { (Side::Before, lines.iter().collect()) } else { (Side::After, after) };
+    let num = |l: &git::DiffLine| if side == Side::After { l.new_no } else { l.old_no };
+    let nums: Vec<u32> = picked.iter().filter_map(|l| num(l)).collect();
+    let (start, end) = (*nums.iter().min()?, *nums.iter().max()?);
+    let last = picked.iter().find(|l| num(l) == Some(end))?;
+    let file = &doc.files[fi];
+    Some(LineComment {
+        path: file.path.clone(),
+        old_path: file.old_path.clone(),
+        side,
+        start,
+        end,
+        old_line: last.old_no,
+        new_line: last.new_no,
+        body: String::new(),
+    })
+}
+
+/// Over the changes while lines are picked: "Comment on these lines", then a
+/// box to write it in.
+fn line_comment_bar(ui: &mut Ui, doc: &DiffDoc, sel: &mut LineSel, draft: &mut Option<LineDraft>, kind: ForgeKind, posting: bool, actions: &mut Vec<Action>) {
+    let Some(at) = line_target(doc, sel) else {
+        *draft = None;
+        return;
+    };
+    if draft.as_ref().is_some_and(|d| d.at.place() != at.place() || d.at.side != at.side) {
+        // Other lines were picked: the comment goes with them.
+        if let Some(d) = draft.as_mut() {
+            d.at = at.clone();
+        }
+    }
+    egui::Frame::new().fill(BLUE.gamma_multiply(0.10)).stroke(Stroke::new(1.0, BORDER)).inner_margin(Margin::symmetric(12, 6)).show(ui, |ui| {
+        ui.set_width(ui.available_width());
+        ui.horizontal(|ui| {
+            let n = at.end - at.start + 1;
+            let side = if at.side == Side::Before { " (before the change)" } else { "" };
+            ui.label(RichText::new(format!("{n} line{} picked", if n == 1 { "" } else { "s" })).strong().color(TEXT));
+            ui.label(RichText::new(format!("in {}{side}", at.place())).color(DIM));
+            ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                if ui.button("Clear").on_hover_text("Esc").clicked() {
+                    sel.lines.clear();
+                    *draft = None;
+                }
+                if draft.is_none() && ui.button("Comment on these lines").clicked() {
+                    *draft = Some(LineDraft { at: at.clone(), text: String::new() });
+                }
+            });
+        });
+        let mut cancel = false;
+        let Some(d) = draft.as_mut() else { return };
+        let r = ui.add(egui::TextEdit::multiline(&mut d.text).hint_text(format!("Comment on {}", d.at.place())).desired_rows(3).desired_width(f32::INFINITY));
+        name_it(&r, egui::Role::MultilineTextInput, "Line comment");
+        ui.horizontal(|ui| {
+            ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                let (label, tip) = match kind {
+                    ForgeKind::GitHub => ("Add to review", "Keep it for your review, posted from Conversation with Submit review"),
+                    ForgeKind::GitLab => ("Comment", "Post it now, as a discussion on these lines"),
+                };
+                let empty = d.text.trim().is_empty();
+                let b = ui.add_enabled(!empty && !posting, egui::Button::new(RichText::new(label).strong()).fill(ACCENT_DIM)).on_hover_text(tip);
+                if empty {
+                    b.clone().on_disabled_hover_text("Write something first");
+                }
+                if b.clicked() {
+                    actions.push(op(PrOp::AddLineComment));
+                }
+                if ui.button("Cancel").clicked() {
+                    cancel = true;
+                }
+            });
+        });
+        if cancel {
+            *draft = None;
         }
     });
 }
@@ -595,6 +922,24 @@ fn log_box(ui: &mut Ui, name: &str, log: &Load<String>) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A comment on picked lines goes on the lines after the change when any
+    /// are still there, else on the removed ones; GitLab gets the last line's
+    /// numbers on both sides.
+    #[test]
+    fn picked_lines_say_where_a_comment_goes() {
+        let doc = DiffDoc::new(git::parse_patch("diff --git a/old.rs b/new.rs\nsimilarity index 80%\nrename from old.rs\nrename to new.rs\n--- a/old.rs\n+++ b/new.rs\n@@ -1,4 +1,4 @@\n keep\n-gone\n+added\n same\n-last\n+fresh\n"), true);
+        let pick = |lines: &[usize]| LineSel { lines: lines.iter().map(|&li| (0, 0, li)).collect(), ..Default::default() };
+        // keep(0) gone(1) added(2) same(3) last(4) fresh(5)
+        let c = line_target(&doc, &pick(&[0, 1, 2, 3])).unwrap();
+        assert_eq!((c.side, c.start, c.end, c.old_line, c.new_line), (Side::After, 1, 3, Some(3), Some(3)), "an unchanged last line has both numbers");
+        assert_eq!((c.path.as_str(), c.old_path.as_deref(), c.place()), ("new.rs", Some("old.rs"), "new.rs:1–3".to_string()));
+        let gone = line_target(&doc, &pick(&[1, 4])).unwrap();
+        assert_eq!((gone.side, gone.start, gone.end, gone.old_line, gone.new_line), (Side::Before, 2, 4, Some(4), None));
+        let one = line_target(&doc, &pick(&[5])).unwrap();
+        assert_eq!((one.side, one.place(), one.old_line, one.new_line), (Side::After, "new.rs:4".to_string(), None, Some(4)));
+        assert!(line_target(&doc, &LineSel::default()).is_none());
+    }
 
     #[test]
     fn durations_read_like_a_clock() {

@@ -1056,6 +1056,24 @@ pub fn pr_commit_list(repo: &Path, head: &str, base: &str, limit: usize) -> GitR
         .collect())
 }
 
+/// The full messages of the commits on `head` that aren't on `base`, oldest
+/// first (for a squash commit's message).
+pub fn commit_messages(repo: &Path, head: &str, base: &str) -> GitResult<Vec<String>> {
+    let out = run(repo, &["log", "--reverse", "--format=%B%x00", head, "--not", base, "--"])?;
+    Ok(out.split('\0').map(|m| m.trim().to_string()).filter(|m| !m.is_empty()).collect())
+}
+
+/// After a pull request is merged on the forge: switch to `base` (made from
+/// `remote`'s when there's no local one yet) and bring it up to the remote's.
+pub fn switch_and_pull(repo: &Path, remote: &str, base: &str) -> GitResult<String> {
+    if run(repo, &["rev-parse", "--verify", "--quiet", &format!("refs/heads/{base}")]).is_ok() {
+        run(repo, &["checkout", base])?;
+    } else {
+        run(repo, &["checkout", "--track", &format!("{remote}/{base}")])?;
+    }
+    run(repo, &["pull", "--ff-only", remote, base])
+}
+
 /// Everything a pull request changes: from where it left `base` to `head`
 /// (`base...head`, as forges show it).
 pub fn pr_diff(repo: &Path, base: &str, head: &str, ignore_whitespace: bool) -> GitResult<Vec<DiffFile>> {
@@ -6248,6 +6266,48 @@ index 4444444..0000000
         assert_eq!(paths, ["b.txt", "c.txt"]);
         assert!(files[0].new_id.is_some(), "full blob ids, for pictures and colours");
         assert!(pr_diff(&dir, "no-such-base", &newer, false).is_err());
+        let _ = std::fs::remove_dir_all(&dir);
+        let _ = std::fs::remove_dir_all(&server);
+    }
+
+    /// What the merge dialog and the steps after a merge do in git: read the
+    /// commits' messages for the squash message, then (after the forge squashed
+    /// and deleted the branch) fetch, switch to the base and pull, and delete
+    /// the local branch, which git only lets go of with -D after a squash.
+    #[test]
+    fn after_a_squash_merge_the_base_is_pulled_and_the_branch_can_go() {
+        let (server, dir, _) = pr_server("after-merge");
+        run(&server, &["checkout", "-q", "fix-x"]).unwrap();
+        commit_file_with(&server, "c.txt", "more\n", "Handle the empty cart\n\nIt said nothing before.");
+        run(&server, &["checkout", "-q", "main"]).unwrap();
+        run(&dir, &["fetch", "-q", "origin"]).unwrap();
+        run(&dir, &["checkout", "-q", "-b", "fix-x", "--track", "origin/fix-x"]).unwrap();
+        assert_eq!(commit_messages(&dir, "fix-x", "origin/main").unwrap(), ["write b.txt", "Handle the empty cart\n\nIt said nothing before."]);
+        assert!(commit_messages(&dir, "no-such-commit", "origin/main").is_err());
+
+        // The forge squashes it onto main and deletes the branch.
+        run(&server, &["merge", "-q", "--squash", "fix-x"]).unwrap();
+        run(&server, &["commit", "-q", "-m", "Fix x (#12)"]).unwrap();
+        run(&server, &["branch", "-q", "-D", "fix-x"]).unwrap();
+        let merged = head(&server);
+
+        // As the merge action does: fetch. With no main here yet, it's made from origin's.
+        run(&dir, &["fetch", "-q", "--prune", "origin"]).unwrap();
+        run(&dir, &["branch", "-q", "-D", "main"]).unwrap();
+        switch_and_pull(&dir, "origin", "main").unwrap();
+        let on = |d: &Path| run(d, &["symbolic-ref", "--short", "HEAD"]).unwrap().trim().to_string();
+        assert_eq!((on(&dir), head(&dir)), ("main".to_string(), merged.clone()));
+        assert!(dir.join("c.txt").exists());
+        assert!(run(&dir, &["branch", "-d", "fix-x"]).is_err(), "squashed: git doesn't see it merged");
+        run(&dir, &["branch", "-D", "fix-x"]).unwrap();
+
+        // Again with main here and behind: switched to and pulled.
+        commit_file(&server, "d.txt", "later\n");
+        let later = head(&server);
+        run(&dir, &["fetch", "-q", "origin"]).unwrap();
+        run(&dir, &["checkout", "-q", "-b", "other"]).unwrap();
+        switch_and_pull(&dir, "origin", "main").unwrap();
+        assert_eq!((on(&dir), head(&dir)), ("main".to_string(), later));
         let _ = std::fs::remove_dir_all(&dir);
         let _ = std::fs::remove_dir_all(&server);
     }

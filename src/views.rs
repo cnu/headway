@@ -347,7 +347,14 @@ fn delete_finished_branch(path: &Path, name: &str, st: &PrStatus) -> Action {
     } else {
         ("-d", format!("Delete the branch “{name}”? Its pull request #{n} was closed without merging. git keeps it if its commits aren't merged anywhere."))
     };
-    Action::confirm("Delete branch", body, "Delete", true, Action::args(path, format!("Delete {name}"), &["branch", flag, name]).undoable(git::Undoable::Refs, format!("delete branch {name}")))
+    Action::confirm("Delete branch", body, "Delete", true, delete_branch(path, name, flag == "-D"))
+}
+
+/// Delete a local branch, undoably (`force`: even when git thinks its commits
+/// aren't merged, as after a squash).
+pub fn delete_branch(path: &Path, name: &str, force: bool) -> Action {
+    let flag = if force { "-D" } else { "-d" };
+    Action::args(path, format!("Delete {name}"), &["branch", flag, name]).undoable(git::Undoable::Refs, format!("delete branch {name}"))
 }
 
 /// The ⋯ menus' line about GitHub or GitLab: who's signed in, or how to fix it

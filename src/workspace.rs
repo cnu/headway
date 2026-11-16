@@ -31,6 +31,9 @@ pub struct Config {
     /// Branches hidden from the history, per repository folder (full ref names).
     #[serde(default)]
     pub hidden_refs: std::collections::BTreeMap<PathBuf, Vec<String>>,
+    /// The merge method last used in each repository folder.
+    #[serde(default)]
+    pub merge_methods: std::collections::BTreeMap<PathBuf, crate::forge::MergeMethod>,
     /// Where to save; the usual settings file when empty (tests save elsewhere).
     #[serde(skip)]
     pub file: Option<PathBuf>,
@@ -90,7 +93,7 @@ impl Config {
                 return (cfg, needs);
             }
         }
-        let cfg = Config { workspaces: vec![samples::sample_workspace()], current: 0, view: ViewPrefs::default(), hidden_refs: Default::default(), file: None };
+        let cfg = Config { workspaces: vec![samples::sample_workspace()], current: 0, view: ViewPrefs::default(), hidden_refs: Default::default(), merge_methods: Default::default(), file: None };
         cfg.save();
         let needs = samples::samples_missing(cfg.ws());
         (cfg, needs)
@@ -112,7 +115,7 @@ impl Config {
     /// A workspace setup for tests, saved to `file` instead of the real settings.
     #[cfg(test)]
     pub fn for_test(workspaces: Vec<Workspace>, file: PathBuf) -> Self {
-        Config { workspaces, current: 0, view: ViewPrefs::default(), hidden_refs: Default::default(), file: Some(file) }
+        Config { workspaces, current: 0, view: ViewPrefs::default(), hidden_refs: Default::default(), merge_methods: Default::default(), file: Some(file) }
     }
 
     pub fn ws(&self) -> &Workspace {
@@ -147,7 +150,7 @@ mod tests {
         ws.repos = vec!["/a".into(), "/b".into()];
         ws.open_tabs = vec!["/b".into()];
         ws.active_tab = Some(0);
-        let cfg = Config { workspaces: vec![ws, Workspace::new("Other")], current: 1, view: ViewPrefs { sidebar_open: false, split: 0.3, ..Default::default() }, hidden_refs: [(PathBuf::from("/a"), vec!["refs/heads/x".to_string()])].into(), file: None };
+        let cfg = Config { workspaces: vec![ws, Workspace::new("Other")], current: 1, view: ViewPrefs { sidebar_open: false, split: 0.3, ..Default::default() }, hidden_refs: [(PathBuf::from("/a"), vec!["refs/heads/x".to_string()])].into(), merge_methods: Default::default(), file: None };
         let back: Config = serde_json::from_str(&serde_json::to_string(&cfg).unwrap()).unwrap();
         assert_eq!(back.current, 1);
         assert_eq!(back.ws().name, "Other");

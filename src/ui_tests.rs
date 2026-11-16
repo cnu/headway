@@ -2955,6 +2955,112 @@ fn a_failing_pull_request_opens_in_the_window_shows_its_failed_log_and_reruns() 
     assert!(!shows(&h, "main ← fix/tax-rounding"));
 }
 
+/// The value of the (first) text box with this name.
+fn text_value(h: &Harness<'static, HeadwayApp>, name: &str) -> String {
+    h.get_all_by_label(name)
+        .find(|n| matches!(n.accesskit_node().role(), egui::Role::TextInput | egui::Role::MultilineTextInput))
+        .unwrap_or_else(|| panic!("no text box “{name}”"))
+        .accesskit_node()
+        .value()
+        .unwrap_or_default()
+        .to_string()
+}
+
+/// What the web-shop's fake GitHub was asked to do, in order.
+fn forge_done(forges: &crate::forge::fake::FakeForges) -> Vec<String> {
+    forges.data().repos["github.com/headway-samples/web-shop"].done.clone()
+}
+
+#[test]
+fn a_pull_request_is_approved_and_another_squash_merged_from_its_view() {
+    let s = scratch("pr-review-merge");
+    // On #12's branch, so merging it offers to switch to main.
+    let r = web_shop(&s, "feature/search");
+    serve_web_shop(&s, &r);
+    let forges = std::sync::Arc::new(crate::forge::fake::FakeForges::new(crate::samples::web_shop_forge(crate::forge::now_secs())));
+    let mut h = app_with_forge(&s, &r, true, forges.clone());
+
+    // Someone else's draft: approve it, with a comment. The box empties once it's posted.
+    h.get_all_by_label_contains("◌ #14 draft").next().expect("#14's badge").click();
+    settle(&mut h);
+    assert!(shows(&h, "Show product reviews  #14"));
+    assert!(shows(&h, "Request changes") && shows(&h, "Approve"), "not mine, so I can review it");
+    type_into(&mut h, "Leave a comment", "Works on my phone too.");
+    h.get_by_label("Preview").click();
+    settle(&mut h);
+    assert!(shows(&h, "Works on my phone too."), "the preview");
+    click(&mut h, "Approve");
+    assert!(shows_containing(&h, "Approved #14"));
+    assert_eq!(forge_done(&forges), ["review #14 approve with 0 line comments"]);
+    assert!(shows_containing(&h, "alex-rivera approved · "), "read again, with the approval in it");
+    click(&mut h, "Write");
+    assert_eq!(text_value(&h, "Comment"), "");
+
+    // Something written and not sent stays with #14 while another one is open.
+    type_into(&mut h, "Leave a comment", "Half a thought");
+    h.get_all_by_label_contains("○ #12 ✔").next().expect("#12's badge").click();
+    settle(&mut h);
+    assert!(shows(&h, "Add product search  #12"));
+    assert_eq!(text_value(&h, "Comment"), "", "#12 has its own box");
+    assert!(!shows(&h, "Approve") && !shows(&h, "Request changes"), "my own pull request: comment only");
+
+    // #12 is approved with its checks passing: squash and merge it.
+    click(&mut h, "Merge…");
+    assert!(shows(&h, "Merge #12") && !shows(&h, "Not ready to merge"));
+    click(&mut h, "Squash and merge");
+    assert!(text_value(&h, "Commit title").ends_with(" (#12)"), "filled in like GitHub: {:?}", text_value(&h, "Commit title"));
+    click(&mut h, "Also delete the local branch “feature/search” (can be undone)");
+    click(&mut h, "Squash and merge…");
+    assert!(shows(&h, "GitHub will squash and merge #12 into main now. Merging can't be undone from Headway."));
+    click(&mut h, "Squash and merge");
+    assert!(shows_containing(&h, "Merged #12 into main"));
+    let done = forge_done(&forges);
+    assert!(done[1].starts_with("merge #12 squash “") && done[1].ends_with("(#12)” delete-branch"), "{done:?}");
+    assert_eq!(h.state().cfg.merge_methods.get(&r), Some(&crate::forge::MergeMethod::Squash), "remembered for next time");
+    let pv = h.state().tabs.get(&r).unwrap().pr_view.as_ref().unwrap();
+    assert_eq!(pv.pr.state, crate::forge::PrState::Merged, "read again");
+
+    // It was checked out: switch to main and pull, then the local branch goes (undoably).
+    assert!(shows(&h, "You're on “feature/search”, which was just merged. Switch to main and pull, so the merge is here? Then “feature/search” is deleted."));
+    click(&mut h, "Switch and pull");
+    settle(&mut h);
+    assert_eq!(git_ok(&r, &["symbolic-ref", "--short", "HEAD"]).trim(), "main");
+    assert!(git::run(&r, &["rev-parse", "--verify", "-q", "refs/heads/feature/search"]).is_err(), "deleted");
+    ctrl(&mut h, egui::Key::Z);
+    settle(&mut h);
+    assert!(git::run(&r, &["rev-parse", "--verify", "-q", "refs/heads/feature/search"]).is_ok(), "and back with Undo");
+
+    // Back on #14, the unsent comment is still there.
+    h.get_all_by_label_contains("◌ #14 draft").next().expect("#14's badge").click();
+    settle(&mut h);
+    assert_eq!(text_value(&h, "Comment"), "Half a thought");
+}
+
+/// What's in the way is shown, and Merge says why it can't.
+#[test]
+fn merging_is_refused_with_the_reason_and_closing_asks_first() {
+    let s = scratch("pr-merge-blocked");
+    let r = web_shop(&s, "main");
+    let forges = std::sync::Arc::new(crate::forge::fake::FakeForges::new(crate::samples::web_shop_forge(crate::forge::now_secs())));
+    let mut h = app_with_forge(&s, &r, true, forges.clone());
+    click(&mut h, "#13 Round cart totals to cents by alex-rivera, checks failing, changes requested");
+    click(&mut h, "Merge…");
+    assert!(shows(&h, "Not ready to merge"));
+    assert!(shows(&h, "• Changes were requested") && shows(&h, "• Required checks are failing"));
+    // The dialog's button is off (the header's opened it); the reason is beside it.
+    assert!(h.get_all_by_label("Merge…").any(|n| n.accesskit_node().is_disabled()), "the merge button is off");
+    assert!(shows(&h, "Changes were requested"));
+    click(&mut h, "Cancel");
+
+    // Closing asks first, then it's closed on the forge.
+    click(&mut h, "⋯");
+    click(&mut h, "Close pull request…");
+    assert!(shows(&h, "Close #13 “Round cart totals to cents” without merging it? It can be reopened later."));
+    click(&mut h, "Close");
+    assert!(shows_containing(&h, "Closed #13"));
+    assert_eq!(forge_done(&forges), ["close #13"]);
+}
+
 #[test]
 fn rerun_is_refused_with_a_reason_without_permission() {
     let s = scratch("pr-view-denied");

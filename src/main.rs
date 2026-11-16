@@ -16,6 +16,7 @@ mod newpr;
 mod oplog;
 mod overview;
 mod preview;
+mod prmerge;
 mod prview;
 mod resolver;
 mod samples;

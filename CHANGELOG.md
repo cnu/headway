@@ -67,6 +67,25 @@ workflow uses that version's section as the GitHub release notes.
   GitLab pipeline) again, and says why when it can't. Each part loads on its
   own, so a slow log never holds up the description, and the checks are read
   again every 30 seconds while any is running.
+- **Review and merge pull requests**: a comment box under the conversation
+  (with a preview) posts a comment, or approves or requests changes on
+  someone else's pull request (on GitLab: approve or revoke your approval).
+  What you've written stays with each pull request until it's sent. Pick
+  lines in Files changed to comment on them: on GitHub they collect into one
+  review sent with Submit review; on GitLab each is posted as a discussion on
+  the diff. Mark a draft ready for review or turn it back into a draft, and
+  close (after asking) or reopen it. **Merge** offers only the methods the
+  repository allows (merge commit, squash or rebase on GitHub; merge or
+  fast-forward and squash on GitLab), remembers the last one per repository,
+  fills in a squash commit's title and message the way GitHub does, and can
+  delete the branch on the forge and the local one (undoably). What stands in
+  the way (failing or running checks, a review needed, conflicts, a branch
+  behind its base) is listed, and Merge says why it can't; when GitHub's
+  auto-merge can wait for it instead, "Merge when checks pass" turns that on.
+  Merging asks once more, naming the method and the base, since Headway can't
+  undo it; afterwards Headway fetches, and if you were on the merged branch,
+  offers to switch to the base and pull. A refusal from GitHub or GitLab is
+  shown in its own words, and every action is in the command log.
 - `headway --version` (or `-V`) prints the version, and `--help` lists every
   option with what it does.
 

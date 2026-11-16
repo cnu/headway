@@ -13,8 +13,9 @@
 //! CLI. `pulls` are [`PullRequest`]s as serde writes them; `users` and `labels`
 //! are what a new pull request can name. `details` holds, by number, what a
 //! pull request's view shows: its description, checks, conversation and the
-//! logs of failed checks (by check name). Checks run again turn pending and are
-//! listed in `reruns`. Pull requests created here are kept
+//! logs of failed checks (by check name), and what merging needs (`merge`).
+//! Checks run again turn pending and are listed in `reruns`; merges, reviews,
+//! comments and state changes change the pull request and are listed in `done`. Pull requests created here are kept
 //! until the app quits. Development builds use it when
 //! `HEADWAY_FAKE_FORGE=<folder>` is set (and for the sample projects).
 
@@ -52,6 +53,9 @@ pub struct FakeRepo {
     pub details: HashMap<u64, FakeDetails>,
     /// The checks run again (by name), in order.
     pub reruns: Vec<String>,
+    /// What was done to pull requests here (merges, reviews, comments…), in
+    /// order, in words: "merge #12 squash".
+    pub done: Vec<String>,
 }
 
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]
@@ -63,6 +67,9 @@ pub struct FakeDetails {
     pub conversation: Vec<PrComment>,
     /// Failed checks' logs, by check name.
     pub logs: HashMap<String, String>,
+    /// What merging needs (the allowed methods default to the repository's;
+    /// whether I'm the author is worked out).
+    pub merge: MergeFacts,
 }
 
 pub struct FakeForges {
@@ -78,6 +85,12 @@ impl FakeForges {
 
     pub fn new(data: FakeData) -> Self {
         FakeForges { data: Arc::new(RwLock::new(data)) }
+    }
+
+    /// What the fixtures hold now (tests look at what was done).
+    #[cfg(test)]
+    pub fn data(&self) -> std::sync::RwLockReadGuard<'_, FakeData> {
+        self.data.read().unwrap()
     }
 }
 
@@ -111,6 +124,20 @@ impl FakeForge {
             return Err(ForgeError::SignedOut { kind: self.kind, host: self.host.clone() });
         }
         Ok(h.clone())
+    }
+
+    /// Change pull request `number` (and its details) in place.
+    fn change(&self, key: &RepoKey, number: u64, f: impl FnOnce(&mut FakeRepo, &mut PullRequest, &mut FakeDetails)) -> ForgeResult<()> {
+        self.host()?;
+        let mut data = self.data.write().unwrap();
+        let r = data.repos.get_mut(&key.to_string()).ok_or(ForgeError::NotFound)?;
+        let i = r.pulls.iter().position(|p| p.number == number).ok_or(ForgeError::NotFound)?;
+        let mut pr = r.pulls[i].clone();
+        let mut d = r.details.remove(&number).unwrap_or_default();
+        f(r, &mut pr, &mut d);
+        r.pulls[i] = pr;
+        r.details.insert(number, d);
+        Ok(())
     }
 
     fn repo(&self, key: &RepoKey) -> ForgeResult<FakeRepo> {
@@ -188,7 +215,100 @@ impl Forge for FakeForge {
         let r = self.repo(repo)?;
         let pr = r.pulls.iter().find(|p| p.number == number).cloned().ok_or(ForgeError::NotFound)?;
         let d = r.details.get(&number).cloned().unwrap_or_default();
-        Ok(PrDetails { pr, body: d.body, can_rerun: d.can_rerun })
+        let me = self.host()?.user.unwrap_or_default();
+        let mut merge = d.merge;
+        if merge.methods.is_empty() {
+            merge.methods = r.info.as_ref().map(|i| i.merge_methods.clone()).unwrap_or_default();
+        }
+        merge.viewer_is_author = pr.author == me;
+        Ok(PrDetails { pr, body: d.body, can_rerun: d.can_rerun, merge })
+    }
+
+    /// Refused like the real ones when something's in the way (unless it's
+    /// auto-merge, which waits); else it's merged.
+    fn merge(&self, repo: &RepoKey, number: u64, req: &MergeRequest) -> ForgeResult<()> {
+        let details = self.pr_details(repo, number)?;
+        let checks = self.pr_checks(repo, number)?;
+        let blocked = blockers(self.kind, &details.pr, &details.merge, Some(&checks));
+        if let Some(b) = blocked.first().filter(|_| !req.auto) {
+            return Err(ForgeError::Other(format!("Pull request {repo}#{number} is not mergeable: {}.", b.text(self.kind, &details.pr.base_branch).to_lowercase())));
+        }
+        if !details.merge.methods.contains(&req.method) {
+            return Err(ForgeError::Other(format!("{} merges are not allowed on this repository.", req.method.verb())));
+        }
+        self.change(repo, number, |r, pr, d| {
+            if req.auto {
+                d.merge.auto_merge_on = true;
+            } else {
+                pr.state = PrState::Merged;
+                pr.updated = now_secs();
+            }
+            let what = if req.auto { "auto-merge" } else { "merge" };
+            let mut line = format!("{what} #{number} {:?}", req.method).to_lowercase();
+            if req.method == MergeMethod::Squash {
+                line.push_str(&format!(" “{}”", req.title));
+            }
+            if req.delete_branch {
+                line.push_str(" delete-branch");
+            }
+            r.done.push(line);
+        })
+    }
+
+    fn set_state(&self, repo: &RepoKey, number: u64, change: StateChange) -> ForgeResult<()> {
+        self.change(repo, number, |r, pr, _| {
+            pr.state = match change {
+                StateChange::Ready | StateChange::Reopen => PrState::Open,
+                StateChange::Draft => PrState::Draft,
+                StateChange::Close => PrState::Closed,
+            };
+            r.done.push(format!("{} #{number}", change.label().to_lowercase()));
+        })
+    }
+
+    fn comment(&self, repo: &RepoKey, number: u64, body: &str) -> ForgeResult<()> {
+        let me = self.host()?.user.unwrap_or_default();
+        self.change(repo, number, |r, _, d| {
+            d.conversation.push(PrComment { kind: CommentKind::Comment, author: me.clone(), time: now_secs(), body: body.to_string(), path: None, line: None, url: None });
+            r.done.push(format!("comment #{number}"));
+        })
+    }
+
+    fn review(&self, repo: &RepoKey, number: u64, review: &Review) -> ForgeResult<()> {
+        let me = self.host()?.user.unwrap_or_default();
+        self.change(repo, number, |r, pr, d| {
+            let now = now_secs();
+            let kind = match review.verdict {
+                Verdict::Approve => {
+                    pr.review = ReviewDecision::Approved;
+                    d.merge.viewer_approved = true;
+                    CommentKind::Approved
+                }
+                Verdict::RequestChanges => {
+                    pr.review = ReviewDecision::ChangesRequested;
+                    CommentKind::ChangesRequested
+                }
+                Verdict::Unapprove => {
+                    pr.review = ReviewDecision::ReviewRequired;
+                    d.merge.viewer_approved = false;
+                    CommentKind::Comment
+                }
+                Verdict::Comment => CommentKind::Reviewed,
+            };
+            d.conversation.push(PrComment { kind, author: me.clone(), time: now, body: review.body.clone(), path: None, line: None, url: None });
+            for c in &review.comments {
+                d.conversation.push(PrComment { kind: CommentKind::Line, author: me.clone(), time: now, body: c.body.clone(), path: Some(c.path.clone()), line: Some(c.end), url: None });
+            }
+            r.done.push(format!("review #{number} {:?} with {} line comments", review.verdict, review.comments.len()).to_lowercase());
+        })
+    }
+
+    fn line_comment(&self, repo: &RepoKey, number: u64, c: &LineComment, _refs: &DiffRefs) -> ForgeResult<()> {
+        let me = self.host()?.user.unwrap_or_default();
+        self.change(repo, number, |r, _, d| {
+            d.conversation.push(PrComment { kind: CommentKind::Line, author: me.clone(), time: now_secs(), body: c.body.clone(), path: Some(c.path.clone()), line: Some(c.end), url: None });
+            r.done.push(format!("line comment #{number} {}", c.place()));
+        })
     }
 
     fn pr_checks(&self, repo: &RepoKey, number: u64) -> ForgeResult<Vec<Check>> {
@@ -261,4 +381,31 @@ mod tests {
         assert!(gh.create_pr(&key, &new, "alex").unwrap_err().to_string().contains("already exists"));
         assert_eq!(gh.pr_meta(&key).unwrap(), PrMeta::default());
     }
+
+    /// Merging, reviewing and closing change the pull request, as on the forge;
+    /// a merge with something in the way is refused unless it's auto-merge.
+    #[test]
+    fn pull_requests_are_merged_reviewed_and_closed() {
+        let data = crate::samples::web_shop_forge(1_000_000);
+        let forges = FakeForges::new(data);
+        let gh = forges.forge(ForgeKind::GitHub, "github.com", None);
+        let key = RepoKey { host: "github.com".into(), path: "headway-samples/web-shop".into() };
+        let squash = |auto| MergeRequest { method: MergeMethod::Squash, title: "Fix (#13)".into(), message: String::new(), delete_branch: true, auto, head: None };
+        let refused = gh.merge(&key, 13, &squash(false)).unwrap_err().to_string();
+        assert_eq!(refused, "Pull request github.com/headway-samples/web-shop#13 is not mergeable: changes were requested.");
+        gh.merge(&key, 13, &squash(true)).unwrap();
+        assert!(gh.pr_details(&key, 13).unwrap().merge.auto_merge_on);
+
+        gh.review(&key, 14, &Review { verdict: Verdict::Approve, body: "Nice".into(), comments: vec![], pr_id: "x".into() }).unwrap();
+        assert_eq!(gh.pr_details(&key, 14).unwrap().pr.review, ReviewDecision::Approved);
+        assert_eq!(gh.conversation(&key, 14).unwrap().last().map(|c| (c.kind, c.author.as_str())), Some((CommentKind::Approved, "alex-rivera")));
+
+        gh.merge(&key, 12, &squash(false)).unwrap();
+        assert_eq!(gh.pr_details(&key, 12).unwrap().pr.state, PrState::Merged);
+        gh.set_state(&key, 14, StateChange::Close).unwrap();
+        assert_eq!(gh.pr_details(&key, 14).unwrap().pr.state, PrState::Closed);
+        let done = forges.data.read().unwrap().repos["github.com/headway-samples/web-shop"].done.clone();
+        assert_eq!(done, ["auto-merge #13 squash “Fix (#13)” delete-branch", "review #14 approve with 0 line comments", "merge #12 squash “Fix (#13)” delete-branch", "close #14"]);
+    }
+
 }

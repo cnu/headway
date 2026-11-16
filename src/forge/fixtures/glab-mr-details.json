@@ -1,9 +1,1 @@
-{"data":{"project":{"mergeRequest":{
-"iid":"13","title":"Round cart totals to cents","state":"opened","draft":true,"webUrl":"https://gitlab.com/acme/shop/-/merge_requests/13","updatedAt":"2026-11-10T09:30:12Z",
-"sourceBranch":"fix/tax-rounding","targetBranch":"main","diffHeadSha":"4b7c1e0f2a9d3c5b6e8f7a1d2c3b4a5e6f7d8c9b","author":{"username":"tanuki-user"},
-"sourceProject":{"fullPath":"acme/shop"},"targetProject":{"fullPath":"acme/shop"},"approved":false,"detailedMergeStatus":"DRAFT_STATUS",
-"reviewers":{"nodes":[{"username":"reviewer-1"}]},
-"headPipeline":{"status":"FAILED","jobs":{"nodes":[{"status":"SUCCESS","allowFailure":false},{"status":"FAILED","allowFailure":false}]}},
-"description":"Fixes rounding.\n\n    indented code\n\n* one\n* two\n",
-"rerun":{"userPermissions":{"updatePipeline":false}}
-}}}}
+{"data":{"project":{"mergeRequest":{"iid":"13","title":"Round cart totals to cents","state":"opened","draft":true,"webUrl":"https://gitlab.com/acme/shop/-/merge_requests/13","updatedAt":"2026-11-10T09:30:12Z","sourceBranch":"fix/tax-rounding","targetBranch":"main","diffHeadSha":"4b7c1e0f2a9d3c5b6e8f7a1d2c3b4a5e6f7d8c9b","author":{"username":"tanuki-user"},"sourceProject":{"fullPath":"acme/shop"},"targetProject":{"fullPath":"acme/shop"},"approved":false,"detailedMergeStatus":"DRAFT_STATUS","reviewers":{"nodes":[{"username":"reviewer-1"}]},"headPipeline":{"status":"FAILED","jobs":{"nodes":[{"status":"SUCCESS","allowFailure":false},{"status":"FAILED","allowFailure":false}]}},"description":"Fixes rounding.\n\n    indented code\n\n* one\n* two\n","rerun":{"userPermissions":{"updatePipeline":false}},"userPermissions":{"canMerge":true},"approvedBy":{"nodes":[{"username":"reviewer-1"}]},"diffRefs":{"baseSha":"1111111111111111111111111111111111111111","startSha":"2222222222222222222222222222222222222222","headSha":"4b7c1e0f2a9d3c5b6e8f7a1d2c3b4a5e6f7d8c9b"},"autoMergeEnabled":false}},"currentUser":{"username":"reviewer-1"}}}

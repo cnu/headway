@@ -11,6 +11,12 @@ pub struct GitLab {
 }
 
 impl GitLab {
+    /// Run a glab command that changes something, keeping a refusal's own words.
+    fn act(&self, args: &[String]) -> ForgeResult<String> {
+        let args: Vec<&str> = args.iter().map(String::as_str).collect();
+        run_action(self.cli.as_ref(), ForgeKind::GitLab, &self.host, self.dir.as_deref(), &args)
+    }
+
     fn json<T: serde::de::DeserializeOwned>(&self, args: &[&str]) -> ForgeResult<T> {
         let mut all: Vec<&str> = args.to_vec();
         all.extend(["--hostname", self.host.as_str()]);
@@ -85,7 +91,10 @@ impl Forge for GitLab {
     fn pr_details(&self, repo: &RepoKey, number: u64) -> ForgeResult<PrDetails> {
         let q = format!("query={}", details_query(number));
         let path = format!("path={}", repo.path);
-        parse_details(self.json(&["api", "graphql", "-f", &q, "-f", &path])?)
+        let reply = self.json(&["api", "graphql", "-f", &q, "-f", &path])?;
+        // How the project merges is in its settings, which GraphQL doesn't show.
+        let project: Option<Project> = self.json(&["api", &format!("projects/{}", encode_path(&repo.path))]).ok();
+        parse_details(reply, project.as_ref())
     }
 
     fn pr_checks(&self, repo: &RepoKey, number: u64) -> ForgeResult<Vec<Check>> {
@@ -106,6 +115,40 @@ impl Forge for GitLab {
         let endpoint = format!("projects/{}/jobs/{job}/trace", encode_path(&repo.path));
         let text = run_text(self.cli.as_ref(), ForgeKind::GitLab, &self.host, self.dir.as_deref(), &["api", &endpoint, "--hostname", &self.host])?;
         Ok(trim_log(&text, LOG_LINES).0)
+    }
+
+    fn merge(&self, repo: &RepoKey, number: u64, req: &MergeRequest) -> ForgeResult<()> {
+        self.act(&merge_args(&self.host, repo, number, req)).map(drop)
+    }
+
+    fn set_state(&self, repo: &RepoKey, number: u64, change: StateChange) -> ForgeResult<()> {
+        self.act(&state_args(&self.host, repo, number, change)).map(drop)
+    }
+
+    fn comment(&self, repo: &RepoKey, number: u64, body: &str) -> ForgeResult<()> {
+        self.act(&note_args(&self.host, repo, number, body)).map(drop)
+    }
+
+    /// Approve or take back an approval, then the comment (if any) as a note.
+    fn review(&self, repo: &RepoKey, number: u64, review: &Review) -> ForgeResult<()> {
+        let call = match review.verdict {
+            Verdict::Approve => Some("approve"),
+            Verdict::Unapprove => Some("unapprove"),
+            Verdict::Comment => None,
+            Verdict::RequestChanges => return Err(ForgeError::NotYet("request changes on GitLab")),
+        };
+        if let Some(call) = call {
+            let endpoint = format!("{}/{call}", mr_endpoint(repo, number));
+            self.act(&["api".into(), "-X".into(), "POST".into(), endpoint, "--hostname".into(), self.host.clone()])?;
+        }
+        if !review.body.trim().is_empty() {
+            self.comment(repo, number, &review.body)?;
+        }
+        Ok(())
+    }
+
+    fn line_comment(&self, repo: &RepoKey, number: u64, comment: &LineComment, refs: &DiffRefs) -> ForgeResult<()> {
+        self.act(&discussion_args(&self.host, repo, number, comment, refs)).map(drop)
     }
 
     /// Retry the pipeline (GitLab runs its failed jobs again).
@@ -137,6 +180,88 @@ pub fn rerun_commands(host: &str, repo: &RepoKey, checks: &[Check]) -> Vec<Vec<S
         .into_iter()
         .map(|p| ["api", "-X", "POST", &format!("projects/{project}/pipelines/{p}/retry"), "--hostname", host].map(String::from).to_vec())
         .collect()
+}
+
+/// `projects/<id>/merge_requests/<iid>` in the REST API.
+fn mr_endpoint(repo: &RepoKey, number: u64) -> String {
+    format!("projects/{}/merge_requests/{number}", encode_path(&repo.path))
+}
+
+/// `glab api … --hostname <host>`, with `fields` (`-f` for text, `-F` for
+/// true and false, which glab sends as booleans).
+fn api_call(host: &str, method: &str, endpoint: String, fields: &[(&str, String)]) -> Vec<String> {
+    let mut a: Vec<String> = vec!["api".into(), "-X".into(), method.into(), endpoint];
+    for (k, v) in fields {
+        let flag = if v == "true" || v == "false" { "-F" } else { "-f" };
+        a.extend([flag.into(), format!("{k}={v}")]);
+    }
+    a.extend(["--hostname".into(), host.into()]);
+    a
+}
+
+/// The REST merge call: GitLab merges the way the project is set to; squashing
+/// (with its message) and deleting the source branch are asked for here. The
+/// head commit is pinned, so a push since isn't merged unseen.
+pub fn merge_args(host: &str, repo: &RepoKey, number: u64, req: &MergeRequest) -> Vec<String> {
+    let mut fields: Vec<(&str, String)> = Vec::new();
+    if req.method == MergeMethod::Squash {
+        fields.push(("squash", "true".into()));
+        let msg = [req.title.trim(), req.message.trim()].iter().filter(|s| !s.is_empty()).copied().collect::<Vec<_>>().join("\n\n");
+        if !msg.is_empty() {
+            fields.push(("squash_commit_message", msg));
+        }
+    }
+    if req.delete_branch {
+        fields.push(("should_remove_source_branch", "true".into()));
+    }
+    if let Some(h) = &req.head {
+        fields.push(("sha", h.clone()));
+    }
+    api_call(host, "PUT", format!("{}/merge", mr_endpoint(repo, number)), &fields)
+}
+
+/// Ready and draft through `glab mr update`; closing and reopening through
+/// the REST API's state event.
+pub fn state_args(host: &str, repo: &RepoKey, number: u64, change: StateChange) -> Vec<String> {
+    match change {
+        StateChange::Ready | StateChange::Draft => {
+            let flag = if change == StateChange::Ready { "--ready" } else { "--draft" };
+            vec!["mr".into(), "update".into(), number.to_string(), flag.into(), format!("--repo=https://{host}/{}", repo.path)]
+        }
+        StateChange::Close | StateChange::Reopen => {
+            let event = if change == StateChange::Close { "close" } else { "reopen" };
+            api_call(host, "PUT", mr_endpoint(repo, number), &[("state_event", event.into())])
+        }
+    }
+}
+
+pub fn note_args(host: &str, repo: &RepoKey, number: u64, body: &str) -> Vec<String> {
+    api_call(host, "POST", format!("{}/notes", mr_endpoint(repo, number)), &[("body", body.to_string())])
+}
+
+/// A discussion on the diff. Its position goes in the address (as
+/// `position[…]=` parameters, which GitLab reads into the nested position); an
+/// unchanged line is placed by both its numbers. A range is placed on its last
+/// line.
+pub fn discussion_args(host: &str, repo: &RepoKey, number: u64, c: &LineComment, refs: &DiffRefs) -> Vec<String> {
+    let old_path = c.old_path.as_deref().unwrap_or(&c.path);
+    let mut pos: Vec<(&str, String)> = vec![
+        ("position_type", "text".into()),
+        ("base_sha", refs.base.clone()),
+        ("start_sha", refs.start.clone()),
+        ("head_sha", refs.head.clone()),
+        ("old_path", old_path.to_string()),
+        ("new_path", c.path.clone()),
+    ];
+    if let Some(n) = c.old_line {
+        pos.push(("old_line", n.to_string()));
+    }
+    if let Some(n) = c.new_line {
+        pos.push(("new_line", n.to_string()));
+    }
+    let query: Vec<String> = pos.iter().map(|(k, v)| format!("position%5B{k}%5D={}", encode_path(v))).collect();
+    let endpoint = format!("{}/discussions?{}", mr_endpoint(repo, number), query.join("&"));
+    api_call(host, "POST", endpoint, &[("body", c.body.clone())])
 }
 
 /// `glab mr create` for `pr`, never asking anything. Values are written
@@ -208,18 +333,29 @@ pub struct Project {
     merge_method: String,
     #[serde(default)]
     squash_option: String,
+    #[serde(default)]
+    remove_source_branch_after_merge: bool,
 }
 
 pub fn parse_project(p: Project) -> RepoInfo {
-    // "ff" and "rebase_merge" both need the branch rebased first.
-    let mut merge_methods = vec![match p.merge_method.as_str() {
-        "ff" => MergeMethod::Rebase,
-        _ => MergeMethod::Merge,
-    }];
-    if p.squash_option != "never" {
-        merge_methods.push(MergeMethod::Squash);
-    }
+    let merge_methods = merge_methods(&p);
     RepoInfo { default_branch: p.default_branch.unwrap_or_default(), merge_methods, web_url: p.web_url }
+}
+
+/// How a project's merge requests can be merged: its one merge method
+/// (fast-forward, or a merge commit — "rebase_merge" makes one too, once the
+/// branch is rebased), and squashing unless the project never allows it.
+/// A project that always squashes offers only that.
+pub fn merge_methods(p: &Project) -> Vec<MergeMethod> {
+    let plain = match p.merge_method.as_str() {
+        "ff" => MergeMethod::FastForward,
+        _ => MergeMethod::Merge,
+    };
+    match p.squash_option.as_str() {
+        "always" => vec![MergeMethod::Squash],
+        "never" => vec![plain],
+        _ => vec![plain, MergeMethod::Squash],
+    }
 }
 
 #[derive(Deserialize)]
@@ -419,7 +555,9 @@ fn mr_from(n: &MrNode) -> PullRequest {
 /// The merge request with its description, and whether the user may retry its pipeline.
 pub fn details_query(number: u64) -> String {
     format!(
-        "query($path: ID!) {{ project(fullPath: $path) {{ mergeRequest(iid: \"{number}\") {{ ...mr description rerun: headPipeline {{ userPermissions {{ updatePipeline }} }} }} }} }} {MR_FRAGMENT}"
+        "query($path: ID!) {{ currentUser {{ username }} project(fullPath: $path) {{ mergeRequest(iid: \"{number}\") {{ ...mr description \
+rerun: headPipeline {{ userPermissions {{ updatePipeline }} }} userPermissions {{ canMerge }} approvedBy {{ nodes {{ username }} }} \
+diffRefs {{ baseSha startSha headSha }} autoMergeEnabled }} }} }} {MR_FRAGMENT}"
     )
 }
 
@@ -446,8 +584,12 @@ pub struct Reply<T> {
 }
 
 #[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
 struct ProjectOf<T> {
     project: Option<MrOf<T>>,
+    /// Asked for with the details only.
+    #[serde(default)]
+    current_user: Option<Username>,
 }
 
 #[derive(Deserialize)]
@@ -462,12 +604,33 @@ fn merge_request<T>(reply: Reply<T>) -> ForgeResult<T> {
 }
 
 #[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
 pub struct DetailsMr {
     #[serde(flatten)]
     mr: MrNode,
     #[serde(default)]
     description: Option<String>,
     rerun: Option<RerunPipeline>,
+    user_permissions: Option<MrPermissions>,
+    approved_by: Option<Nodes<Username>>,
+    diff_refs: Option<GqlDiffRefs>,
+    #[serde(default)]
+    auto_merge_enabled: bool,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct MrPermissions {
+    #[serde(default)]
+    can_merge: bool,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct GqlDiffRefs {
+    base_sha: Option<String>,
+    start_sha: Option<String>,
+    head_sha: Option<String>,
 }
 
 #[derive(Deserialize)]
@@ -483,10 +646,27 @@ struct PipelinePermissions {
     update_pipeline: bool,
 }
 
-pub fn parse_details(reply: Reply<DetailsMr>) -> ForgeResult<PrDetails> {
+/// The merge request's details, with the project's settings (`project`, from
+/// the REST API: how it merges and whether it deletes source branches).
+pub fn parse_details(reply: Reply<DetailsMr>, project: Option<&Project>) -> ForgeResult<PrDetails> {
+    let me = reply.data.as_ref().and_then(|d| d.current_user.as_ref()).map(|u| u.username.clone());
     let d = merge_request(reply)?;
     let can_rerun = d.rerun.and_then(|r| r.user_permissions).is_some_and(|p| p.update_pipeline);
-    Ok(PrDetails { pr: mr_from(&d.mr), body: d.description.unwrap_or_default(), can_rerun })
+    let pr = mr_from(&d.mr);
+    let mine = |name: &str| me.as_deref() == Some(name);
+    let merge = MergeFacts {
+        node_id: String::new(),
+        status: d.mr.detailed_merge_status.clone().unwrap_or_default(),
+        viewer_is_author: mine(&pr.author),
+        viewer_approved: d.approved_by.as_ref().is_some_and(|n| n.nodes.iter().flatten().any(|u| mine(&u.username))),
+        can_merge: d.user_permissions.is_some_and(|p| p.can_merge),
+        methods: project.map(merge_methods).unwrap_or_default(),
+        auto_merge_allowed: false,
+        auto_merge_on: d.auto_merge_enabled,
+        delete_branch: project.is_some_and(|p| p.remove_source_branch_after_merge),
+        diff_refs: d.diff_refs.and_then(|r| Some(DiffRefs { base: r.base_sha?, start: r.start_sha?, head: r.head_sha? })),
+    };
+    Ok(PrDetails { pr, body: d.description.unwrap_or_default(), can_rerun, merge })
 }
 
 #[derive(Deserialize)]
@@ -687,7 +867,7 @@ mod tests {
         let f = forge(cli);
         let info = f.repo_info(&RepoKey { host: "gitlab.example.org".into(), path: "group/sub/shop".into() }).unwrap();
         assert_eq!(info.default_branch, "main");
-        assert_eq!(info.merge_methods, [MergeMethod::Rebase, MergeMethod::Squash]);
+        assert_eq!(info.merge_methods, [MergeMethod::FastForward, MergeMethod::Squash]);
         assert_eq!(info.web_url, "https://gitlab.example.org/group/sub/shop");
         assert_eq!(f.whoami().unwrap(), "tanuki-user");
         assert_eq!(encode_path("a b/c.d"), "a%20b%2Fc.d");
@@ -761,7 +941,7 @@ mod tests {
 
     #[test]
     fn a_merge_requests_details_jobs_and_notes_are_read() {
-        let d = parse_details(serde_json::from_str(MR_DETAILS).unwrap()).unwrap();
+        let d = parse_details(serde_json::from_str(MR_DETAILS).unwrap(), None).unwrap();
         assert_eq!((d.pr.number, d.pr.state, d.can_rerun), (13, PrState::Draft, false));
         assert!(d.body.starts_with("Fixes rounding."));
 
@@ -812,4 +992,72 @@ mod tests {
         let calls = cli.calls();
         assert_eq!(calls.last().unwrap().1, ["api", "-X", "POST", "projects/acme%2Fshop/pipelines/5501/retry", "--hostname", "gitlab.example.org"]);
     }
+
+    /// The project's settings decide the methods; each details fixture shows
+    /// what's in the way.
+    #[test]
+    fn merge_methods_and_blockers_come_with_the_details() {
+        let project: Project = serde_json::from_str(include_str!("fixtures/glab-project.json")).unwrap();
+        let methods = |merge: &str, squash: &str| merge_methods(&Project { merge_method: merge.into(), squash_option: squash.into(), ..serde_json::from_str(include_str!("fixtures/glab-project.json")).unwrap() });
+        assert_eq!(methods("merge", "default_off"), [MergeMethod::Merge, MergeMethod::Squash]);
+        assert_eq!(methods("rebase_merge", "never"), [MergeMethod::Merge]);
+        assert_eq!(methods("ff", "default_on"), [MergeMethod::FastForward, MergeMethod::Squash]);
+        assert_eq!(methods("merge", "always"), [MergeMethod::Squash], "a project that always squashes");
+
+        let d = parse_details(serde_json::from_str(MR_DETAILS).unwrap(), Some(&project)).unwrap();
+        let m = &d.merge;
+        assert_eq!(m.methods, [MergeMethod::FastForward, MergeMethod::Squash]);
+        assert!(m.can_merge && m.viewer_approved && !m.viewer_is_author && !m.auto_merge_allowed);
+        assert_eq!(m.diff_refs.as_ref().map(|r| r.start.as_str()), Some("2222222222222222222222222222222222222222"));
+        let words = |json: &str| -> Vec<String> {
+            let d = parse_details(serde_json::from_str(json).unwrap(), Some(&project)).unwrap();
+            blockers(ForgeKind::GitLab, &d.pr, &d.merge, None).iter().map(|b| b.text(ForgeKind::GitLab, &d.pr.base_branch)).collect()
+        };
+        assert_eq!(words(MR_DETAILS), ["It's a draft: mark it ready for review first"]);
+        assert_eq!(words(include_str!("fixtures/glab-mr-details-rebase.json")), ["main has moved on: the branch must be brought up to date first"]);
+        assert_eq!(
+            words(include_str!("fixtures/glab-mr-details-ci.json")),
+            ["You don't have permission to merge into main", "Required checks are failing"]
+        );
+    }
+
+    #[test]
+    fn merging_reviewing_and_state_changes_are_glab_commands() {
+        let key = RepoKey { host: "git.corp".into(), path: "group/app".into() };
+        let squash = MergeRequest { method: MergeMethod::Squash, title: "Search".into(), message: "* Add search".into(), delete_branch: true, auto: false, head: Some("abc".into()) };
+        assert_eq!(
+            merge_args("git.corp", &key, 7, &squash),
+            [
+                "api", "-X", "PUT", "projects/group%2Fapp/merge_requests/7/merge", "-F", "squash=true", "-f", "squash_commit_message=Search\n\n* Add search", "-F", "should_remove_source_branch=true", "-f", "sha=abc", "--hostname",
+                "git.corp"
+            ]
+        );
+        let plain = MergeRequest { method: MergeMethod::FastForward, delete_branch: false, head: None, ..squash.clone() };
+        assert_eq!(merge_args("git.corp", &key, 7, &plain), ["api", "-X", "PUT", "projects/group%2Fapp/merge_requests/7/merge", "--hostname", "git.corp"]);
+        assert_eq!(state_args("git.corp", &key, 7, StateChange::Ready), ["mr", "update", "7", "--ready", "--repo=https://git.corp/group/app"]);
+        assert_eq!(state_args("git.corp", &key, 7, StateChange::Close), ["api", "-X", "PUT", "projects/group%2Fapp/merge_requests/7", "-f", "state_event=close", "--hostname", "git.corp"]);
+        assert_eq!(note_args("git.corp", &key, 7, "Nice"), ["api", "-X", "POST", "projects/group%2Fapp/merge_requests/7/notes", "-f", "body=Nice", "--hostname", "git.corp"]);
+
+        let refs = DiffRefs { base: "b".into(), start: "s".into(), head: "h".into() };
+        let unchanged = LineComment { path: "src/new name.rs".into(), old_path: Some("src/old.rs".into()), side: Side::After, start: 3, end: 4, old_line: Some(2), new_line: Some(4), body: "Hm".into() };
+        let a = discussion_args("git.corp", &key, 7, &unchanged, &refs);
+        assert_eq!(
+            a[3],
+            "projects/group%2Fapp/merge_requests/7/discussions?position%5Bposition_type%5D=text&position%5Bbase_sha%5D=b&position%5Bstart_sha%5D=s&position%5Bhead_sha%5D=h\
+&position%5Bold_path%5D=src%2Fold.rs&position%5Bnew_path%5D=src%2Fnew%20name.rs&position%5Bold_line%5D=2&position%5Bnew_line%5D=4"
+        );
+        assert_eq!(a[4..], ["-f", "body=Hm", "--hostname", "git.corp"]);
+
+        // Approving is its own call, then the comment as a note; a refusal keeps GitLab's words.
+        let cli = Arc::new(StubCli::default().on(Tool::Glab, &["api", "-X", "POST"], Answer::Ok("{}")));
+        let gl = forge(cli.clone());
+        gl.review(&shop(), 13, &Review { verdict: Verdict::Approve, body: "LGTM".into(), comments: vec![], pr_id: String::new() }).unwrap();
+        let calls: Vec<String> = cli.calls().iter().map(|c| c.1[3].clone()).collect();
+        assert_eq!(calls, ["projects/acme%2Fshop/merge_requests/13/approve", "projects/acme%2Fshop/merge_requests/13/notes"]);
+        gl.review(&shop(), 13, &Review { verdict: Verdict::Unapprove, body: String::new(), comments: vec![], pr_id: String::new() }).unwrap();
+        assert_eq!(cli.calls().last().unwrap().1[3], "projects/acme%2Fshop/merge_requests/13/unapprove");
+        let refused = forge(Arc::new(StubCli::default().on(Tool::Glab, &["api", "-X", "PUT"], Answer::Fail(1, "glab: 405 Method Not Allowed (HTTP 405)\n{\"message\":\"405 Method Not Allowed\"}"))));
+        assert_eq!(refused.merge(&shop(), 13, &plain).unwrap_err().to_string(), "glab: 405 Method Not Allowed (HTTP 405)\n{\"message\":\"405 Method Not Allowed\"}");
+    }
+
 }

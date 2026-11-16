@@ -497,11 +497,42 @@ pub fn in_time_order(mut list: Vec<PrComment>) -> Vec<PrComment> {
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "lowercase")]
+#[serde(rename_all = "snake_case")]
 pub enum MergeMethod {
     Merge,
     Squash,
     Rebase,
+    /// GitLab projects set to fast-forward merges.
+    FastForward,
+}
+
+impl MergeMethod {
+    /// What the merge button says ("Squash and merge").
+    pub fn verb(self) -> &'static str {
+        match self {
+            MergeMethod::Merge => "Merge",
+            MergeMethod::Squash => "Squash and merge",
+            MergeMethod::Rebase => "Rebase and merge",
+            MergeMethod::FastForward => "Fast-forward merge",
+        }
+    }
+
+    /// What it does, for the method picker.
+    pub fn about(self, kind: ForgeKind) -> &'static str {
+        match (self, kind) {
+            (MergeMethod::Merge, ForgeKind::GitHub) => "All commits are added to the base branch with a merge commit",
+            (MergeMethod::Merge, ForgeKind::GitLab) => "Merged the way the project is set to (with a merge commit)",
+            (MergeMethod::Squash, _) => "The commits are combined into one commit on the base branch",
+            (MergeMethod::Rebase, _) => "The commits are added onto the base branch one by one, without a merge commit",
+            (MergeMethod::FastForward, _) => "The base branch is moved to the last commit; no merge commit",
+        }
+    }
+}
+
+/// The method to offer first: the one used last in this repository when it's
+/// still allowed, else the first one the forge allows.
+pub fn pick_method(allowed: &[MergeMethod], last: Option<MergeMethod>) -> Option<MergeMethod> {
+    last.filter(|m| allowed.contains(m)).or_else(|| allowed.first().copied())
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
@@ -573,11 +604,261 @@ pub struct PrMeta {
     pub labels: Vec<String>,
 }
 
-#[allow(dead_code)] // Ahead of the UI: the pull request features to come use it.
+/// What a review says.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Verdict {
+    Comment,
     Approve,
     RequestChanges,
-    Comment,
+    /// GitLab: take back my approval.
+    Unapprove,
+}
+
+/// Which side of the diff a line comment is on: the lines before the change
+/// (removed ones) or after it (added and unchanged ones).
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub enum Side {
+    Before,
+    After,
+}
+
+/// A comment on some lines of the changes.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct LineComment {
+    pub path: String,
+    /// Where the file was before, when it was renamed.
+    pub old_path: Option<String>,
+    pub side: Side,
+    /// The first and last line, numbered on `side`.
+    pub start: u32,
+    pub end: u32,
+    /// The last line's number before and after the change (both, for an
+    /// unchanged line): GitLab places the comment by them.
+    pub old_line: Option<u32>,
+    pub new_line: Option<u32>,
+    pub body: String,
+}
+
+impl LineComment {
+    /// "src/cart.js:3" or "src/cart.js:3–7".
+    pub fn place(&self) -> String {
+        if self.start == self.end { format!("{}:{}", self.path, self.end) } else { format!("{}:{}–{}", self.path, self.start, self.end) }
+    }
+}
+
+/// A review to post: the verdict, what it says, and (GitHub) the line
+/// comments collected for it.
+#[derive(Clone, Debug, PartialEq)]
+pub struct Review {
+    pub verdict: Verdict,
+    pub body: String,
+    pub comments: Vec<LineComment>,
+    /// GitHub's id for the pull request, which reviews are posted to.
+    pub pr_id: String,
+}
+
+/// Draft ↔ ready, closed ↔ open.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum StateChange {
+    Ready,
+    Draft,
+    Close,
+    Reopen,
+}
+
+impl StateChange {
+    pub fn label(self) -> &'static str {
+        match self {
+            StateChange::Ready => "Ready for review",
+            StateChange::Draft => "Convert to draft",
+            StateChange::Close => "Close",
+            StateChange::Reopen => "Reopen",
+        }
+    }
+}
+
+/// A merge to ask for.
+#[derive(Clone, Debug, PartialEq)]
+pub struct MergeRequest {
+    pub method: MergeMethod,
+    /// The commit's title and message, for a squash (empty: the forge's own).
+    pub title: String,
+    pub message: String,
+    /// Delete the pull request's branch on the forge once merged.
+    pub delete_branch: bool,
+    /// GitHub: merge once the checks and reviews it waits for are done.
+    pub auto: bool,
+    /// The head commit the person saw: the forge refuses if it has moved on.
+    pub head: Option<String>,
+}
+
+/// The commits a GitLab merge request's diff is between (its line comments
+/// are placed against them).
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct DiffRefs {
+    pub base: String,
+    pub start: String,
+    pub head: String,
+}
+
+/// What the details say about merging and reviewing, for the signed-in user.
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct MergeFacts {
+    /// GitHub's id for the pull request.
+    pub node_id: String,
+    /// The forge's own word for whether it can be merged now: GitHub's
+    /// `mergeStateStatus`, GitLab's `detailedMergeStatus`.
+    pub status: String,
+    pub viewer_is_author: bool,
+    /// GitLab: I've approved it (so the button takes it back).
+    pub viewer_approved: bool,
+    pub can_merge: bool,
+    /// What the repository allows, in the forge's order.
+    pub methods: Vec<MergeMethod>,
+    /// GitHub: the repository allows auto-merge.
+    pub auto_merge_allowed: bool,
+    /// Auto-merge is already on for it.
+    pub auto_merge_on: bool,
+    /// The repository deletes branches once merged (the default for the box).
+    pub delete_branch: bool,
+    pub diff_refs: Option<DiffRefs>,
+}
+
+/// Something that keeps a pull request from being merged now.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Blocker {
+    Closed,
+    Merged,
+    Draft,
+    NoPermission,
+    Conflicts,
+    Behind,
+    ChecksFailing,
+    ChecksPending,
+    ReviewRequired,
+    ChangesRequested,
+    Discussions,
+    /// The forge is still working it out.
+    Checking,
+    /// Branch rules block it for another reason.
+    Rules,
+}
+
+impl Blocker {
+    pub fn text(self, kind: ForgeKind, base: &str) -> String {
+        let site = kind.name();
+        match self {
+            Blocker::Closed => "It's closed".into(),
+            Blocker::Merged => "It's merged already".into(),
+            Blocker::Draft => "It's a draft: mark it ready for review first".into(),
+            Blocker::NoPermission => format!("You don't have permission to merge into {base}"),
+            Blocker::Conflicts => format!("It has conflicts with {base} that must be resolved first"),
+            Blocker::Behind => format!("{base} has moved on: the branch must be brought up to date first"),
+            Blocker::ChecksFailing => "Required checks are failing".into(),
+            Blocker::ChecksPending => "Required checks are still running".into(),
+            Blocker::ReviewRequired => "An approving review is required".into(),
+            Blocker::ChangesRequested => "Changes were requested".into(),
+            Blocker::Discussions => "Every discussion must be resolved first".into(),
+            Blocker::Checking => format!("{site} is still working out whether it can be merged: refresh in a moment"),
+            Blocker::Rules => format!("{site}'s rules for {base} don't allow merging it yet"),
+        }
+    }
+
+    /// GitHub's auto-merge waits for this to clear by itself.
+    pub fn waits(self) -> bool {
+        matches!(self, Blocker::ChecksPending | Blocker::ChecksFailing | Blocker::ReviewRequired)
+    }
+}
+
+/// What keeps the pull request from being merged now, from the forge's
+/// merge status, the review decision and the checks (the list once read,
+/// else the counts it came with).
+pub fn blockers(kind: ForgeKind, pr: &PullRequest, m: &MergeFacts, checks: Option<&[Check]>) -> Vec<Blocker> {
+    let mut out = Vec::new();
+    match pr.state {
+        PrState::Merged => return vec![Blocker::Merged],
+        PrState::Closed => return vec![Blocker::Closed],
+        PrState::Draft => out.push(Blocker::Draft),
+        PrState::Open => {}
+    }
+    if !m.can_merge {
+        out.push(Blocker::NoPermission);
+    }
+    let (failing, pending) = match checks {
+        Some(c) => (c.iter().any(|c| c.state == CheckState::Failing), c.iter().any(|c| c.state == CheckState::Pending)),
+        None => (pr.checks.failing > 0, pr.checks.pending > 0),
+    };
+    let checks_block = if failing { Blocker::ChecksFailing } else { Blocker::ChecksPending };
+    match (kind, m.status.as_str()) {
+        (ForgeKind::GitHub, "DRAFT") | (ForgeKind::GitLab, "DRAFT_STATUS") => out.push(Blocker::Draft),
+        (ForgeKind::GitHub, "DIRTY") | (ForgeKind::GitLab, "CONFLICT") => out.push(Blocker::Conflicts),
+        (ForgeKind::GitHub, "BEHIND") | (ForgeKind::GitLab, "NEED_REBASE") => out.push(Blocker::Behind),
+        (ForgeKind::GitHub, "UNKNOWN") | (ForgeKind::GitLab, "CHECKING" | "UNCHECKED" | "PREPARING" | "APPROVALS_SYNCING") => out.push(Blocker::Checking),
+        (ForgeKind::GitHub, "BLOCKED") => {
+            let before = out.len();
+            match pr.review {
+                ReviewDecision::ReviewRequired => out.push(Blocker::ReviewRequired),
+                ReviewDecision::ChangesRequested => out.push(Blocker::ChangesRequested),
+                _ => {}
+            }
+            if failing || pending {
+                out.push(checks_block);
+            }
+            if out.len() == before && m.can_merge {
+                out.push(Blocker::Rules);
+            }
+        }
+        (ForgeKind::GitLab, "CI_MUST_PASS") => out.push(if pending && !failing { Blocker::ChecksPending } else { Blocker::ChecksFailing }),
+        (ForgeKind::GitLab, "CI_STILL_RUNNING") => out.push(Blocker::ChecksPending),
+        (ForgeKind::GitLab, "NOT_APPROVED") => out.push(Blocker::ReviewRequired),
+        (ForgeKind::GitLab, "REQUESTED_CHANGES") => out.push(Blocker::ChangesRequested),
+        (ForgeKind::GitLab, "DISCUSSIONS_NOT_RESOLVED") => out.push(Blocker::Discussions),
+        (ForgeKind::GitLab, "NOT_OPEN") => out.push(Blocker::Closed),
+        (ForgeKind::GitLab, "MERGEABLE" | "") | (ForgeKind::GitHub, _) => {}
+        (ForgeKind::GitLab, _) => out.push(Blocker::Rules),
+    }
+    let mut seen = Vec::new();
+    out.retain(|b| {
+        let new = !seen.contains(b);
+        seen.push(*b);
+        new
+    });
+    out
+}
+
+/// Whether the merge button can merge now, can turn on GitHub's auto-merge
+/// (everything in the way clears by itself), or can't, and why.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum MergeReady {
+    Now,
+    Auto,
+    Blocked(String),
+}
+
+pub fn merge_ready(kind: ForgeKind, base: &str, m: &MergeFacts, blockers: &[Blocker]) -> MergeReady {
+    match blockers.first() {
+        None => MergeReady::Now,
+        Some(_) if kind == ForgeKind::GitHub && m.auto_merge_allowed && blockers.iter().all(|b| b.waits()) => MergeReady::Auto,
+        Some(b) => MergeReady::Blocked(b.text(kind, base)),
+    }
+}
+
+/// A squash commit's title and message, filled in the way GitHub does: one
+/// commit keeps its own message; several take the pull request's title and
+/// list each commit's message. GitHub adds the number to the title.
+pub fn squash_message(kind: ForgeKind, title: &str, number: u64, messages: &[String]) -> (String, String) {
+    let suffix = match kind {
+        ForgeKind::GitHub => format!(" (#{number})"),
+        ForgeKind::GitLab => String::new(),
+    };
+    if let [one] = messages {
+        let one = one.trim();
+        let (subject, rest) = one.split_once('\n').unwrap_or((one, ""));
+        return (format!("{}{suffix}", subject.trim()), rest.trim().to_string());
+    }
+    let body = messages.iter().map(|m| format!("* {}", m.trim())).collect::<Vec<_>>().join("\n\n");
+    (format!("{}{suffix}", title.trim()), body)
 }
 
 /// One pull request, for its view: what the lists know, plus its description
@@ -590,6 +871,8 @@ pub struct PrDetails {
     pub body: String,
     #[serde(default)]
     pub can_rerun: bool,
+    #[serde(default)]
+    pub merge: MergeFacts,
 }
 
 
@@ -671,20 +954,23 @@ pub trait Forge: Send + Sync {
     fn pr_meta(&self, _repo: &RepoKey) -> ForgeResult<PrMeta> {
         Err(ForgeError::NotYet("list reviewers and labels"))
     }
-    fn merge(&self, _repo: &RepoKey, _number: u64, _method: MergeMethod) -> ForgeResult<()> {
+    /// Merge it now, or (GitHub, `auto`) once what it waits for is done.
+    fn merge(&self, _repo: &RepoKey, _number: u64, _req: &MergeRequest) -> ForgeResult<()> {
         Err(ForgeError::NotYet("merge pull requests"))
     }
-    fn close(&self, _repo: &RepoKey, _number: u64) -> ForgeResult<()> {
-        Err(ForgeError::NotYet("close pull requests"))
-    }
-    fn mark_ready(&self, _repo: &RepoKey, _number: u64) -> ForgeResult<()> {
-        Err(ForgeError::NotYet("mark pull requests ready"))
+    fn set_state(&self, _repo: &RepoKey, _number: u64, _change: StateChange) -> ForgeResult<()> {
+        Err(ForgeError::NotYet("change pull requests"))
     }
     fn comment(&self, _repo: &RepoKey, _number: u64, _body: &str) -> ForgeResult<()> {
         Err(ForgeError::NotYet("comment on pull requests"))
     }
-    fn review(&self, _repo: &RepoKey, _number: u64, _verdict: Verdict, _body: &str) -> ForgeResult<()> {
+    /// Post a review (GitHub: with its line comments, as one review).
+    fn review(&self, _repo: &RepoKey, _number: u64, _review: &Review) -> ForgeResult<()> {
         Err(ForgeError::NotYet("review pull requests"))
+    }
+    /// GitLab: a comment on lines of the diff, as a discussion of its own.
+    fn line_comment(&self, _repo: &RepoKey, _number: u64, _comment: &LineComment, _refs: &DiffRefs) -> ForgeResult<()> {
+        Err(ForgeError::NotYet("comment on lines"))
     }
     /// Run the failed ones of `checks` again; returns how many runs (or
     /// pipelines) were restarted.
@@ -743,6 +1029,32 @@ pub fn run_write(cli: &dyn Cli, kind: ForgeKind, host: &str, dir: Option<&Path>,
         return Ok(String::from_utf8_lossy(&out.stdout).into_owned());
     }
     Err(classify_failure(kind, host, &out))
+}
+
+/// Run a CLI call that acts on a pull request (merge, review, close…). When
+/// the forge refuses, its own words are kept whole, so the reason (a branch
+/// rule, a missing permission) reaches the person as the forge put it.
+pub fn run_action(cli: &dyn Cli, kind: ForgeKind, host: &str, dir: Option<&Path>, args: &[&str]) -> ForgeResult<String> {
+    let out = cli.run(kind.tool(), dir, args, true).map_err(|e| io_error(kind, &e))?;
+    if out.code == Some(0) {
+        return Ok(String::from_utf8_lossy(&out.stdout).into_owned());
+    }
+    Err(refusal(kind, host, &out))
+}
+
+/// What a refused action printed: signed out and rate limits as usual,
+/// anything else in the forge's words (stderr, else the reply on stdout).
+pub fn refusal(kind: ForgeKind, host: &str, out: &ToolOutput) -> ForgeError {
+    match classify_failure(kind, host, out) {
+        e @ (ForgeError::SignedOut { .. } | ForgeError::RateLimited { .. }) => e,
+        _ if out.code.is_none() => classify_failure(kind, host, out),
+        _ => {
+            let words = |b: &[u8]| String::from_utf8_lossy(b).lines().map(str::trim).filter(|l| !l.is_empty()).collect::<Vec<_>>().join("\n");
+            let text = Some(words(&out.stderr)).filter(|t| !t.is_empty()).unwrap_or_else(|| words(&out.stdout));
+            let text = if text.is_empty() { format!("{} failed", kind.tool().program()) } else { text };
+            ForgeError::Other(crate::cmdlog::redact(&text))
+        }
+    }
 }
 
 /// Run a read-only CLI call that prints text (a log), and return it.
@@ -1183,11 +1495,72 @@ mod tests {
     }
 
     #[test]
+    fn a_squash_message_is_filled_in_like_github() {
+        let one = ["Add search\n\nA box over the list.\n".to_string()];
+        assert_eq!(squash_message(ForgeKind::GitHub, "Product search", 12, &one), ("Add search (#12)".into(), "A box over the list.".into()));
+        let two = ["Add search".to_string(), "Fix the empty case\n\nNo results said nothing.".to_string()];
+        assert_eq!(
+            squash_message(ForgeKind::GitHub, "Product search", 12, &two),
+            ("Product search (#12)".into(), "* Add search\n\n* Fix the empty case\n\nNo results said nothing.".into())
+        );
+        assert_eq!(squash_message(ForgeKind::GitLab, "Product search", 12, &two).0, "Product search", "GitLab adds no number");
+        assert_eq!(squash_message(ForgeKind::GitHub, "Product search", 12, &[]), ("Product search (#12)".into(), String::new()));
+    }
+
+    #[test]
+    fn the_last_method_is_offered_again_while_allowed() {
+        let allowed = [MergeMethod::Merge, MergeMethod::Squash];
+        assert_eq!(pick_method(&allowed, Some(MergeMethod::Squash)), Some(MergeMethod::Squash));
+        assert_eq!(pick_method(&allowed, Some(MergeMethod::Rebase)), Some(MergeMethod::Merge), "not allowed any more");
+        assert_eq!(pick_method(&allowed, None), Some(MergeMethod::Merge));
+        assert_eq!(pick_method(&[], Some(MergeMethod::Merge)), None);
+    }
+
+    #[test]
+    fn blockers_read_the_checks_and_reviews_behind_blocked() {
+        let pr = PullRequest {
+            number: 1,
+            title: "t".into(),
+            state: PrState::Open,
+            author: "a".into(),
+            head_branch: "h".into(),
+            base_branch: "main".into(),
+            head_repo: None,
+            url: String::new(),
+            review: ReviewDecision::ReviewRequired,
+            requested_reviewers: vec![],
+            checks: CheckSummary::default(),
+            mergeable: Mergeable::Blocked,
+            updated: 0,
+            head_oid: None,
+        };
+        let m = MergeFacts { status: "BLOCKED".into(), can_merge: true, ..Default::default() };
+        let check = |state| Check { name: "ci".into(), state, url: None, started: None, finished: None, kind: CheckKind::Other };
+        let gh = |pr: &PullRequest, m: &MergeFacts, c: &[Check]| blockers(ForgeKind::GitHub, pr, m, Some(c));
+        assert_eq!(gh(&pr, &m, &[check(CheckState::Pending)]), [Blocker::ReviewRequired, Blocker::ChecksPending]);
+        assert_eq!(gh(&pr, &m, &[check(CheckState::Failing), check(CheckState::Pending)]), [Blocker::ReviewRequired, Blocker::ChecksFailing]);
+        let approved = PullRequest { review: ReviewDecision::Approved, ..pr.clone() };
+        assert_eq!(gh(&approved, &m, &[check(CheckState::Passing)]), [Blocker::Rules], "blocked for a reason GitHub doesn't name");
+        let reader = MergeFacts { can_merge: false, ..m.clone() };
+        assert_eq!(gh(&approved, &reader, &[]), [Blocker::NoPermission]);
+        let unstable = MergeFacts { status: "UNSTABLE".into(), ..m.clone() };
+        assert!(gh(&approved, &unstable, &[check(CheckState::Failing)]).is_empty(), "failing checks that aren't required don't block");
+        assert_eq!(gh(&PullRequest { state: PrState::Merged, ..pr.clone() }, &m, &[]), [Blocker::Merged]);
+        let gl = |status: &str, c: &[Check]| blockers(ForgeKind::GitLab, &approved, &MergeFacts { status: status.into(), can_merge: true, ..Default::default() }, Some(c));
+        assert_eq!(gl("CI_MUST_PASS", &[check(CheckState::Pending)]), [Blocker::ChecksPending]);
+        assert_eq!(gl("DISCUSSIONS_NOT_RESOLVED", &[]), [Blocker::Discussions]);
+        assert_eq!(gl("EXTERNAL_STATUS_CHECKS", &[]), [Blocker::Rules]);
+        assert!(gl("MERGEABLE", &[]).is_empty());
+    }
+
+    #[test]
     fn unfinished_operations_say_so() {
         let f = CliForges { cli: Arc::new(StubCli::default()) }.forge(ForgeKind::GitHub, "github.com", None);
         let key = RepoKey { host: "github.com".into(), path: "a/b".into() };
-        assert_eq!(f.merge(&key, 1, MergeMethod::Squash), Err(ForgeError::NotYet("merge pull requests")));
-        assert_eq!(f.merge(&key, 1, MergeMethod::Squash).unwrap_err().to_string(), "Headway can't merge pull requests yet");
+        // GitHub's line comments go out with a review, never on their own.
+        let c = LineComment { path: "a".into(), old_path: None, side: Side::After, start: 1, end: 1, old_line: None, new_line: Some(1), body: "x".into() };
+        assert_eq!(f.line_comment(&key, 1, &c, &DiffRefs::default()), Err(ForgeError::NotYet("comment on lines")));
+        assert_eq!(f.line_comment(&key, 1, &c, &DiffRefs::default()).unwrap_err().to_string(), "Headway can't comment on lines yet");
     }
 
     /// The real `gh`, against GitHub (network; run by hand):

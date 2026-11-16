@@ -15,6 +15,12 @@ pub struct GitHub {
 }
 
 impl GitHub {
+    /// Run a gh command that changes something, keeping a refusal's own words.
+    fn act(&self, args: &[String]) -> ForgeResult<String> {
+        let args: Vec<&str> = args.iter().map(String::as_str).collect();
+        run_action(self.cli.as_ref(), ForgeKind::GitHub, &self.host, self.dir.as_deref(), &args)
+    }
+
     fn json<T: serde::de::DeserializeOwned>(&self, args: &[&str]) -> ForgeResult<T> {
         let mut all: Vec<&str> = args.to_vec();
         all.extend(["--hostname", self.host.as_str()]);
@@ -146,6 +152,28 @@ impl Forge for GitHub {
         Ok(trim_log(&failed_job_log(&text, &check.name), LOG_LINES).0)
     }
 
+    fn merge(&self, repo: &RepoKey, number: u64, req: &MergeRequest) -> ForgeResult<()> {
+        self.act(&merge_args(repo, number, req)).map(drop)
+    }
+
+    fn set_state(&self, repo: &RepoKey, number: u64, change: StateChange) -> ForgeResult<()> {
+        self.act(&state_args(repo, number, change)).map(drop)
+    }
+
+    fn comment(&self, repo: &RepoKey, number: u64, body: &str) -> ForgeResult<()> {
+        self.act(&comment_args(repo, number, body)).map(drop)
+    }
+
+    /// A plain comment when there's nothing else to it; anything more is one
+    /// review, posted with its line comments in a single call.
+    fn review(&self, repo: &RepoKey, number: u64, review: &Review) -> ForgeResult<()> {
+        if review.verdict == Verdict::Comment && review.comments.is_empty() {
+            return self.comment(repo, number, &review.body);
+        }
+        let q = format!("query={}", review_mutation(review)?);
+        self.act(&["api".into(), "graphql".into(), "-f".into(), q, "--hostname".into(), self.host.clone()]).map(drop)
+    }
+
     /// `gh run rerun <run> --failed` for each workflow run with a failed job.
     fn rerun_failed_checks(&self, repo: &RepoKey, _number: u64, checks: &[Check]) -> ForgeResult<usize> {
         let all = rerun_commands(repo, checks);
@@ -160,6 +188,90 @@ impl Forge for GitHub {
 /// `-R` for gh's own commands: `HOST/OWNER/REPO` (they don't take `--hostname`).
 fn repo_flag(repo: &RepoKey) -> String {
     format!("{}/{}", repo.host, repo.path)
+}
+
+/// `gh pr merge`, never asking anything. The method is always named, the
+/// head commit pinned (so a push since isn't merged unseen), and `-R` keeps
+/// gh from touching the local checkout (deleting or switching branches).
+pub fn merge_args(repo: &RepoKey, number: u64, req: &MergeRequest) -> Vec<String> {
+    let mut a: Vec<String> = vec!["pr".into(), "merge".into(), number.to_string(), "-R".into(), repo_flag(repo)];
+    a.push(
+        match req.method {
+            MergeMethod::Squash => "--squash",
+            MergeMethod::Rebase => "--rebase",
+            MergeMethod::Merge | MergeMethod::FastForward => "--merge",
+        }
+        .into(),
+    );
+    if req.method == MergeMethod::Squash {
+        if !req.title.trim().is_empty() {
+            a.extend(["--subject".into(), req.title.trim().to_string()]);
+        }
+        a.extend(["--body".into(), req.message.trim().to_string()]);
+    }
+    if req.delete_branch {
+        a.push("--delete-branch".into());
+    }
+    if req.auto {
+        a.push("--auto".into());
+    }
+    if let Some(h) = &req.head {
+        a.extend(["--match-head-commit".into(), h.clone()]);
+    }
+    a
+}
+
+/// `gh pr ready` (or `--undo`), `gh pr close`, `gh pr reopen`.
+pub fn state_args(repo: &RepoKey, number: u64, change: StateChange) -> Vec<String> {
+    let n = number.to_string();
+    let words: &[&str] = match change {
+        StateChange::Ready => &["pr", "ready", &n],
+        StateChange::Draft => &["pr", "ready", &n, "--undo"],
+        StateChange::Close => &["pr", "close", &n],
+        StateChange::Reopen => &["pr", "reopen", &n],
+    };
+    let mut a: Vec<String> = words.iter().map(|w| w.to_string()).collect();
+    a.extend(["-R".into(), repo_flag(repo)]);
+    a
+}
+
+pub fn comment_args(repo: &RepoKey, number: u64, body: &str) -> Vec<String> {
+    vec!["pr".into(), "comment".into(), number.to_string(), "--body".into(), body.to_string(), "-R".into(), repo_flag(repo)]
+}
+
+/// One `addPullRequestReview` with the verdict, the text and every line
+/// comment (as review threads). Strings are written as JSON strings, which
+/// GraphQL reads the same way.
+pub fn review_mutation(r: &Review) -> ForgeResult<String> {
+    let q = |s: &str| serde_json::to_string(s).unwrap_or_default();
+    let event = match r.verdict {
+        Verdict::Comment => "COMMENT",
+        Verdict::Approve => "APPROVE",
+        Verdict::RequestChanges => "REQUEST_CHANGES",
+        Verdict::Unapprove => return Err(ForgeError::NotYet("take back an approval on GitHub")),
+    };
+    if r.pr_id.is_empty() {
+        return Err(ForgeError::Other("The pull request's details haven't been read yet".into()));
+    }
+    let threads: Vec<String> = r
+        .comments
+        .iter()
+        .map(|c| {
+            let side = match c.side {
+                Side::Before => "LEFT",
+                Side::After => "RIGHT",
+            };
+            let path = if c.side == Side::Before { c.old_path.as_deref().unwrap_or(&c.path) } else { &c.path };
+            let start = if c.start < c.end { format!(", startLine: {}, startSide: {side}", c.start) } else { String::new() };
+            format!("{{ path: {}, body: {}, line: {}, side: {side}{start} }}", q(path), q(&c.body), c.end)
+        })
+        .collect();
+    Ok(format!(
+        "mutation {{ addPullRequestReview(input: {{ pullRequestId: {}, event: {event}, body: {}, threads: [{}] }}) {{ pullRequestReview {{ url }} }} }}",
+        q(&r.pr_id),
+        q(&r.body),
+        threads.join(", ")
+    ))
 }
 
 /// `gh run view <run> --log-failed` for a workflow run.
@@ -536,7 +648,11 @@ fn pr_from(n: &PrNode) -> PullRequest {
 /// The pull request with its description, and what the viewer may do in the
 /// repository. The number is written into the query (it's a number).
 pub fn details_query(number: u64) -> String {
-    format!("query($owner: String!, $name: String!) {{ repository(owner: $owner, name: $name) {{ viewerPermission pullRequest(number: {number}) {{ ...pr body }} }} }} {PR_FRAGMENT}")
+    format!(
+        "query($owner: String!, $name: String!) {{ repository(owner: $owner, name: $name) {{ viewerPermission \
+mergeCommitAllowed squashMergeAllowed rebaseMergeAllowed autoMergeAllowed deleteBranchOnMerge \
+pullRequest(number: {number}) {{ ...pr body id viewerDidAuthor autoMergeRequest {{ enabledAt }} }} }} }} {PR_FRAGMENT}"
+    )
 }
 
 /// Every check on the pull request's latest commit: Actions jobs with their run,
@@ -567,22 +683,51 @@ pub struct DetailsData {
 #[serde(rename_all = "camelCase")]
 struct DetailsRepo {
     viewer_permission: Option<String>,
+    #[serde(default)]
+    merge_commit_allowed: bool,
+    #[serde(default)]
+    squash_merge_allowed: bool,
+    #[serde(default)]
+    rebase_merge_allowed: bool,
+    #[serde(default)]
+    auto_merge_allowed: bool,
+    #[serde(default)]
+    delete_branch_on_merge: bool,
     pull_request: Option<DetailsPr>,
 }
 
 #[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
 struct DetailsPr {
     #[serde(flatten)]
     pr: PrNode,
     #[serde(default)]
     body: String,
+    #[serde(default)]
+    id: String,
+    #[serde(default)]
+    viewer_did_author: bool,
+    auto_merge_request: Option<serde_json::Value>,
 }
 
 pub fn parse_details(data: DetailsData) -> ForgeResult<PrDetails> {
     let repo = data.repository.ok_or(ForgeError::NotFound)?;
     let p = repo.pull_request.ok_or(ForgeError::NotFound)?;
-    let can_rerun = matches!(repo.viewer_permission.as_deref(), Some("ADMIN" | "MAINTAIN" | "WRITE"));
-    Ok(PrDetails { pr: pr_from(&p.pr), body: p.body, can_rerun })
+    let writer = matches!(repo.viewer_permission.as_deref(), Some("ADMIN" | "MAINTAIN" | "WRITE"));
+    let methods = [(repo.merge_commit_allowed, MergeMethod::Merge), (repo.squash_merge_allowed, MergeMethod::Squash), (repo.rebase_merge_allowed, MergeMethod::Rebase)];
+    let merge = MergeFacts {
+        node_id: p.id,
+        status: p.pr.merge_state_status.clone().unwrap_or_default(),
+        viewer_is_author: p.viewer_did_author,
+        viewer_approved: false,
+        can_merge: writer,
+        methods: methods.iter().filter(|m| m.0).map(|m| m.1).collect(),
+        auto_merge_allowed: repo.auto_merge_allowed,
+        auto_merge_on: p.auto_merge_request.is_some_and(|v| !v.is_null()),
+        delete_branch: repo.delete_branch_on_merge,
+        diff_refs: None,
+    };
+    Ok(PrDetails { pr: pr_from(&p.pr), body: p.body, can_rerun: writer, merge })
 }
 
 #[derive(Deserialize)]
@@ -1024,4 +1169,78 @@ mod tests {
         let denied = GitHub { cli: Arc::new(StubCli::default().on(Tool::Gh, &["run", "rerun"], Answer::Fail(1, "HTTP 403: Must have admin rights to Repository."))), host: "github.com".into(), dir: None };
         assert!(matches!(denied.rerun_failed_checks(&key, 13, &checks), Err(ForgeError::Other(m)) if m.contains("403")));
     }
+
+    /// Each details fixture, as the merge dialog shows what's in the way.
+    #[test]
+    fn merge_methods_and_blockers_come_with_the_details() {
+        let d = parse_details(gql(DETAILS)).unwrap();
+        let m = &d.merge;
+        assert_eq!(m.methods, [MergeMethod::Merge, MergeMethod::Squash], "rebase isn't allowed here");
+        assert_eq!((m.node_id.as_str(), m.status.as_str()), ("PR_kwDOAbc123", "BLOCKED"));
+        assert!(m.can_merge && m.auto_merge_allowed && m.delete_branch && !m.auto_merge_on && !m.viewer_is_author);
+        let words = |json: &str| -> Vec<String> {
+            let d = parse_details(gql(json)).unwrap();
+            blockers(ForgeKind::GitHub, &d.pr, &d.merge, None).iter().map(|b| b.text(ForgeKind::GitHub, &d.pr.base_branch)).collect()
+        };
+        assert_eq!(words(DETAILS), ["Changes were requested", "Required checks are failing"]);
+        assert_eq!(words(include_str!("fixtures/gh-pr-details-clean.json")), Vec::<String>::new());
+        assert_eq!(words(include_str!("fixtures/gh-pr-details-behind.json")), ["main has moved on: the branch must be brought up to date first"]);
+        assert_eq!(words(include_str!("fixtures/gh-pr-details-dirty.json")), ["It has conflicts with main that must be resolved first"]);
+        assert_eq!(words(include_str!("fixtures/gh-pr-details-draft.json")), ["It's a draft: mark it ready for review first"]);
+
+        let clean = parse_details(gql(include_str!("fixtures/gh-pr-details-clean.json"))).unwrap();
+        assert!(clean.merge.viewer_is_author && clean.merge.auto_merge_on);
+        // Changes requested doesn't clear by itself, so auto-merge isn't offered.
+        let b = blockers(ForgeKind::GitHub, &d.pr, &d.merge, None);
+        assert_eq!(merge_ready(ForgeKind::GitHub, "main", &d.merge, &b), MergeReady::Blocked("Changes were requested".into()));
+        let waiting = [Blocker::ChecksPending, Blocker::ReviewRequired];
+        assert_eq!(merge_ready(ForgeKind::GitHub, "main", &d.merge, &waiting), MergeReady::Auto);
+        let no_auto = MergeFacts { auto_merge_allowed: false, ..d.merge.clone() };
+        assert_eq!(merge_ready(ForgeKind::GitHub, "main", &no_auto, &waiting), MergeReady::Blocked("Required checks are still running".into()));
+        assert_eq!(merge_ready(ForgeKind::GitHub, "main", &d.merge, &[]), MergeReady::Now);
+    }
+
+    #[test]
+    fn merging_reviewing_and_state_changes_are_gh_commands() {
+        let key = RepoKey { host: "github.acme.com".into(), path: "team/app".into() };
+        let squash = MergeRequest { method: MergeMethod::Squash, title: "Search (#12)".into(), message: "* Add search\n\n* Fix it".into(), delete_branch: true, auto: false, head: Some("abc123".into()) };
+        assert_eq!(
+            merge_args(&key, 12, &squash),
+            ["pr", "merge", "12", "-R", "github.acme.com/team/app", "--squash", "--subject", "Search (#12)", "--body", "* Add search\n\n* Fix it", "--delete-branch", "--match-head-commit", "abc123"]
+        );
+        let auto = MergeRequest { method: MergeMethod::Rebase, delete_branch: false, auto: true, head: None, ..squash.clone() };
+        assert_eq!(merge_args(&key, 12, &auto), ["pr", "merge", "12", "-R", "github.acme.com/team/app", "--rebase", "--auto"]);
+        assert_eq!(state_args(&key, 3, StateChange::Draft), ["pr", "ready", "3", "--undo", "-R", "github.acme.com/team/app"]);
+        assert_eq!(state_args(&key, 3, StateChange::Close), ["pr", "close", "3", "-R", "github.acme.com/team/app"]);
+        assert_eq!(state_args(&key, 3, StateChange::Reopen), ["pr", "reopen", "3", "-R", "github.acme.com/team/app"]);
+        assert_eq!(comment_args(&key, 3, "Nice"), ["pr", "comment", "3", "--body", "Nice", "-R", "github.acme.com/team/app"]);
+
+        let line = |side, start, end| LineComment { path: "src/a \"b\".rs".into(), old_path: None, side, start, end, old_line: None, new_line: Some(end), body: "Why?\nReally".into() };
+        let review = Review { verdict: Verdict::RequestChanges, body: "See notes".into(), comments: vec![line(Side::After, 3, 5), line(Side::Before, 9, 9)], pr_id: "PR_1".into() };
+        assert_eq!(
+            review_mutation(&review).unwrap(),
+            "mutation { addPullRequestReview(input: { pullRequestId: \"PR_1\", event: REQUEST_CHANGES, body: \"See notes\", threads: [\
+{ path: \"src/a \\\"b\\\".rs\", body: \"Why?\\nReally\", line: 5, side: RIGHT, startLine: 3, startSide: RIGHT }, \
+{ path: \"src/a \\\"b\\\".rs\", body: \"Why?\\nReally\", line: 9, side: LEFT }] }) { pullRequestReview { url } } }"
+        );
+
+        // A plain comment is `gh pr comment`; a review is one GraphQL call. A refusal keeps gh's words.
+        let cli = Arc::new(StubCli::default().on(Tool::Gh, &["pr", "comment"], Answer::Ok("")).on(Tool::Gh, &["api", "graphql"], Answer::Ok("{}")));
+        let gh = GitHub { cli: cli.clone(), host: "github.acme.com".into(), dir: None };
+        gh.review(&key, 3, &Review { verdict: Verdict::Comment, body: "Hi".into(), comments: vec![], pr_id: "PR_1".into() }).unwrap();
+        gh.review(&key, 3, &Review { verdict: Verdict::Approve, body: String::new(), comments: vec![], pr_id: "PR_1".into() }).unwrap();
+        let calls = cli.calls();
+        assert_eq!(calls[0].1[..2], ["pr", "comment"]);
+        assert!(calls[1].1[3].contains("event: APPROVE") && calls[1].1.ends_with(&["--hostname".to_string(), "github.acme.com".to_string()]));
+        let refused = GitHub {
+            cli: Arc::new(StubCli::default().on(Tool::Gh, &["pr", "merge"], Answer::Fail(1, "X Pull request team/app#12 is not mergeable: the base branch policy prohibits the merge.\nTo have the pull request merged after all the requirements have been met, add the `--auto` flag."))),
+            host: "github.acme.com".into(),
+            dir: None,
+        };
+        assert_eq!(
+            refused.merge(&key, 12, &squash).unwrap_err().to_string(),
+            "X Pull request team/app#12 is not mergeable: the base branch policy prohibits the merge.\nTo have the pull request merged after all the requirements have been met, add the `--auto` flag."
+        );
+    }
+
 }

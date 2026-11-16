@@ -8,7 +8,7 @@ use crate::workspace::{Config, Workspace};
 use crate::fileview::{self, FileView, Mode};
 use crate::resolver::Resolver;
 use crate::forge::{self, cache::Reason};
-use crate::{cmdlog, diffmodel, highlight, markdown, newpr, overview, preview, prview, views};
+use crate::{cmdlog, diffmodel, highlight, markdown, newpr, overview, preview, prmerge, prview, views};
 use egui::{Align, Color32, CornerRadius, Id, Layout, Margin, RichText, Sense, Stroke, Ui};
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
@@ -822,6 +822,8 @@ enum Msg {
     PrMeta { key: forge::RepoKey, result: Result<forge::PrMeta, String> },
     /// A part of an open pull request view (`id`: which opening it's for).
     PrPart { repo: PathBuf, id: u64, part: PrPart },
+    /// The messages of a pull request's commits, for the merge dialog's squash message.
+    MergeMessages { repo: PathBuf, number: u64, result: Result<Vec<String>, String> },
 }
 
 /// One section of a pull request view, read on a worker.
@@ -846,6 +848,10 @@ pub enum OpKind {
     Reword,
     /// An undo; the output says what was undone.
     Undo,
+    /// Something done on GitHub or GitLab (a merge, a review…): says nothing
+    /// itself when it works (its follow-up does), and a refusal is shown in
+    /// the forge's own words.
+    Forge,
 }
 
 /// Save what a git action changes, so it can be undone.
@@ -923,6 +929,10 @@ pub enum Action {
     /// How diffs are shown changed: show the open ones that way, reading them
     /// again (`reload`) when what they contain changes.
     DiffPrefsChanged { reload: bool },
+    /// Merge the pull request in the merge dialog.
+    SubmitMerge,
+    /// Run a git action, then `then` once it has worked.
+    Then { first: Box<Action>, then: Box<Action> },
 }
 
 impl Action {
@@ -989,6 +999,23 @@ pub enum FollowUp {
     Forget(PathBuf),
     /// A pull request was created (the action puts it in `slot`).
     PrCreated { key: forge::RepoKey, slot: Arc<Mutex<Option<forge::PullRequest>>> },
+    /// A comment, review or state change was posted: say so, clear what was
+    /// sent, and read the pull request again.
+    PrPosted { number: u64, sent: Sent, done: String },
+    /// A pull request was merged (or set to merge by itself).
+    PrMerged { number: u64, base: String, remote: String, auto: bool, done: String, method: forge::MergeMethod, local: Option<(String, bool)>, delete_local: bool },
+    /// Do this next.
+    Then(Box<Action>),
+}
+
+/// What a post took from the view, to clear once it's on the forge.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Sent {
+    /// The comment box (and the review's line comments).
+    Draft,
+    /// The comment on picked lines.
+    LineDraft,
+    Nothing,
 }
 
 pub enum Dialog {
@@ -1016,6 +1043,7 @@ pub enum Dialog {
     },
     Confirm { title: String, body: String, button: String, danger: bool, then: Option<Box<Action>> },
     CreatePr(Box<newpr::PrDraft>),
+    MergePr(Box<prmerge::MergeDraft>),
     /// Find a file or folder by name, to blame it or see its history.
     FindFile {
         repo: PathBuf,
@@ -1090,6 +1118,9 @@ pub struct HeadwayApp {
     forge_after_load: HashMap<PathBuf, Reason>,
     /// The people and labels each project's new pull requests can name.
     pr_meta: HashMap<forge::RepoKey, Arc<forge::PrMeta>>,
+    /// Comments written in pull request views and not posted yet, kept while
+    /// the view is closed: (repository, number).
+    pr_drafts: HashMap<(PathBuf, u64), prview::ReviewDraft>,
     /// When the poll timer last looked (seconds of app time).
     forge_polled: f64,
 }
@@ -1129,6 +1160,7 @@ impl HeadwayApp {
             forge_repos: HashMap::new(),
             forge_after_load: HashMap::new(),
             pr_meta: HashMap::new(),
+            pr_drafts: HashMap::new(),
             forge_polled: f64::NEG_INFINITY,
             shot: screenshot.map(|path| Shot {
                 path,
@@ -1767,7 +1799,11 @@ impl HeadwayApp {
             pv.shown = true;
             return;
         }
-        rv.pr_view = Some(prview::PrView::new(pr, kind, id));
+        let mut pv = prview::PrView::new(pr, kind, id);
+        pv.draft = self.pr_drafts.remove(&(repo.clone(), pv.pr.number)).unwrap_or_default();
+        if let Some(old) = rv.pr_view.replace(pv) {
+            stash_draft(&mut self.pr_drafts, &repo, old);
+        }
         self.pr_view_load(&repo, true);
     }
 
@@ -1854,7 +1890,9 @@ impl HeadwayApp {
         let (id, number, kind) = (pv.id, pv.pr.number, pv.kind);
         match o {
             PrOp::Close => {
-                rv.pr_view = None;
+                if let Some(old) = rv.pr_view.take() {
+                    stash_draft(&mut self.pr_drafts, repo, old);
+                }
                 // Back to the blame or history it was opened over, if any.
                 if let Some(fv) = rv.file_view.as_mut() {
                     fv.shown = true;
@@ -1899,7 +1937,153 @@ impl HeadwayApp {
                     Msg::PrPart { repo: p, id, part: PrPart::Rerun(f.rerun_failed_checks(&key, number, &checks).map_err(|e| e.to_string())) }
                 });
             }
+            PrOp::Post(verdict) => {
+                if pv.post_blocked(verdict).is_some() {
+                    return;
+                }
+                let Some(key) = forge else { return };
+                let review = forge::Review {
+                    verdict,
+                    body: pv.draft.text.trim().to_string(),
+                    comments: pv.draft.pending.clone(),
+                    pr_id: pv.facts.as_ref().map(|m| m.node_id.clone()).unwrap_or_default(),
+                };
+                let n = pv.number();
+                let (label, done) = match verdict {
+                    forge::Verdict::Comment if review.comments.is_empty() => (format!("Comment on {n}"), format!("Commented on {n}")),
+                    forge::Verdict::Comment => (format!("Review {n}"), format!("Posted your review of {n}")),
+                    forge::Verdict::Approve => (format!("Approve {n}"), format!("Approved {n}")),
+                    forge::Verdict::RequestChanges => (format!("Request changes on {n}"), format!("Requested changes on {n}")),
+                    forge::Verdict::Unapprove => (format!("Revoke approval of {n}"), format!("Took back your approval of {n}")),
+                };
+                pv.posting = true;
+                let f = self.forges.forge(kind, &key.host, Some(repo));
+                let op: GitFn = Box::new(move |_| f.review(&key, number, &review).map(|_| String::new()).map_err(|e| e.to_string()));
+                let id = self.run_git(repo.to_path_buf(), label, op, OpKind::Forge, None);
+                self.followups.insert(id, FollowUp::PrPosted { number, sent: Sent::Draft, done });
+            }
+            PrOp::AddLineComment => {
+                let Some(d) = pv.line_draft.as_ref().filter(|d| !d.text.trim().is_empty()) else { return };
+                let comment = forge::LineComment { body: d.text.trim().to_string(), ..d.at.clone() };
+                if kind == forge::ForgeKind::GitHub {
+                    // Kept for the review, which goes out from the comment box.
+                    pv.draft.pending.push(comment);
+                    pv.line_draft = None;
+                    pv.files_sel = LineSel::default();
+                    let n = pv.draft.pending.len();
+                    self.toast(format!("Added to your review ({n} line comment{}): submit it from Conversation", if n == 1 { "" } else { "s" }), false);
+                    return;
+                }
+                let Some(key) = forge else { return };
+                let Some(refs) = pv.facts.as_ref().and_then(|m| m.diff_refs.clone()) else {
+                    self.toast("Can't place the comment yet: the merge request's details are still loading".to_string(), true);
+                    return;
+                };
+                pv.posting = true;
+                let place = comment.place();
+                let f = self.forges.forge(kind, &key.host, Some(repo));
+                let op: GitFn = Box::new(move |_| f.line_comment(&key, number, &comment, &refs).map(|_| String::new()).map_err(|e| e.to_string()));
+                let label = format!("Comment on {place}");
+                let id = self.run_git(repo.to_path_buf(), label, op, OpKind::Forge, None);
+                self.followups.insert(id, FollowUp::PrPosted { number, sent: Sent::LineDraft, done: format!("Commented on {place}") });
+            }
+            PrOp::SetState(change) => {
+                let Some(key) = forge else { return };
+                pv.posting = true;
+                let n = pv.number();
+                let (label, done) = match change {
+                    forge::StateChange::Ready => (format!("Mark {n} ready for review"), format!("{n} is ready for review")),
+                    forge::StateChange::Draft => (format!("Convert {n} to a draft"), format!("{n} is a draft now")),
+                    forge::StateChange::Close => (format!("Close {n}"), format!("Closed {n}")),
+                    forge::StateChange::Reopen => (format!("Reopen {n}"), format!("Reopened {n}")),
+                };
+                let f = self.forges.forge(kind, &key.host, Some(repo));
+                let op: GitFn = Box::new(move |_| f.set_state(&key, number, change).map(|_| String::new()).map_err(|e| e.to_string()));
+                let id = self.run_git(repo.to_path_buf(), label, op, OpKind::Forge, None);
+                self.followups.insert(id, FollowUp::PrPosted { number, sent: Sent::Nothing, done });
+            }
+            PrOp::Merge => self.open_merge(repo),
         }
+    }
+
+    /// Read pull request `number` again if it's in the view (after something
+    /// was done to it).
+    fn pr_view_reread(&mut self, repo: &Path, number: u64) {
+        if self.tabs.get(repo).and_then(|rv| rv.pr_view.as_ref()).is_some_and(|pv| pv.pr.number == number) {
+            self.pr_view_load(repo, false);
+        }
+    }
+
+    /// Open the merge dialog for the pull request in the view, and read its
+    /// commits' messages (for a squash) on a worker.
+    fn open_merge(&mut self, repo: &Path) {
+        let Some(r) = self.forge_repos.get(repo) else { return };
+        let (key, remote) = (r.remotes.key(), r.remotes.pr_remote.clone());
+        let Some(rv) = self.tabs.get(repo) else { return };
+        let Some(pv) = rv.pr_view.as_ref() else { return };
+        let Some(facts) = pv.facts.clone() else { return };
+        let mut pr = pv.pr.clone();
+        // What's merged is the head the view showed.
+        let head = match &pv.head {
+            Some(Ok((h, _))) => Some(h.clone()),
+            _ => pr.head_oid.clone(),
+        };
+        pr.head_oid = head.clone();
+        // The local branch for it: named like its branch, or pr/N from checking it
+        // out; and whether it's still at what's merged (so deleting it loses nothing).
+        let local = rv.data.as_ref().and_then(|d| {
+            let names = [pr.head_branch.clone(), format!("pr/{}", pr.number)];
+            let b = d.branches.iter().filter(|b| !b.remote).find(|b| names.contains(&b.name) && (pr.head_repo.is_none() || b.name.starts_with("pr/") || b.upstream_remote.as_deref() != Some(remote.as_str())))?;
+            Some((b.name.clone(), head.as_deref() == Some(b.tip.as_str())))
+        });
+        let last = self.cfg.merge_methods.get(repo).copied();
+        let d = prmerge::MergeDraft::new(repo.to_path_buf(), pv.kind, key, &pr, &facts, pv.blockers(), last, local);
+        self.dialog = Some(Dialog::MergePr(Box::new(d)));
+        let (p, number, base) = (repo.to_path_buf(), pr.number, format!("{remote}/{}", pr.base_branch));
+        self.spawn(move || {
+            let _name = cmdlog::named("read commit messages");
+            let result = match head {
+                Some(h) => git::commit_messages(&p, &h, &base).map_err(|e| e.to_string()),
+                None => Err("The head commit isn't here".into()),
+            };
+            Msg::MergeMessages { repo: p, number, result }
+        });
+    }
+
+    /// Merge what the dialog says (one action in the command log), then fetch
+    /// so the merge is here too.
+    fn submit_merge(&mut self) {
+        let Some(Dialog::MergePr(d)) = &mut self.dialog else { return };
+        if d.merging {
+            return;
+        }
+        let Some(remote) = self.forge_repos.get(&d.repo).map(|r| r.remotes.pr_remote.clone()) else { return };
+        d.merging = true;
+        d.error = None;
+        let req = d.request();
+        let f = self.forges.forge(d.kind, &d.key.host, Some(&d.repo));
+        let (repo, key, number) = (d.repo.clone(), d.key.clone(), d.number);
+        let n = d.number_text();
+        let label = if req.auto { format!("Turn on auto-merge for {n}") } else { format!("{} {n}", req.method.verb()) };
+        let done = if req.auto {
+            format!("Auto-merge is on: {} merges {n} once its checks and reviews are done", d.kind.name())
+        } else {
+            format!("Merged {n} into {}", d.base)
+        };
+        let follow = FollowUp::PrMerged { number, base: d.base.clone(), remote: remote.clone(), auto: req.auto, done, method: req.method, local: d.local.clone(), delete_local: d.delete_local };
+        let op: GitFn = Box::new(move |p| {
+            f.merge(&key, number, &req).map_err(|e| e.to_string())?;
+            if req.auto {
+                return Ok(String::new());
+            }
+            // Bring the merge here; it's merged even if this fails.
+            Ok(match git::run(p, &["fetch", "--prune", &remote]) {
+                Ok(_) => String::new(),
+                Err(e) => format!("Merged, but fetching {remote} failed: {e}"),
+            })
+        });
+        let id = self.run_git(repo, label, op, OpKind::Forge, None);
+        self.followups.insert(id, follow);
     }
 
     fn on_pr_part(&mut self, repo: PathBuf, id: u64, part: PrPart) {
@@ -1911,6 +2095,7 @@ impl HeadwayApp {
                     let head = d.pr.head_oid.clone().or(pv.pr.head_oid.take());
                     pv.pr = forge::PullRequest { head_oid: head, ..d.pr };
                     pv.can_rerun = Some(d.can_rerun);
+                    pv.facts = Some(d.merge);
                     pv.body = Some(Ok(doc));
                 }
                 // A refresh that failed keeps the description already shown.
@@ -2299,6 +2484,12 @@ impl HeadwayApp {
                     self.busy.retain(|b| b.0 != id);
                     let follow = self.followups.remove(&id);
                     let mut after = None;
+                    let mut next: Vec<Action> = Vec::new();
+                    if matches!(follow, Some(FollowUp::PrPosted { .. } | FollowUp::PrMerged { .. }))
+                        && let Some(pv) = self.tabs.get_mut(&repo).and_then(|rv| rv.pr_view.as_mut())
+                    {
+                        pv.posting = false;
+                    }
                     match result {
                         Ok(out) => {
                             match follow {
@@ -2315,6 +2506,66 @@ impl HeadwayApp {
                                     // Ask again once the branches are read (it may have been pushed just now).
                                     after = Some(Reason::AfterPrAction);
                                 }
+                                Some(FollowUp::PrPosted { number, sent, done }) => {
+                                    if let Some(pv) = self.tabs.get_mut(&repo).and_then(|rv| rv.pr_view.as_mut()).filter(|pv| pv.pr.number == number) {
+                                        match sent {
+                                            Sent::Draft => {
+                                                pv.draft = prview::ReviewDraft::default();
+                                                pv.preview = None;
+                                            }
+                                            Sent::LineDraft => {
+                                                pv.line_draft = None;
+                                                pv.files_sel = LineSel::default();
+                                            }
+                                            Sent::Nothing => {}
+                                        }
+                                    }
+                                    if sent == Sent::Draft {
+                                        self.pr_drafts.remove(&(repo.clone(), number));
+                                    }
+                                    self.toast(done, false);
+                                    self.pr_view_reread(&repo, number);
+                                    after = Some(Reason::AfterPrAction);
+                                }
+                                Some(FollowUp::PrMerged { number, base, remote, auto, done, method, local, delete_local }) => {
+                                    if matches!(&self.dialog, Some(Dialog::MergePr(d)) if d.repo == repo) {
+                                        self.dialog = None;
+                                    }
+                                    self.cfg.merge_methods.insert(repo.clone(), method);
+                                    self.save();
+                                    match out.trim() {
+                                        "" => self.toast(done, false),
+                                        note => self.toast(format!("{done}\n{note}"), true),
+                                    }
+                                    self.pr_view_reread(&repo, number);
+                                    after = Some(Reason::AfterPrAction);
+                                    if !auto {
+                                        let current = self.tabs.get(&repo).and_then(|rv| rv.head_branch()).map(|b| b.trim_start_matches("refs/heads/").to_string());
+                                        let plan = prmerge::after_merge(local.as_ref().map(|l| l.0.as_str()), current.as_deref(), delete_local);
+                                        let force = local.as_ref().is_some_and(|l| l.1);
+                                        if let Some(name) = &plan.delete_now {
+                                            next.push(views::delete_branch(&repo, name, force));
+                                        }
+                                        if plan.offer_switch {
+                                            let name = local.as_ref().map(|l| l.0.clone()).unwrap_or_default();
+                                            let (rem, b2) = (remote.clone(), base.clone());
+                                            let switch = Action::git(&repo, format!("Switch to {base} and pull"), move |p| git::switch_and_pull(p, &rem, &b2))
+                                            .undoable(git::Undoable::Tree { save_work: false }, format!("switch to {base} and pull"));
+                                            let (then, more) = match &plan.delete_after_switch {
+                                                Some(n) => (Action::Then { first: Box::new(switch), then: Box::new(views::delete_branch(&repo, n, force)) }, format!(" Then “{n}” is deleted.")),
+                                                None => (switch, String::new()),
+                                            };
+                                            next.push(Action::confirm(
+                                                &format!("Switch to {base}?"),
+                                                format!("You're on “{name}”, which was just merged. Switch to {base} and pull, so the merge is here?{more}"),
+                                                "Switch and pull",
+                                                false,
+                                                then,
+                                            ));
+                                        }
+                                    }
+                                }
+                                Some(FollowUp::Then(a)) => next.push(*a),
                                 None => {}
                             }
                             if kind == OpKind::Commit {
@@ -2330,7 +2581,7 @@ impl HeadwayApp {
                                     rv.detail = None;
                                 }
                             }
-                            if kind != OpKind::Quiet || undo.is_some() {
+                            if !matches!(kind, OpKind::Quiet | OpKind::Forge) || undo.is_some() {
                                 let extra = out.lines().rev().find(|l| !l.trim().is_empty()).unwrap_or("");
                                 let msg = if kind == OpKind::Reword {
                                     "Commit message updated".to_string()
@@ -2363,6 +2614,10 @@ impl HeadwayApp {
                                 d.creating = false;
                                 d.error = Some(e);
                             }
+                            (Some(FollowUp::PrMerged { .. }), Some(Dialog::MergePr(d))) if d.repo == repo => {
+                                d.merging = false;
+                                d.error = Some(e);
+                            }
                             _ => self.toast(failure_text(&label, kind, &e), true),
                         },
                     }
@@ -2377,6 +2632,18 @@ impl HeadwayApp {
                     self.reload_summary(&repo);
                     if touches_remote(&label) {
                         self.forge_refresh(&repo, Reason::AfterGit);
+                    }
+                    for a in next {
+                        self.do_action(a);
+                    }
+                }
+                Msg::MergeMessages { repo, number, result } => {
+                    if let Some(Dialog::MergePr(d)) = &mut self.dialog
+                        && d.repo == repo
+                        && d.number == number
+                    {
+                        // Without them, the title and an empty message stay.
+                        d.messages_read(&result.unwrap_or_default());
                     }
                 }
                 Msg::PrPrep { repo, generation, base, result } => {
@@ -2848,6 +3115,17 @@ impl HeadwayApp {
                 let id = self.run_git(repo, label, op, OpKind::Normal, None);
                 self.followups.insert(id, then);
             }
+            Action::Then { first, then } => match *first {
+                Action::Git { repo, label, op, kind, record } => {
+                    let id = self.run_git(repo, label, op, kind, record);
+                    self.followups.insert(id, FollowUp::Then(then));
+                }
+                other => {
+                    self.do_action(other);
+                    self.do_action(*then);
+                }
+            },
+            Action::SubmitMerge => self.submit_merge(),
             Action::Undo { repo, id } => {
                 // One at a time: a second press would race the first.
                 if !self.busy.iter().any(|b| b.1 == repo && b.2 == "Undo") {
@@ -3527,6 +3805,11 @@ impl HeadwayApp {
                         keep = false;
                     }
                 }
+                Dialog::MergePr(d) => match prmerge::ui(ui, d) {
+                    prmerge::Outcome::Keep => {}
+                    prmerge::Outcome::Close => keep = false,
+                    prmerge::Outcome::Merge => actions.push(Action::SubmitMerge),
+                },
                 Dialog::CreatePr(d) => match newpr::ui(ui, d) {
                     newpr::Outcome::Keep => {}
                     newpr::Outcome::Close => keep = false,
@@ -3851,10 +4134,22 @@ fn touches_remote(label: &str) -> bool {
     matches!(label.split_whitespace().next(), Some("Fetch" | "Pull" | "Push"))
 }
 
+/// Keep what was written in a pull request view that's going away.
+fn stash_draft(drafts: &mut HashMap<(PathBuf, u64), prview::ReviewDraft>, repo: &Path, pv: prview::PrView) {
+    let key = (repo.to_path_buf(), pv.pr.number);
+    if pv.draft.is_empty() {
+        drafts.remove(&key);
+    } else {
+        drafts.insert(key, prview::ReviewDraft { preview: false, ..pv.draft });
+    }
+}
+
 fn failure_text(label: &str, kind: OpKind, e: &str) -> String {
     match kind {
         // Undo explains itself; git's hints would only confuse.
         OpKind::Undo => format!("Couldn't undo\n{e}"),
+        // The forge's reason, whole: git's hints don't apply to it.
+        OpKind::Forge => format!("{label} failed\n{e}"),
         _ => format!("{label} failed\n{}", friendly_error(e)),
     }
 }

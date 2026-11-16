@@ -29,3 +29,14 @@ Answers from `gh` and `glab`, read by the parsing tests. Tests never call the ne
   the same for a merge request, by hand from GitLab's GraphQL documentation:
   jobs allowed to fail, a manual one, a running one; notes on the diff and
   GitLab's own notes.
+- `gh-pr-details-clean.json`, `-behind.json`, `-dirty.json`, `-draft.json`:
+  `gh-pr-details.json` with another `mergeStateStatus` (and what goes with
+  it), one per thing that can stand in the way of merging. The details carry
+  the repository's merge settings (`mergeCommitAllowed`, `autoMergeAllowed`,
+  `deleteBranchOnMerge`, …) and the pull request's `id`, `viewerDidAuthor` and
+  `autoMergeRequest`.
+- `glab-mr-details-rebase.json`, `glab-mr-details-ci.json`: the same for a
+  merge request's `detailedMergeStatus` (`NEED_REBASE`, `CI_MUST_PASS` without
+  permission to merge). The details carry `currentUser`, `userPermissions`,
+  `approvedBy` and `diffRefs`; the merge methods come from
+  `glab-project.json`'s `merge_method` and `squash_option`.
