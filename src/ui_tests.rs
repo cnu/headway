@@ -3315,3 +3315,400 @@ fn fixup_into_folds_staged_changes_into_a_picked_commit() {
     ctrl(&mut h, egui::Key::Z);
     assert_eq!(git_ok(&r, &["status", "--porcelain"]).trim(), "M  f2.txt", "undo brings the staged change back");
 }
+
+// ---------------------------------------------------------------------------
+// Command palette and keyboard shortcuts
+
+/// The app on one repository, with these changes to the settings (key bindings).
+fn app_with_keys(s: &Scratch, r: &Path, keys: &[(&str, &str)]) -> Harness<'static, HeadwayApp> {
+    let mut ws = Workspace::new("Office");
+    ws.repos = vec![r.to_path_buf()];
+    ws.open_tabs = vec![r.to_path_buf()];
+    ws.active_tab = Some(0);
+    let mut cfg = Config::for_test(vec![ws], s.root.join("settings.json"));
+    for (k, v) in keys {
+        cfg.keybindings.insert(k.to_string(), v.to_string());
+    }
+    app_with(cfg, egui::vec2(1600.0, 1000.0))
+}
+
+fn ctrl_shift(h: &mut Harness<'static, HeadwayApp>, k: egui::Key) {
+    h.key_press_modifiers(egui::Modifiers::COMMAND | egui::Modifiers::SHIFT, k);
+    settle(h);
+}
+
+#[test]
+fn the_palette_opens_runs_an_action_and_remembers_it() {
+    let s = scratch("palette");
+    let r = new_repo(&s.root, "shop");
+    commit(&r, "a.txt", "one\n", "Start shop");
+    write(&r, "b.txt", "new\n");
+    let mut h = app(&s, &[&r], true);
+
+    // Ctrl+Shift+P is the palette; it must not also open "Find file" (Ctrl+P).
+    ctrl_shift(&mut h, egui::Key::P);
+    assert!(shows(&h, "Command palette") && !shows(&h, "Find file"));
+    assert!(shows(&h, "Stage all changes"), "the list starts with the actions");
+    type_text(&mut h, "stage all");
+    key(&mut h, egui::Key::Enter);
+    assert_eq!(staged_files(&r), ["b.txt"]);
+    assert!(!shows(&h, "Command palette"), "it closes after running");
+    assert_eq!(h.state().cfg.recent_actions, ["stage.all"]);
+
+    // Ctrl+K opens it again, Escape closes it, and Ctrl+P still finds files.
+    ctrl(&mut h, egui::Key::K);
+    assert!(shows(&h, "Command palette"));
+    key(&mut h, egui::Key::Escape);
+    assert!(!shows(&h, "Command palette"));
+    ctrl(&mut h, egui::Key::P);
+    assert!(shows(&h, "Find file") && !shows(&h, "Command palette"));
+    key(&mut h, egui::Key::Escape);
+
+    // An action that can't run now says why instead of doing nothing.
+    ctrl(&mut h, egui::Key::K);
+    type_text(&mut h, "pull");
+    key(&mut h, egui::Key::Enter);
+    assert!(shows(&h, "This repository has no remote"));
+}
+
+#[test]
+fn hash_in_the_palette_jumps_to_a_branch() {
+    let s = scratch("palette-branch");
+    let r = new_repo(&s.root, "shop");
+    commit(&r, "a.txt", "one\n", "Start shop");
+    git_ok(&r, &["branch", "feature"]);
+    git_ok(&r, &["branch", "search-ready"]);
+    let mut h = app(&s, &[&r], true);
+    assert_eq!(branch(&r), "main");
+
+    // The sidebar names each branch once; the palette adds a row for each match.
+    let seen = |h: &Harness<'static, HeadwayApp>, name: &str| h.query_all_by_label(name).count();
+    let (feature, ready) = (seen(&h, "feature"), seen(&h, "search-ready"));
+    ctrl(&mut h, egui::Key::K);
+    type_text(&mut h, "#feat");
+    assert_eq!((seen(&h, "feature"), seen(&h, "search-ready")), (feature + 1, ready), "only matching branches");
+    key(&mut h, egui::Key::Enter);
+    assert_eq!(branch(&r), "feature");
+    assert!(!shows(&h, "Command palette"));
+
+    // The arrow keys pick another row; ":" finds commits and "@" repositories.
+    ctrl(&mut h, egui::Key::K);
+    type_text(&mut h, "#");
+    key(&mut h, egui::Key::ArrowDown);
+    key(&mut h, egui::Key::ArrowDown);
+    key(&mut h, egui::Key::Enter);
+    assert_ne!(branch(&r), "feature", "a different branch was picked with the arrows");
+    ctrl(&mut h, egui::Key::K);
+    type_text(&mut h, ":start");
+    assert!(shows(&h, "Start shop"));
+    key(&mut h, egui::Key::Escape);
+    ctrl(&mut h, egui::Key::K);
+    type_text(&mut h, "@sho");
+    assert!(shows(&h, "shop"));
+    key(&mut h, egui::Key::Escape);
+}
+
+#[test]
+fn slash_in_the_palette_blames_a_file() {
+    let s = scratch("palette-file");
+    let r = new_repo(&s.root, "shop");
+    commit(&r, "readme.md", "hello\n", "Start shop");
+    commit(&r, "cart.rs", "fn cart() {}\n", "Add cart");
+    let mut h = app(&s, &[&r], true);
+    ctrl(&mut h, egui::Key::K);
+    type_text(&mut h, "/cart");
+    assert!(shows(&h, "cart.rs") && !shows(&h, "readme.md"));
+    key(&mut h, egui::Key::Enter);
+    assert!(h.state().tabs[&r].file_view.as_ref().is_some_and(|f| f.shown), "the file's blame opens");
+}
+
+#[test]
+fn shortcuts_can_be_rebound_and_the_cheat_sheet_lists_them() {
+    let s = scratch("rebind");
+    let r = new_repo(&s.root, "shop");
+    commit(&r, "a.txt", "one\n", "Start shop");
+    let mut h = app_with_keys(&s, &r, &[("view.sidebar", "Ctrl+J"), ("view.refresh", "none")]);
+    assert!(shows(&h, "Add remote…"));
+    // The old key does nothing now; the new one works.
+    ctrl(&mut h, egui::Key::B);
+    assert!(shows(&h, "Add remote…"));
+    ctrl(&mut h, egui::Key::J);
+    assert!(!shows(&h, "Add remote…"));
+    assert!(!h.state().cfg.view.sidebar_open);
+    ctrl(&mut h, egui::Key::J);
+    assert!(shows(&h, "Add remote…"));
+    // "?" shows every shortcut in force, mine included.
+    h.key_press_modifiers(egui::Modifiers::SHIFT, egui::Key::Questionmark);
+    settle(&mut h);
+    assert!(shows(&h, "Keyboard shortcuts"));
+    assert!(shows(&h, "Ctrl+J") && shows_containing(&h, "Ctrl+Shift+P"), "the rebound key and a default");
+    key(&mut h, egui::Key::Escape);
+    assert!(!shows(&h, "Keyboard shortcuts"));
+    // The toolbar's tooltip follows the binding.
+    let tip = crate::keys::with_hint(&h.ctx, "Hide the sidebar", crate::actions::Id::ToggleSidebar);
+    assert_eq!(tip, "Hide the sidebar (Ctrl+J)");
+}
+
+#[test]
+fn a_clashing_binding_is_reported_and_the_default_stays() {
+    let s = scratch("rebind-clash");
+    let r = new_repo(&s.root, "shop");
+    commit(&r, "a.txt", "one\n", "Start shop");
+    // Ctrl+K belongs to the palette.
+    let mut h = app_with_keys(&s, &r, &[("view.sidebar", "Ctrl+K")]);
+    assert!(shows_containing(&h, "already used by"));
+    ctrl(&mut h, egui::Key::B);
+    assert!(!shows(&h, "Add remote…"), "Ctrl+B still hides the sidebar");
+}
+
+#[test]
+fn single_keys_stage_unstage_discard_and_focus_the_commit_box() {
+    let s = scratch("single-keys");
+    let r = new_repo(&s.root, "shop");
+    commit(&r, "a.txt", "one\n", "Start");
+    commit(&r, "b.txt", "two\n", "Add b");
+    write(&r, "a.txt", "one changed\n");
+    write(&r, "b.txt", "two changed\n");
+    let mut h = app(&s, &[&r], true);
+    let pick = |h: &mut Harness<'static, HeadwayApp>, path: &str, staged: bool| {
+        let sel = super::FileSel { path: path.into(), staged, untracked: false };
+        h.state_mut().tabs.get_mut(&r).unwrap().file_sel = Some(sel);
+        h.step();
+    };
+
+    // s stages the picked file, u takes it back out.
+    pick(&mut h, "b.txt", false);
+    key(&mut h, egui::Key::S);
+    assert_eq!(staged_files(&r), ["b.txt"]);
+    pick(&mut h, "b.txt", true);
+    key(&mut h, egui::Key::U);
+    assert!(staged_files(&r).is_empty());
+    // d asks first; Cancel keeps the change, Discard throws it away.
+    pick(&mut h, "a.txt", false);
+    key(&mut h, egui::Key::D);
+    assert!(shows(&h, "Discard changes"));
+    click(&mut h, "Cancel");
+    assert_eq!(std::fs::read_to_string(r.join("a.txt")).unwrap(), "one changed\n");
+    key(&mut h, egui::Key::D);
+    click_last(&mut h, "Discard");
+    assert_eq!(std::fs::read_to_string(r.join("a.txt")).unwrap(), "one\n");
+
+    // c focuses the commit box, and the "c" itself isn't typed into it.
+    h.event(egui::Event::Text("c".into()));
+    key(&mut h, egui::Key::C);
+    assert_eq!(h.state().tabs[&r].commit_msg, "");
+    type_text(&mut h, "hello");
+    assert_eq!(h.state().tabs[&r].commit_msg, "hello");
+    // While typing, single keys are just keys: s doesn't stage.
+    pick(&mut h, "b.txt", false);
+    h.event(egui::Event::Text("s".into()));
+    key(&mut h, egui::Key::S);
+    assert!(staged_files(&r).is_empty(), "no staging while the commit box has focus");
+    assert_eq!(h.state().tabs[&r].commit_msg, "hellos");
+}
+
+#[test]
+fn the_keyboard_walks_history_files_and_branches() {
+    use super::Pane;
+    let s = scratch("panes");
+    let r = new_repo(&s.root, "shop");
+    commit(&r, "f1.txt", "one\n", "Start shop");
+    write(&r, "f2.txt", "two\n");
+    write(&r, "f3.txt", "three\n");
+    git_ok(&r, &["add", "-A"]);
+    git_ok(&r, &["commit", "-q", "-m", "Add two files"]);
+    git_ok(&r, &["branch", "feature"]);
+    git_ok(&r, &["branch", "other"]);
+    let mut h = app(&s, &[&r], true);
+    let pane = |h: &Harness<'static, HeadwayApp>| h.state().tabs[&r].pane;
+
+    // The history is where keys go at first; Enter goes into the commit's files.
+    click(&mut h, "Add two files");
+    assert_eq!(pane(&h), Pane::History);
+    key(&mut h, egui::Key::Enter);
+    assert_eq!(pane(&h), Pane::Files);
+    assert!(crate::keys::keyboard_mode(&h.ctx), "the focus ring shows while keys are used");
+    let picked = |h: &Harness<'static, HeadwayApp>| h.state().tabs[&r].commit_file;
+    assert_eq!(picked(&h), Some(0));
+    key(&mut h, egui::Key::ArrowDown);
+    assert_eq!(picked(&h), Some(1));
+    key(&mut h, egui::Key::ArrowUp);
+    assert_eq!(picked(&h), Some(0));
+    key(&mut h, egui::Key::End);
+    assert_eq!(picked(&h), Some(1), "the commit has two files");
+    key(&mut h, egui::Key::ArrowDown);
+    assert_eq!(picked(&h), Some(1), "no further");
+    // Enter opens it (blame at that commit); Escape leaves the lists for the history.
+    key(&mut h, egui::Key::Enter);
+    assert!(h.state().tabs[&r].file_view.as_ref().is_some_and(|f| f.shown));
+    key(&mut h, egui::Key::Escape);
+    key(&mut h, egui::Key::Escape);
+    assert_eq!(pane(&h), Pane::History);
+    assert!(!h.state().tabs[&r].file_view.as_ref().is_some_and(|f| f.shown));
+
+    // F6 moves on to the next list, the branches, and around again.
+    key(&mut h, egui::Key::F6);
+    assert_eq!(pane(&h), Pane::Files);
+    key(&mut h, egui::Key::F6);
+    assert_eq!(pane(&h), Pane::Branches);
+    assert_eq!(h.state().tabs[&r].branch_sel.as_deref(), Some("main"), "starts on the current branch");
+    key(&mut h, egui::Key::ArrowDown);
+    let next = h.state().tabs[&r].branch_sel.clone().unwrap();
+    assert_ne!(next, "main");
+    key(&mut h, egui::Key::Enter);
+    assert_eq!(branch(&r), next, "Enter switches to the branch");
+    h.key_press_modifiers(egui::Modifiers::SHIFT, egui::Key::F6);
+    settle(&mut h);
+    assert_eq!(pane(&h), Pane::Files, "Shift+F6 goes back");
+    key(&mut h, egui::Key::Escape);
+    assert_eq!(pane(&h), Pane::History);
+
+    // In the uncommitted changes the arrows pick a file and Enter stages it, then unstages it.
+    write(&r, "f1.txt", "one changed\n");
+    write(&r, "f2.txt", "two changed\n");
+    ctrl(&mut h, egui::Key::R);
+    click(&mut h, "Uncommitted changes");
+    key(&mut h, egui::Key::Enter);
+    assert_eq!(pane(&h), Pane::Files);
+    key(&mut h, egui::Key::Home);
+    let first = h.state().tabs[&r].file_sel.clone().unwrap();
+    key(&mut h, egui::Key::ArrowDown);
+    let second = h.state().tabs[&r].file_sel.clone().unwrap();
+    assert_ne!(first.path, second.path);
+    key(&mut h, egui::Key::Enter);
+    assert_eq!(staged_files(&r), std::slice::from_ref(&second.path));
+    // The staged file is now the one in the second list; Enter takes it back out.
+    let sel = super::FileSel { path: second.path.clone(), staged: true, untracked: false };
+    h.state_mut().tabs.get_mut(&r).unwrap().file_sel = Some(sel);
+    key(&mut h, egui::Key::Enter);
+    assert!(staged_files(&r).is_empty());
+
+    // Back in the history the arrows move through the commits again.
+    key(&mut h, egui::Key::Escape);
+    key(&mut h, egui::Key::ArrowDown);
+    assert!(matches!(h.state().tabs[&r].selection, Some(super::Selection::Commit(_))));
+}
+
+#[test]
+fn the_arrow_keys_move_over_the_overview_cards_and_enter_opens_one() {
+    let s = scratch("cards");
+    let a = new_repo(&s.root, "alpha");
+    commit(&a, "a.txt", "a\n", "Start alpha");
+    let b = new_repo(&s.root, "beta");
+    commit(&b, "b.txt", "b\n", "Start beta");
+    let mut h = app(&s, &[&a, &b], false);
+    assert!(h.state().active_path().is_none(), "the overview is showing");
+    let card = |h: &Harness<'static, HeadwayApp>| h.ctx.data(|d| d.get_temp::<usize>(egui::Id::unique(("overview_card", "Office"))));
+    assert_eq!(card(&h), None);
+    key(&mut h, egui::Key::ArrowRight);
+    assert_eq!(card(&h), Some(0), "the first key picks the first card");
+    key(&mut h, egui::Key::ArrowRight);
+    assert_eq!(card(&h), Some(1));
+    key(&mut h, egui::Key::ArrowRight);
+    assert_eq!(card(&h), Some(1), "no further");
+    key(&mut h, egui::Key::ArrowLeft);
+    assert_eq!(card(&h), Some(0));
+    key(&mut h, egui::Key::End);
+    key(&mut h, egui::Key::Enter);
+    assert_eq!(h.state().active_path().as_deref(), Some(b.as_path()), "Enter opens the picked repository");
+}
+
+#[test]
+fn enter_still_presses_a_focused_button_and_dead_end_lists_give_the_keys_back() {
+    use super::Pane;
+    let s = scratch("pane-edges");
+    let r = new_repo(&s.root, "shop");
+    commit(&r, "a.txt", "one\n", "Start shop");
+    commit(&r, "b.txt", "two\n", "Add b");
+    let mut h = app(&s, &[&r], true);
+    let pane = |h: &Harness<'static, HeadwayApp>| h.state().tabs[&r].pane;
+
+    // A focused button gets Enter, not the list: the sidebar button toggles, the pane stays.
+    click(&mut h, "Add b");
+    let open = h.state().cfg.view.sidebar_open;
+    h.get_by_label("◧").focus();
+    h.step();
+    key(&mut h, egui::Key::Enter);
+    assert_ne!(h.state().cfg.view.sidebar_open, open, "the button was pressed");
+    assert_eq!(pane(&h), Pane::History, "and the history didn't take Enter");
+    if !h.state().cfg.view.sidebar_open {
+        ctrl(&mut h, egui::Key::B);
+    }
+
+    // Hiding the sidebar while the branches have the keys hands them back to the history.
+    key(&mut h, egui::Key::F6);
+    key(&mut h, egui::Key::F6);
+    assert_eq!(pane(&h), Pane::Branches);
+    ctrl(&mut h, egui::Key::B);
+    key(&mut h, egui::Key::ArrowDown);
+    assert_eq!(pane(&h), Pane::History);
+    ctrl(&mut h, egui::Key::B);
+
+    // So does a files list that has nothing in it.
+    h.state_mut().tabs.get_mut(&r).unwrap().pane = Pane::Files;
+    click(&mut h, "Working directory is clean");
+    h.state_mut().tabs.get_mut(&r).unwrap().pane = Pane::Files;
+    key(&mut h, egui::Key::ArrowDown);
+    assert_eq!(pane(&h), Pane::History);
+    assert!(matches!(h.state().tabs[&r].selection, Some(super::Selection::Commit(_))), "the arrow moved the history");
+}
+
+#[test]
+fn ctrl_w_closes_the_tab_but_not_while_typing_a_message() {
+    let s = scratch("close-tab");
+    let r = new_repo(&s.root, "shop");
+    commit(&r, "a.txt", "one\n", "Start shop");
+    write(&r, "a.txt", "changed\n");
+    let mut h = app(&s, &[&r], true);
+    key(&mut h, egui::Key::C);
+    type_text(&mut h, "my message");
+    ctrl(&mut h, egui::Key::W);
+    assert!(h.state().active_path().is_some(), "Ctrl+W in a text box is the box's");
+    assert_eq!(h.state().tabs[&r].commit_msg, "my message");
+    key(&mut h, egui::Key::Escape);
+    click(&mut h, "Uncommitted changes");
+    ctrl(&mut h, egui::Key::W);
+    assert!(h.state().active_path().is_none() || !h.state().cfg.ws().open_tabs.contains(&r), "outside a text box it closes the tab");
+}
+
+#[test]
+fn a_commit_picked_in_the_palette_shows_through_a_search_and_a_file_view() {
+    let s = scratch("palette-commit");
+    let r = new_repo(&s.root, "shop");
+    commit(&r, "a.txt", "one\n", "Start shop");
+    commit(&r, "b.txt", "two\n", "Add cart page");
+    let mut h = app(&s, &[&r], true);
+    // A search hides "Start shop"; a file view covers the history.
+    ctrl(&mut h, egui::Key::F);
+    type_into(&mut h, "Search commits", "cart");
+    assert!(!shows(&h, "Start shop"));
+    ctrl(&mut h, egui::Key::K);
+    type_text(&mut h, "/a.txt");
+    key(&mut h, egui::Key::Enter);
+    assert!(h.state().tabs[&r].file_view.as_ref().is_some_and(|f| f.shown));
+    ctrl(&mut h, egui::Key::K);
+    type_text(&mut h, ":start");
+    key(&mut h, egui::Key::Enter);
+    let rv = &h.state().tabs[&r];
+    assert!(rv.search.is_empty(), "the search was cleared so the commit is in the list");
+    assert!(!rv.file_view.as_ref().is_some_and(|f| f.shown), "the file view made way");
+    assert!(shows(&h, "Start shop"));
+    assert!(matches!(&rv.selection, Some(super::Selection::Commit(_))));
+}
+
+#[test]
+fn the_palette_without_a_repository_says_so_instead_of_waiting() {
+    let s = scratch("palette-none");
+    let r = new_repo(&s.root, "shop");
+    commit(&r, "a.txt", "one\n", "Start shop");
+    let mut h = app(&s, &[&r], false);
+    ctrl(&mut h, egui::Key::K);
+    type_text(&mut h, "/anything");
+    assert!(shows(&h, "Open a repository first"));
+    key(&mut h, egui::Key::Escape);
+    // Actions that need no repository still run: adding one opens the folder picker's dialog path.
+    ctrl(&mut h, egui::Key::K);
+    type_text(&mut h, "clone");
+    key(&mut h, egui::Key::Enter);
+    assert!(shows(&h, "Clone"), "the clone dialog opened from the palette");
+}

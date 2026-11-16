@@ -26,6 +26,26 @@ workflow uses that version's section as the GitHub release notes.
   contain merge commits are refused with an explanation. git runs Headway
   itself as its editor for this, through the hidden `--write-rebase-todo` and
   `--write-rebase-message` options.
+- **Command palette**: Ctrl/Cmd+K or Ctrl/Cmd+Shift+P opens a search over every
+  action (fetch, pull, push, commit, stage all, new branch, stash, toggle the
+  side-by-side diff, switch tab and so on), showing each one's shortcut,
+  greying out the ones that can't run now and saying why, and listing the ones
+  you used lately first. Start with a prefix to jump somewhere instead:
+  `@` a repository of the workspace, `#` a branch (Enter checks it out,
+  Ctrl/Cmd+Enter shows it in the history), `:` a commit by its id, message or
+  author, `/` a file (Enter blames it, Ctrl/Cmd+Enter shows its history).
+- **Keyboard-first**: Enter on a history row goes into its files, F6 and
+  Shift+F6 move between the history, the files and the sidebar's branches, and
+  Escape comes back. In each list the arrow keys, Page Up/Down, Home and End
+  move and Enter does what a double-click does; a focus ring follows the
+  keyboard. The overview's repository cards work the same way (arrows, Enter
+  opens). In the uncommitted changes, single keys act on the picked file:
+  `s` stage, `u` unstage, `d` discard (asks first), `c` write the message.
+  They never fire while you're typing.
+- **Remappable shortcuts**: a `keybindings` section in the settings file maps
+  an action's name (for example `"git.fetch": "Ctrl+Shift+F"`) to a shortcut;
+  `"none"` removes one. Clashes and typos are reported and the default stays.
+  Press `?` for a cheat sheet of everything in force.
 - **Fixup into…** in the commit box: pick an earlier commit, and the staged
   changes are committed as a fixup and folded into it in one step. Aborting a
   conflict puts the changes back in the staging area.
@@ -34,6 +54,10 @@ workflow uses that version's section as the GitHub release notes.
 
 ### Changed
 
+- Every action now lives in one table (`src/actions.rs`) that the toolbar,
+  the menus, the shortcuts and the palette all use, so they agree on what an
+  action does and when it's available. Tooltips and menus show the shortcut
+  actually in force.
 - The banner for a rebase that stopped says "Stopped at 3 of 7", counting only
   commits (not the `update-ref` and `drop` lines in git's list).
 

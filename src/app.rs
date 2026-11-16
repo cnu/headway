@@ -1,6 +1,7 @@
 //! Application state, background work and the outer frame (workspace bar, tabs,
 //! dialogs, notifications).
 
+use crate::actions::{self, Ctx, Id as ActionId};
 use crate::git::{self, Branch, Change, Commit, CommitDetail, DiffFile, GitResult, Stash, Status};
 use crate::graph::{self, Graph};
 use crate::theme::{self, *};
@@ -8,7 +9,7 @@ use crate::workspace::{Config, Workspace};
 use crate::fileview::{self, FileView, Mode};
 use crate::resolver::Resolver;
 use crate::forge::{self, cache::Reason};
-use crate::{cmdlog, diffmodel, highlight, inbox, markdown, newpr, overview, preview, prmerge, prview, rebaseview, views};
+use crate::{cmdlog, diffmodel, highlight, inbox, keys, markdown, newpr, overview, palette, panes, preview, prmerge, prview, rebaseview, views};
 use egui::{Align, Color32, CornerRadius, Id, Layout, Margin, RichText, Sense, Stroke, Ui};
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
@@ -635,6 +636,17 @@ pub struct Detail {
     pub doc: DiffDoc,
 }
 
+/// Which list of the repository screen has the keyboard (see `panes.rs`).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum Pane {
+    #[default]
+    History,
+    /// The files of the selected commit, or of the uncommitted changes.
+    Files,
+    /// The sidebar's branches.
+    Branches,
+}
+
 pub struct RepoView {
     pub path: PathBuf,
     pub data: Option<RepoData>,
@@ -696,6 +708,18 @@ pub struct RepoView {
     pr_reveal: Option<String>,
     /// A pull request opened in the window, when one is.
     pub pr_view: Option<prview::PrView>,
+    /// The list that has the keyboard, and each list's picked row.
+    pub pane: Pane,
+    /// The picked file of the selected commit (an index into its files).
+    pub commit_file: Option<usize>,
+    /// The picked branch of the sidebar.
+    pub branch_sel: Option<String>,
+    /// Scroll the picked row into view next frame (set by keys).
+    pub files_scroll: bool,
+    pub branch_scroll: bool,
+    /// The changes list's scroll offset and height as of the last frame, and where to scroll to.
+    pub stage_view: (f32, f32),
+    pub stage_scroll_to: Option<f32>,
 }
 
 impl RepoView {
@@ -742,6 +766,13 @@ impl RepoView {
             pr_highlight: None,
             pr_reveal: None,
             pr_view: None,
+            pane: Pane::History,
+            commit_file: None,
+            branch_sel: None,
+            files_scroll: false,
+            branch_scroll: false,
+            stage_view: (0.0, 0.0),
+            stage_scroll_to: None,
         }
     }
 
@@ -892,6 +923,12 @@ pub enum Action {
     ShowWorkingDir,
     /// The "Find file" dialog (Ctrl/Cmd+P).
     FindFile,
+    /// The command palette wants every file of the open repository (for `/`).
+    PaletteFiles,
+    /// Run an action from the table in `actions.rs` (what buttons, shortcuts and the palette do).
+    Run(ActionId),
+    /// An action was picked in the palette: list it first next time.
+    Recent(ActionId),
     /// Open a conflicted file (by path) in the resolver.
     OpenConflict(String),
     CloseResolver,
@@ -1062,6 +1099,10 @@ pub enum Dialog {
     FixupInto(Box<rebaseview::FixupPicker>),
     CreatePr(Box<newpr::PrDraft>),
     MergePr(Box<prmerge::MergeDraft>),
+    /// The command palette.
+    Palette(Box<palette::Palette>),
+    /// The keyboard cheat sheet.
+    Keys,
     /// Find a file or folder by name, to blame it or see its history.
     FindFile {
         repo: PathBuf,
@@ -1130,6 +1171,8 @@ pub struct HeadwayApp {
     followups: HashMap<u64, FollowUp>,
     /// Layout preferences changed and still need saving (waits for the mouse to be released).
     view_dirty: bool,
+    /// What each shortcut does (the defaults and the settings file's changes).
+    bindings: Arc<keys::Bindings>,
     /// GitHub and GitLab: how to reach them, and what they said last.
     forges: Arc<dyn forge::Forges>,
     forge_cache: forge::cache::ForgeCache,
@@ -1166,7 +1209,9 @@ impl HeadwayApp {
     pub fn with_config(ctx: egui::Context, cfg: Config, needs_samples: bool, screenshot: Option<PathBuf>) -> Self {
         theme::apply(&ctx);
         let (tx, rx) = channel();
+        let bindings = Arc::new(keys::Bindings::from_settings(&cfg.keybindings));
         let mut app = Self {
+            bindings,
             pending: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
             cfg,
             tabs: HashMap::new(),
@@ -1205,6 +1250,9 @@ impl HeadwayApp {
                 error: Arc::new(Mutex::new(None)),
             }),
         };
+        for problem in app.bindings.problems.clone() {
+            app.toast(problem, true);
+        }
         if needs_samples {
             // Building the samples runs git many times; keep the window responsive meanwhile.
             app.spawn(|| {
@@ -1596,6 +1644,121 @@ impl HeadwayApp {
         fv.shown = true;
         fv.history = Some(fileview::History::new(kind, file, 0));
         self.load_history(path);
+    }
+
+    /// What the actions need to know about the window right now.
+    fn command_ctx(&self) -> Ctx {
+        let ws = self.cfg.ws();
+        let (tabs, tab) = (ws.open_tabs.len(), ws.active_tab);
+        match self.active_path().and_then(|p| self.tabs.get(&p)) {
+            Some(rv) => Ctx::of(rv, tabs, tab),
+            None => Ctx::tabs_only(tabs, tab),
+        }
+    }
+
+    /// Run whichever action's shortcut was pressed. Single keys (no Ctrl/Cmd or Alt)
+    /// never fire while typing, and the staging keys only in the list of changes.
+    fn handle_shortcuts(&mut self, ctx: &egui::Context, actions: &mut Vec<Action>) {
+        if self.dialog.is_some() {
+            return;
+        }
+        let c = self.command_ctx();
+        let typing = ctx.text_edit_focused();
+        let popup = ctx.any_popup_open();
+        let bindings = self.bindings.clone();
+        let hit = ctx.input_mut(|i| {
+            bindings.pressed(i, |id, s| {
+                let def = actions::def_of(id);
+                if (typing && (s.is_typing() || def.not_while_typing)) || (popup && s.is_typing()) {
+                    return false;
+                }
+                // Undo with nothing to undo still answers (with a note), so it's always tried.
+                actions::available(id, &c)
+            })
+        });
+        if let Some(id) = hit {
+            actions.push(Action::Run(id));
+        }
+    }
+
+    /// Open the command palette, starting with `query` (a prefix like "#" jumps to a mode).
+    fn open_palette(&mut self, query: &str) {
+        let ctx = self.command_ctx();
+        let mut src = palette::Sources { ctx, recent: self.cfg.recent_actions.clone(), repos: self.cfg.ws().repos.clone(), branches: Vec::new(), commits: Vec::new() };
+        if let Some(d) = self.active_path().and_then(|p| self.tabs.get(&p)).and_then(|rv| rv.data.as_ref()) {
+            let elsewhere = views::branches_in_other_worktrees(d);
+            for b in &d.branches {
+                let local_twin = b.remote && b.name.split_once('/').is_some_and(|(_, short)| d.branches.iter().any(|x| !x.remote && x.name == short));
+                src.branches.push(palette::BranchItem {
+                    name: b.name.clone(),
+                    remote: b.remote,
+                    head: b.is_head,
+                    worktree: if b.remote { None } else { elsewhere.get(b.name.as_str()).map(|p| p.to_path_buf()) },
+                    has_local: local_twin,
+                    tip: b.tip.clone(),
+                });
+            }
+            src.commits = d.commits.iter().map(|c| palette::CommitItem { hash: c.hash.clone(), summary: c.summary.clone(), author: c.author.clone() }).collect();
+        }
+        self.dialog = Some(Dialog::Palette(Box::new(palette::Palette::new(src, self.bindings.clone(), query))));
+    }
+
+    /// Remember an action as recently used (the palette lists those first).
+    fn note_recent(&mut self, id: ActionId) {
+        let key = actions::def_of(id).key.to_string();
+        let list = &mut self.cfg.recent_actions;
+        list.retain(|k| *k != key);
+        list.insert(0, key);
+        list.truncate(12);
+        self.save();
+    }
+
+    /// Do what an action in the table does.
+    fn run_command(&mut self, id: ActionId) {
+        let c = self.command_ctx();
+        if !actions::available(id, &c) {
+            if let Some(why) = actions::missing(id, &c) {
+                self.toast(why, false);
+            }
+            return;
+        }
+        match id {
+            ActionId::Palette => self.open_palette(""),
+            ActionId::Checkout => self.open_palette("#"),
+            ActionId::SwitchRepo => self.open_palette("@"),
+            ActionId::CheatSheet => self.dialog = Some(Dialog::Keys),
+            ActionId::ToggleSidebar => {
+                self.cfg.view.sidebar_open = !self.cfg.view.sidebar_open;
+                self.view_dirty = true;
+            }
+            ActionId::FocusSearch => {
+                if let Some(p) = &c.repo {
+                    self.ctx.memory_mut(|m| m.request_focus(views::search_id(p)));
+                }
+            }
+            ActionId::FocusCommitBox => {
+                if let Some(p) = &c.repo {
+                    self.ctx.memory_mut(|m| m.request_focus(views::commit_box_id(p)));
+                }
+            }
+            ActionId::NextPane | ActionId::PrevPane => {
+                let open = self.cfg.view.sidebar_open;
+                if let Some(rv) = c.repo.as_ref().and_then(|p| self.tabs.get_mut(p)) {
+                    panes::cycle(rv, id == ActionId::NextPane, open);
+                }
+            }
+            ActionId::ToggleSplitDiff => {
+                self.cfg.view.diff.split = !self.cfg.view.diff.split;
+                self.view_dirty = true;
+                self.do_action(Action::DiffPrefsChanged { reload: false });
+            }
+            ActionId::Undo if c.undo.is_none() => self.toast("Nothing to undo", false),
+            _ => {
+                for a in actions::build(id, &c) {
+                    self.do_action(a);
+                }
+            }
+        }
     }
 
     fn toast(&mut self, text: impl Into<String>, error: bool) {
@@ -2640,6 +2803,12 @@ impl HeadwayApp {
                     }
                 }
                 Msg::TrackedFiles(repo, res) => {
+                    if let Some(Dialog::Palette(pal)) = &mut self.dialog
+                        && pal.src.ctx.repo.as_deref() == Some(repo.as_path())
+                    {
+                        pal.files = Some(res);
+                        continue;
+                    }
                     if let Some(Dialog::FindFile { repo: r, files, hits_for, .. }) = &mut self.dialog
                         && *r == repo
                     {
@@ -3181,6 +3350,7 @@ impl HeadwayApp {
                     }
                     rv.selection = Some(Selection::Commit(hash.clone()));
                     rv.detail = None;
+                    rv.commit_file = None;
                 }
                 self.load_detail(&p, hash);
             }
@@ -3273,6 +3443,12 @@ impl HeadwayApp {
                     fv.shown = false;
                 }
                 self.do_action(Action::SelectWorkingDir);
+            }
+            Action::Run(id) => self.run_command(id),
+            Action::Recent(id) => self.note_recent(id),
+            Action::PaletteFiles => {
+                let Some(p) = active else { return };
+                self.spawn(move || Msg::TrackedFiles(p.clone(), git::tracked_files(&p).map(|f| fileview::with_folders(&f))));
             }
             Action::FindFile => {
                 let Some(p) = active else { return };
@@ -4054,6 +4230,16 @@ impl HeadwayApp {
                         keep = false;
                     }
                 }
+                Dialog::Palette(pal) => {
+                    if !pal.ui(ui, actions) {
+                        keep = false;
+                    }
+                }
+                Dialog::Keys => {
+                    if !palette::cheat_sheet(ui, &self.bindings) {
+                        keep = false;
+                    }
+                }
                 Dialog::MergePr(d) => match prmerge::ui(ui, d) {
                     prmerge::Outcome::Keep => {}
                     prmerge::Outcome::Close => keep = false,
@@ -4202,26 +4388,9 @@ impl eframe::App for HeadwayApp {
 
         let mut actions = Vec::new();
 
-        // Keyboard shortcuts
-        ctx.input(|i| {
-            if i.modifiers.command && i.key_pressed(egui::Key::R) {
-                actions.push(Action::Refresh);
-            }
-        });
-        // Ctrl/Cmd+Z undoes the open repository's last action (text boxes keep their own undo).
-        if self.dialog.is_none() && !ctx.text_edit_focused() && ctx.input_mut(|i| i.consume_key(egui::Modifiers::COMMAND, egui::Key::Z)) {
-            if let Some(p) = self.active_path() {
-                match self.tabs.get(&p).and_then(|rv| rv.data.as_ref()).and_then(|d| d.undo.as_ref()) {
-                    Some(e) => actions.push(Action::Undo { repo: p, id: Some(e.id) }),
-                    None => self.toast("Nothing to undo", false),
-                }
-            }
-        }
-
-        // Ctrl/Cmd+P finds a file in the open repository, to blame it or see its history.
-        if self.dialog.is_none() && self.active_path().is_some() && ctx.input_mut(|i| i.consume_key(egui::Modifiers::COMMAND, egui::Key::P)) {
-            actions.push(Action::FindFile);
-        }
+        keys::publish(&ctx, &self.bindings);
+        keys::note_input(&ctx);
+        self.handle_shortcuts(&ctx, &mut actions);
 
         egui::Panel::top("workspace_bar")
             .exact_size(40.0)
@@ -4241,7 +4410,7 @@ impl eframe::App for HeadwayApp {
                     let grouped = self.inbox_grouped();
                     let count = grouped.action_count();
                     let view = (self.overview_tab == overview::OverviewTab::Inbox).then(|| self.inbox_view(grouped));
-                    overview::show(ui, &ws, &self.summaries, &cards, &self.busy, overview::Tabs { tab: self.overview_tab, inbox_count: count, inbox: view.as_ref() }, &mut actions);
+                    overview::show(ui, &ws, &self.summaries, &cards, &self.busy, overview::Tabs { tab: self.overview_tab, inbox_count: count, inbox: view.as_ref(), keys: self.dialog.is_none() }, &mut actions);
                 }
                 Some(p) => {
                     let ws = self.cfg.ws().clone();
@@ -4323,7 +4492,7 @@ pub fn add_menu(ui: &mut Ui, label: &str, actions: &mut Vec<Action>) {
     ui.menu_button(RichText::new(label).strong(), |ui| {
         ui.set_min_width(240.0);
         if ui.button("Add repository…").clicked() {
-            actions.push(Action::PickRepo);
+            actions.push(Action::Run(ActionId::AddRepo));
             ui.close();
         }
         if ui.button("Add every repository in a folder…").clicked() {
@@ -4336,8 +4505,7 @@ pub fn add_menu(ui: &mut Ui, label: &str, actions: &mut Vec<Action>) {
         }
         ui.separator();
         if ui.button("Clone from a web address…").clicked() {
-            let dest = dirs::home_dir().map(|h| h.display().to_string()).unwrap_or_default();
-            actions.push(Action::Dialog(Dialog::Clone { url: String::new(), dest }));
+            actions.push(Action::Run(ActionId::CloneRepo));
             ui.close();
         }
     });

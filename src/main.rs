@@ -3,19 +3,24 @@
 // Release builds on Windows open no console window alongside the app.
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
+mod actions;
 mod app;
 mod cmdlog;
 mod diffmodel;
 mod fileview;
 mod forge;
+mod fuzzy;
 mod git;
 mod graph;
 mod highlight;
 mod inbox;
+mod keys;
 mod markdown;
 mod newpr;
 mod oplog;
 mod overview;
+mod panes;
+mod palette;
 mod preview;
 mod prmerge;
 mod prview;

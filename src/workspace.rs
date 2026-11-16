@@ -37,6 +37,13 @@ pub struct Config {
     /// The merge method last used in each repository folder.
     #[serde(default)]
     pub merge_methods: std::collections::BTreeMap<PathBuf, crate::forge::MergeMethod>,
+    /// Shortcuts that differ from the defaults: an action's name (see `actions.rs`, e.g.
+    /// "git.fetch") to a shortcut like "Ctrl+Shift+F" ("none" removes it).
+    #[serde(default)]
+    pub keybindings: std::collections::BTreeMap<String, String>,
+    /// The actions run from the command palette lately, newest first (their names).
+    #[serde(default)]
+    pub recent_actions: Vec<String>,
     /// Where to save; the usual settings file when empty (tests save elsewhere).
     #[serde(skip)]
     pub file: Option<PathBuf>,
@@ -96,7 +103,7 @@ impl Config {
                 return (cfg, needs);
             }
         }
-        let cfg = Config { workspaces: vec![samples::sample_workspace()], current: 0, view: ViewPrefs::default(), hidden_refs: Default::default(), merge_methods: Default::default(), file: None };
+        let cfg = Config { workspaces: vec![samples::sample_workspace()], current: 0, view: ViewPrefs::default(), hidden_refs: Default::default(), merge_methods: Default::default(), keybindings: Default::default(), recent_actions: Vec::new(), file: None };
         cfg.save();
         let needs = samples::samples_missing(cfg.ws());
         (cfg, needs)
@@ -118,7 +125,7 @@ impl Config {
     /// A workspace setup for tests, saved to `file` instead of the real settings.
     #[cfg(test)]
     pub fn for_test(workspaces: Vec<Workspace>, file: PathBuf) -> Self {
-        Config { workspaces, current: 0, view: ViewPrefs::default(), hidden_refs: Default::default(), merge_methods: Default::default(), file: Some(file) }
+        Config { workspaces, current: 0, view: ViewPrefs::default(), hidden_refs: Default::default(), merge_methods: Default::default(), keybindings: Default::default(), recent_actions: Vec::new(), file: Some(file) }
     }
 
     pub fn ws(&self) -> &Workspace {
@@ -145,6 +152,7 @@ mod tests {
         let ws = cfg.ws();
         assert!(ws.open_tabs.is_empty());
         assert_eq!(ws.active_tab, None);
+        assert!(cfg.keybindings.is_empty() && cfg.recent_actions.is_empty());
     }
 
     #[test]
@@ -158,13 +166,15 @@ mod tests {
         ws.inbox.pin(pr(12));
         ws.inbox.snooze(pr(14), 1_900_000_000);
         ws.inbox.alerts_off.push(crate::inbox::AlertKind::Merged);
-        let cfg = Config { workspaces: vec![ws, Workspace::new("Other")], current: 1, view: ViewPrefs { sidebar_open: false, split: 0.3, ..Default::default() }, hidden_refs: [(PathBuf::from("/a"), vec!["refs/heads/x".to_string()])].into(), merge_methods: Default::default(), file: None };
+        let cfg = Config { workspaces: vec![ws, Workspace::new("Other")], current: 1, view: ViewPrefs { sidebar_open: false, split: 0.3, ..Default::default() }, hidden_refs: [(PathBuf::from("/a"), vec!["refs/heads/x".to_string()])].into(), merge_methods: Default::default(), keybindings: [("git.fetch".to_string(), "Ctrl+Shift+F".to_string())].into(), recent_actions: vec!["git.pull".into()], file: None };
         let back: Config = serde_json::from_str(&serde_json::to_string(&cfg).unwrap()).unwrap();
         assert_eq!(back.current, 1);
         assert_eq!(back.ws().name, "Other");
         assert_eq!(back.workspaces[0].open_tabs, [PathBuf::from("/b")]);
         assert_eq!(back.view, cfg.view);
         assert_eq!(back.hidden_refs, cfg.hidden_refs);
+        assert_eq!(back.keybindings, cfg.keybindings);
+        assert_eq!(back.recent_actions, cfg.recent_actions);
         assert_eq!(back.workspaces[0].inbox, cfg.workspaces[0].inbox);
         assert_eq!(back.workspaces[0].inbox.snoozed_until(&pr(14), 0), Some(1_900_000_000));
         assert_eq!(back.workspaces[1].inbox, crate::inbox::InboxPrefs::default(), "not shared with the other workspace");

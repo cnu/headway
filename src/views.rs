@@ -1,10 +1,11 @@
 //! The repository screen: toolbar, sidebar, history, commit details, staging and diffs.
 
-use crate::app::{Action, PrAction, PrTab, DiffClick, DiffDoc, Dialog, FileOpen, FileSel, FlatRow, FollowUp, LineKey, LineSel, OpKind, Record, RepoData, RepoView, Selection, Summary};
+use crate::app::{Action, Pane, PrAction, PrTab, DiffClick, DiffDoc, Dialog, FileOpen, FileSel, FlatRow, FollowUp, LineKey, LineSel, OpKind, RepoData, RepoView, Selection, Summary};
 use crate::git::{self, Change, FileChange, LineKind, RefKind};
 use crate::graph::Target;
 use crate::forge::status::PrStatus;
-use crate::{highlight, preview};
+use crate::actions::{self, Ctx, Id};
+use crate::{highlight, keys, preview};
 use crate::theme::{self, *};
 use crate::workspace::{DiffPrefs, ViewPrefs, Workspace};
 use egui::text::{LayoutJob, TextFormat, TextWrapping};
@@ -22,9 +23,7 @@ pub fn repo(
     view: &mut ViewPrefs,
     actions: &mut Vec<Action>,
 ) {
-    if !rv.modal && ui.input(|i| i.modifiers.command && i.key_pressed(egui::Key::B)) {
-        view.sidebar_open = !view.sidebar_open;
-    }
+    crate::panes::keys(ui, rv, view.sidebar_open, actions);
     egui::Panel::top("repo_toolbar")
         .exact_size(46.0)
         .frame(egui::Frame::new().fill(PANEL).inner_margin(Margin::symmetric(14, 0)).stroke(Stroke::new(1.0, BORDER)))
@@ -119,17 +118,27 @@ pub fn repo(
 // ---------------------------------------------------------------------------
 // Toolbar
 
+/// The commit message box's id (the app focuses it for the "Write the commit message" action).
+pub(crate) fn commit_box_id(path: &Path) -> egui::Id {
+    egui::Id::unique(("commit_box", path))
+}
+
+/// The commit search box's id (the app focuses it for the "Search commits" action).
+pub(crate) fn search_id(path: &Path) -> egui::Id {
+    egui::Id::unique(("search", path))
+}
+
 fn toolbar(ui: &mut Ui, rv: &mut RepoView, busy: &[String], sidebar_open: &mut bool, actions: &mut Vec<Action>) {
     let path = rv.path.clone();
     let forge = rv.forge.clone();
-    let search_id = egui::Id::unique(("search", &path));
-    if !rv.modal && ui.input(|i| i.modifiers.command && i.key_pressed(egui::Key::F)) {
-        ui.memory_mut(|m| m.request_focus(search_id));
-    }
+    let search_id = search_id(&path);
+    let c = Ctx::of(rv, 0, None);
+    let on = |id| actions::available(id, &c);
+    let tip = |ui: &Ui, text: &str, id| keys::with_hint(ui.ctx(), text, id);
     ui.horizontal_centered(|ui| {
-        let tip = if *sidebar_open { "Hide the sidebar (Ctrl+B)" } else { "Show the sidebar (Ctrl+B)" };
+        let toggle_tip = tip(ui, if *sidebar_open { "Hide the sidebar" } else { "Show the sidebar" }, Id::ToggleSidebar);
         let toggle = egui::Button::new(RichText::new("◧").size(15.0)).selected(*sidebar_open);
-        if ui.add(toggle).on_hover_text(tip).clicked() {
+        if ui.add(toggle).on_hover_text(toggle_tip).clicked() {
             *sidebar_open = !*sidebar_open;
         }
         ui.label(RichText::new(git::repo_name(&path)).size(16.0).strong());
@@ -174,30 +183,22 @@ fn toolbar(ui: &mut Ui, rv: &mut RepoView, busy: &[String], sidebar_open: &mut b
         }
         ui.add_space(6.0);
 
-        let has_remote = !data.remotes.is_empty();
-        let changes = data.status.change_count();
-        if tool_button(ui, "⇅", "Fetch", None, has_remote, "Download news from the remote without changing your files").clicked() {
-            actions.push(Action::args(&path, "Fetch", &["fetch", "--all", "--prune"]));
-        }
+        // The buttons run the same actions as the palette and the shortcuts, and are enabled by the same rules.
+        let button = |ui: &mut Ui, icon: &str, label: &str, badge: Option<String>, id: Id, text: &str, actions: &mut Vec<Action>| {
+            if tool_button(ui, icon, label, badge, on(id), &tip(ui, text, id)).clicked() {
+                actions.push(Action::Run(id));
+            }
+        };
+        button(ui, "⇅", "Fetch", None, Id::Fetch, "Download news from the remote without changing your files", actions);
         let behind = (head.behind > 0).then(|| head.behind.to_string());
-        if tool_button(ui, "⬇", "Pull", behind, has_remote && head.upstream.is_some(), "Bring in new commits from the remote branch").clicked() {
-            actions.push(Action::args(&path, "Pull", &["-c", "pull.rebase=false", "pull", "--no-edit"]).undoable(git::Undoable::Tree { save_work: false }, "pull"));
-        }
+        button(ui, "⬇", "Pull", behind, Id::Pull, "Bring in new commits from the remote branch", actions);
         let ahead = (head.ahead > 0).then(|| head.ahead.to_string());
         let push_tip = if head.upstream.is_some() { "Send your commits to the remote branch" } else { "Publish this branch to the remote" };
-        if tool_button(ui, "⬆", "Push", ahead, has_remote && head.branch.is_some(), push_tip).clicked() {
-            actions.push(push_action(&path, head.branch.as_deref(), head.upstream.is_some(), data.remotes.first()));
-        }
+        button(ui, "⬆", "Push", ahead, Id::Push, push_tip, actions);
         sep(ui);
-        if tool_button(ui, "⤓", "Stash", None, changes > 0, "Put your uncommitted changes aside for later").clicked() {
-            actions.push(Action::args(&path, "Stash changes", &["stash", "push", "--include-untracked"]));
-        }
-        if tool_button(ui, "⤒", "Pop", None, !data.stashes.is_empty(), "Bring back the most recently stashed changes").clicked() {
-            actions.push(Action::args(&path, "Restore stash", &["stash", "pop"]));
-        }
-        if tool_button(ui, "⑂", "Branch", None, !data.commits.is_empty(), "Create a new branch from here").clicked() {
-            actions.push(new_branch(&path, "HEAD", &format!("the current branch ({current})")));
-        }
+        button(ui, "⤓", "Stash", None, Id::Stash, "Put your uncommitted changes aside for later", actions);
+        button(ui, "⤒", "Pop", None, Id::StashPop, "Bring back the most recently stashed changes", actions);
+        button(ui, "⑂", "Branch", None, Id::NewBranch, "Create a new branch from here", actions);
 
         ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
             let menu = ui.menu_button(RichText::new("⋯").size(15.0).color(DIM), |ui| repo_menu(ui, &path, data, forge.as_ref(), actions));
@@ -212,7 +213,7 @@ fn toolbar(ui: &mut Ui, rv: &mut RepoView, busy: &[String], sidebar_open: &mut b
             let escape = ui.input(|i| i.key_pressed(egui::Key::Escape));
             let te = egui::TextEdit::singleline(&mut rv.search)
                 .id(search_id)
-                .hint_text("🔍 Search commits  (Ctrl+F)")
+                .hint_text(keys::with_hint(ui.ctx(), "🔍 Search commits", Id::FocusSearch).replace(" (", "  ("))
                 .desired_width(220.0);
             let r = ui.add(te);
             if had_focus && escape {
@@ -227,7 +228,7 @@ fn toolbar(ui: &mut Ui, rv: &mut RepoView, busy: &[String], sidebar_open: &mut b
 /// The ⋯ menu at the right of the toolbar.
 fn repo_menu(ui: &mut Ui, path: &Path, data: &RepoData, forge: Option<&crate::forge::StatusLine>, actions: &mut Vec<Action>) {
     ui.set_min_width(240.0);
-    let undo_key = ui.ctx().format_shortcut(&egui::KeyboardShortcut::new(egui::Modifiers::COMMAND, egui::Key::Z));
+    let undo_key = keys::hint(ui.ctx(), Id::Undo);
     let text = match &data.undo {
         Some(e) => format!("Undo: {}", e.what),
         None => "Undo".to_string(),
@@ -238,18 +239,16 @@ fn repo_menu(ui: &mut Ui, path: &Path, data: &RepoData, forge: Option<&crate::fo
     };
     let undo = ui.add_enabled(data.undo.is_some(), egui::Button::new(text).shortcut_text(undo_key)).on_hover_text(&tip).on_disabled_hover_text(&tip);
     if undo.clicked() {
-        if let Some(e) = &data.undo {
-            actions.push(Action::Undo { repo: path.to_path_buf(), id: Some(e.id) });
-        }
+        actions.push(Action::Run(Id::Undo));
         ui.close();
     }
     if ui.button("Reflog").on_hover_text("Everywhere HEAD and your branches have been").clicked() {
         actions.push(Action::ShowReflog(None));
         ui.close();
     }
-    let find_key = ui.ctx().format_shortcut(&egui::KeyboardShortcut::new(egui::Modifiers::COMMAND, egui::Key::P));
+    let find_key = keys::hint(ui.ctx(), Id::FindFile);
     if ui.add(egui::Button::new("Find file…").shortcut_text(find_key)).on_hover_text("Blame a file, or see the history of a file or folder").clicked() {
-        actions.push(Action::FindFile);
+        actions.push(Action::Run(Id::FindFile));
         ui.close();
     }
     ui.separator();
@@ -394,11 +393,11 @@ fn sep(ui: &mut Ui) {
 // ---------------------------------------------------------------------------
 // Action builders
 
-fn checkout(path: &Path, name: &str) -> Action {
+pub(crate) fn checkout(path: &Path, name: &str) -> Action {
     Action::args(path, format!("Switch to {name}"), &["checkout", name]).undoable(git::Undoable::Tree { save_work: false }, format!("switch to {name}"))
 }
 
-fn new_branch(path: &Path, at: &str, label: &str) -> Action {
+pub(crate) fn new_branch(path: &Path, at: &str, label: &str) -> Action {
     Action::Dialog(Dialog::CreateBranch {
         repo: path.to_path_buf(),
         at: at.into(),
@@ -409,7 +408,7 @@ fn new_branch(path: &Path, at: &str, label: &str) -> Action {
 }
 
 /// Local branches checked out in some other worktree, with that worktree's folder.
-fn branches_in_other_worktrees(data: &RepoData) -> HashMap<&str, &Path> {
+pub(crate) fn branches_in_other_worktrees(data: &RepoData) -> HashMap<&str, &Path> {
     data.worktrees
         .iter()
         .filter(|w| !w.is_current)
@@ -435,7 +434,7 @@ fn new_worktree(path: &Path, data: &RepoData, new_branch: bool, existing: &str, 
     })
 }
 
-fn push_action(path: &Path, branch: Option<&str>, has_upstream: bool, remote: Option<&String>) -> Action {
+pub(crate) fn push_action(path: &Path, branch: Option<&str>, has_upstream: bool, remote: Option<&String>) -> Action {
     if has_upstream {
         Action::args(path, "Push", &["push"])
     } else {
@@ -668,6 +667,9 @@ fn sidebar(
         resp.on_hover_text("Everywhere HEAD and your branches have been, to find lost commits");
         ui.add_space(4.0);
 
+        let ring_branches = crate::panes::ring(ui.ctx(), rv, Pane::Branches);
+        let picked_branch = rv.branch_sel.clone();
+        let scroll_to_branch = std::mem::take(&mut rv.branch_scroll);
         let merged = |b: &&git::Branch| rv.prs.get(&b.name).is_some_and(|s| s.pr.state == crate::forge::PrState::Merged);
         let locals: Vec<_> = data.branches.iter().filter(|b| !b.remote).filter(|b| !rv.merged_only || merged(b)).collect();
         let elsewhere = branches_in_other_worktrees(data);
@@ -698,6 +700,12 @@ fn sidebar(
                 let eye = Eye { hidden: data.hidden.contains(&full_ref), enabled: !b.is_head };
                 let pr = prs.get(&b.name);
                 let (resp, eye_clicked, badge) = side_row_pr(ui, icon, icon_color, &b.name, right, b.is_head, Some(eye), pr);
+                if ring_branches && picked_branch.as_deref() == Some(b.name.as_str()) {
+                    crate::panes::focus_ring(ui, resp.rect);
+                    if scroll_to_branch {
+                        resp.scroll_to_me(None);
+                    }
+                }
                 if eye_clicked {
                     actions.push(Action::ToggleHidden(full_ref));
                 }
@@ -1416,7 +1424,7 @@ fn pr_menu(ui: &mut Ui, st: &PrStatus, path: &Path, actions: &mut Vec<Action>) {
     }
 }
 
-fn checkout_remote(path: &Path, full: &str, local: &str, exists: bool) -> Action {
+pub(crate) fn checkout_remote(path: &Path, full: &str, local: &str, exists: bool) -> Action {
     if exists {
         checkout(path, local)
     } else {
@@ -1461,6 +1469,11 @@ fn commit_list(ui: &mut Ui, rv: &mut RepoView, actions: &mut Vec<Action>) {
     // Space taken by the right-hand columns (author, commit id, date).
     let cols_w = author_w + hash_w + date_w;
 
+    // A click in the list gives it the keyboard back.
+    if ui.input(|i| i.pointer.any_pressed()) && ui.rect_contains_pointer(ui.max_rect()) {
+        rv.pane = Pane::History;
+    }
+    let ring = crate::panes::ring(ui.ctx(), rv, Pane::History);
     // Keyboard navigation through the list.
     let cur_row = match &rv.selection {
         Some(Selection::WorkingDir) | None => Some(0),
@@ -1469,7 +1482,7 @@ fn commit_list(ui: &mut Ui, rv: &mut RepoView, actions: &mut Vec<Action>) {
     };
     let mut scroll_offset = None;
     // Not while a dialog is open: its keys are its own.
-    if !rv.modal && !rv.pr_keys && !ui.ctx().text_edit_focused() && !ui.ctx().any_popup_open() {
+    if !rv.modal && !rv.pr_keys && rv.pane == Pane::History && !ui.ctx().text_edit_focused() && !ui.ctx().any_popup_open() {
         let (offset, view_h) = rv.list_view;
         let page = ((view_h / row_h).floor() as usize).saturating_sub(1).max(1);
         let key = ui.input(|i| {
@@ -1563,6 +1576,9 @@ fn commit_list(ui: &mut Ui, rv: &mut RepoView, actions: &mut Vec<Action>) {
                 if r == 0 {
                     // Working directory row
                     paint_row_bg(&p, rect, selected, resp.hovered());
+                    if ring && selected {
+                        crate::panes::focus_ring(ui, rect);
+                    }
                     let col = head_row_col.unwrap_or(0);
                     let cx = rect.left() + 8.0 + col as f32 * LANE_W + LANE_W / 2.0;
                     if head_row_col.is_some() && !searching {
@@ -1599,6 +1615,9 @@ fn commit_list(ui: &mut Ui, rv: &mut RepoView, actions: &mut Vec<Action>) {
                     p.rect_filled(Rect::from_min_size(rect.min, vec2(3.0, rect.height())), 0.0, mark_color);
                 }
                 paint_row_bg(&p, rect, selected, resp.hovered());
+                if ring && selected {
+                    crate::panes::focus_ring(ui, rect);
+                }
 
                 // Graph
                 let gp = p.with_clip_rect(Rect::from_min_max(rect.min, pos2(rect.left() + graph_w, rect.bottom())));
@@ -1850,7 +1869,7 @@ fn reset_menu(ui: &mut Ui, path: &Path, data: &RepoData, hash: &str, actions: &m
             if ui.button(text).on_hover_text(desc).clicked() {
                 actions.push(Action::confirm(
                     "Reset branch",
-                    format!("Move {cur} to {short}?\n\n{moves}\n{desc}\n\nYou can undo this afterwards (Ctrl+Z)."),
+                    format!("Move {cur} to {short}?\n\n{moves}\n{desc}\n\nYou can undo this afterwards."),
                     "Reset",
                     danger,
                     Action::args(path, format!("Reset to {short}"), &["reset", mode, hash]).undoable(reset_undo(mode), format!("reset {cur} to {short}")),
@@ -2024,6 +2043,9 @@ fn reflog_row(ui: &mut Ui, path: &Path, data: &RepoData, e: &git::ReflogEntry, a
 // Commit details
 
 fn commit_panel(ui: &mut Ui, rv: &mut RepoView, prefs: &mut DiffPrefs, actions: &mut Vec<Action>) {
+    let ring_files = crate::panes::ring(ui.ctx(), rv, Pane::Files);
+    let scroll_to_file = std::mem::take(&mut rv.files_scroll);
+    let picked_file = rv.commit_file;
     let Some(d) = &rv.detail else {
         ui.add_space(60.0);
         ui.vertical_centered(|ui| {
@@ -2127,7 +2149,14 @@ fn commit_panel(ui: &mut Ui, rv: &mut RepoView, prefs: &mut DiffPrefs, actions: 
                 }
                 ui.spacing_mut().item_spacing.y = 1.0;
                 for (i, f) in d.doc.files.iter().enumerate() {
-                    let resp = file_line(ui, &f.path, f.old_path.as_deref(), &f.change, false, Some((f.added, f.removed)));
+                    let on = picked_file == Some(i);
+                    let resp = file_line(ui, &f.path, f.old_path.as_deref(), &f.change, ring_files && on, Some((f.added, f.removed)));
+                    if ring_files && on {
+                        crate::panes::focus_ring(ui, resp.rect);
+                        if scroll_to_file {
+                            resp.scroll_to_me(None);
+                        }
+                    }
                     if resp.clicked() {
                         jump = Some(i);
                     }
@@ -2142,6 +2171,7 @@ fn commit_panel(ui: &mut Ui, rv: &mut RepoView, prefs: &mut DiffPrefs, actions: 
     }
     if let Some(i) = jump {
         // Picking a file in the list unfolds it and scrolls to it.
+        rv.commit_file = Some(i);
         d.doc.set_collapsed(i, false);
         rv.diff_scroll_to = d.doc.file_rows.get(i).copied();
     }
@@ -2233,6 +2263,7 @@ fn file_line_tagged(
 // Working directory: staging and committing
 
 fn staging_panel(ui: &mut Ui, rv: &mut RepoView, prefs: &mut DiffPrefs, actions: &mut Vec<Action>) {
+    let ring_files = crate::panes::ring(ui.ctx(), rv, Pane::Files);
     let Some(data) = &rv.data else { return };
     let st = &data.status;
     let path = rv.path.clone();
@@ -2257,7 +2288,11 @@ fn staging_panel(ui: &mut Ui, rv: &mut RepoView, prefs: &mut DiffPrefs, actions:
             let total: usize = sections.iter().map(|(_, f)| section_len(f)).sum();
             ui.scope(|ui| {
                 ui.spacing_mut().item_spacing.y = 0.0;
-                egui::ScrollArea::vertical().auto_shrink(false).id_salt(("stage_list", &path)).show_rows(ui, 24.0, total, |ui, range| {
+                let mut list = egui::ScrollArea::vertical().auto_shrink(false).id_salt(("stage_list", &path));
+                if let Some(o) = rv.stage_scroll_to.take() {
+                    list = list.vertical_scroll_offset(o);
+                }
+                let out = list.show_rows(ui, crate::panes::STAGE_ROW_H, total, |ui, range| {
                     for r in range {
                         let mut r = r;
                         let Some(&(kind, files)) = sections.iter().find(|(_, f)| {
@@ -2311,51 +2346,41 @@ fn staging_panel(ui: &mut Ui, rv: &mut RepoView, prefs: &mut DiffPrefs, actions:
                             ListKind::Unstaged => {
                                 let sel = FileSel { path: f.path.clone(), staged: false, untracked: f.change == Change::Untracked };
                                 let second = if f.change == Change::Untracked { "Delete" } else { "Discard" };
-                                let (resp, b) = file_row_buttons(ui, f, rv.file_sel.as_ref() == Some(&sel), &["Stage", second]);
+                                let on = rv.file_sel.as_ref() == Some(&sel);
+                                let (resp, b) = file_row_buttons(ui, f, on, &["Stage", second]);
+                                if ring_files && on {
+                                    crate::panes::focus_ring(ui, resp.rect);
+                                }
                                 resp.context_menu(|ui| file_history_menu(ui, &f.path, None, &f.change, actions));
                                 if resp.clicked() {
                                     actions.push(Action::SelectFile(sel));
                                 }
                                 if resp.double_clicked() || b == Some(0) {
-                                    let paths = vec![f.path.clone()];
-                                    actions.push(quiet(Action::git(&path, format!("Stage {}", f.path), move |p| git::stage(p, &paths))));
+                                    actions.push(file_action(&path, "Stage", f.clone()));
                                 }
                                 if b == Some(1) {
-                                    let fc = f.clone();
-                                    let what = if f.submodule {
-                            "put this submodule back on the commit recorded here"
-                        } else if f.change == Change::Untracked {
-                            "delete this new file"
-                        } else {
-                            "throw away your changes to this file"
-                        };
-                                    actions.push(Action::confirm(
-                                        "Discard changes",
-                                        format!("Really {what}?\n\n{}\n\n{}", f.path, discard_note(f)),
-                                        "Discard",
-                                        true,
-                                        discard_file(&path, fc),
-                                    ));
+                                    actions.push(file_action(&path, "Discard", f.clone()));
                                 }
                             }
                             ListKind::Staged => {
                                 let sel = FileSel { path: f.path.clone(), staged: true, untracked: false };
-                                let (resp, b) = file_row_buttons(ui, f, rv.file_sel.as_ref() == Some(&sel), &["Unstage"]);
+                                let on = rv.file_sel.as_ref() == Some(&sel);
+                                let (resp, b) = file_row_buttons(ui, f, on, &["Unstage"]);
+                                if ring_files && on {
+                                    crate::panes::focus_ring(ui, resp.rect);
+                                }
                                 resp.context_menu(|ui| file_history_menu(ui, &f.path, None, &f.change, actions));
                                 if resp.clicked() {
                                     actions.push(Action::SelectFile(sel));
                                 }
                                 if resp.double_clicked() || b == Some(0) {
-                                    let mut paths = vec![f.path.clone()];
-                                    if let Some(o) = &f.old_path {
-                                        paths.push(o.clone());
-                                    }
-                                    actions.push(quiet(Action::git(&path, format!("Unstage {}", f.path), move |p| git::unstage(p, &paths))));
+                                    actions.push(file_action(&path, "Unstage", f.clone()));
                                 }
                             }
                         }
                     }
                 });
+                rv.stage_view = (out.state.clamped_offset().y, out.inner_rect.height());
             });
         });
 
@@ -2368,11 +2393,12 @@ fn staging_panel(ui: &mut Ui, rv: &mut RepoView, prefs: &mut DiffPrefs, actions:
         .frame(egui::Frame::new().fill(PANEL).inner_margin(Margin::symmetric(12, 10)).stroke(Stroke::new(1.0, BORDER)))
         .show(ui, |ui| {
             let te = egui::TextEdit::multiline(&mut rv.commit_msg)
+                .id(commit_box_id(&path))
                 .hint_text("Describe your change in one line\n\nAdd more detail below if you like…")
                 .desired_rows(3)
                 .desired_width(f32::INFINITY);
             let r = ui.add(te);
-            let submit = r.has_focus() && ui.input(|i| i.modifiers.command && i.key_pressed(egui::Key::Enter));
+            let submit = r.has_focus() && keys::pressed_for(ui.ctx(), Id::Commit);
             ui.add_space(4.0);
             let has_msg = !rv.commit_msg.trim().is_empty();
             // On narrow panels the checkbox gets its own line so it never sits under the buttons.
@@ -2392,18 +2418,9 @@ fn staging_panel(ui: &mut Ui, rv: &mut RepoView, prefs: &mut DiffPrefs, actions:
                         (None, n) => format!("Commit {n} file{}", if n == 1 { "" } else { "s" }),
                     };
                     let btn = egui::Button::new(RichText::new(label).strong().color(if can { Color32::WHITE } else { DIM })).fill(if can { Color32::from_rgb(40, 130, 90) } else { RAISED });
-                    let tip = if !has_msg { "Write a message first" } else if staged_n == 0 { "Stage some files first" } else { "Ctrl+Enter" };
-                    let msg = rv.commit_msg.clone();
-                    let amend = rv.amend;
-                    if (ui.add_enabled(can, btn).on_hover_text(tip).on_disabled_hover_text(tip).clicked() || (submit && can)) && can {
-                        let what = format!("{} “{}”", if amend { "amend" } else { "commit" }, msg.lines().next().unwrap_or("").trim());
-                        actions.push(Action::Git {
-                            repo: path.clone(),
-                            label: if amend { "Amend commit".into() } else { "Commit".into() },
-                            op: Box::new(move |p| git::commit(p, &msg, amend)),
-                            kind: OpKind::Commit,
-                            record: Some(Record { undo: git::Undoable::Refs, what }),
-                        });
+                    let tip = if !has_msg { "Write a message first".to_string() } else if staged_n == 0 && !rv.amend { "Stage some files first".to_string() } else { keys::hint(ui.ctx(), Id::Commit) };
+                    if (ui.add_enabled(can, btn).on_hover_text(&tip).on_disabled_hover_text(&tip).clicked() || (submit && can)) && can {
+                        actions.push(Action::Run(Id::Commit));
                     }
                     if staged_n > 0 && !rv.amend && !conflicts {
                         let tip = "Fold the staged changes into an earlier commit: a fixup commit is made and squashed in";
@@ -2411,21 +2428,10 @@ fn staging_panel(ui: &mut Ui, rv: &mut RepoView, prefs: &mut DiffPrefs, actions:
                             actions.push(Action::FixupInto);
                         }
                     }
-                    if staged_n == 0 && unstaged_n > 0 && !rv.amend {
-                        let msg = rv.commit_msg.clone();
-                        if ui.add_enabled(has_msg && !conflicts, egui::Button::new("Stage all & commit")).on_hover_text("Include every change in this commit").clicked() {
-                            let what = format!("commit “{}”", msg.lines().next().unwrap_or("").trim());
-                            actions.push(Action::Git {
-                                repo: path.clone(),
-                                label: "Commit".into(),
-                                op: Box::new(move |p| {
-                                    git::run(p, &["add", "-A"])?;
-                                    git::commit(p, &msg, false)
-                                }),
-                                kind: OpKind::Commit,
-                                record: Some(Record { undo: git::Undoable::Refs, what }),
-                            });
-                        }
+                    if staged_n == 0 && unstaged_n > 0 && !rv.amend
+                        && ui.add_enabled(has_msg && !conflicts, egui::Button::new("Stage all & commit")).on_hover_text("Include every change in this commit").clicked()
+                    {
+                        actions.push(actions::stage_all_and_commit(&path, &rv.commit_msg));
                     }
                 });
             });
@@ -2490,7 +2496,7 @@ fn quiet(a: Action) -> Action {
     }
 }
 
-fn stage_all(path: &Path) -> Action {
+pub(crate) fn stage_all(path: &Path) -> Action {
     quiet(Action::args(path, "Stage all", &["add", "-A"]))
 }
 
@@ -2760,7 +2766,7 @@ fn row_button_sized(
 }
 
 /// What a button on an uncommitted file's name bar does.
-fn file_action(repo: &Path, button: &str, f: git::FileChange) -> Action {
+pub(crate) fn file_action(repo: &Path, button: &str, f: git::FileChange) -> Action {
     let path = f.path.clone();
     match button {
         "Stage" => quiet(Action::git(repo, format!("Stage {path}"), move |r| git::stage(r, &[path]))),
@@ -2808,7 +2814,7 @@ fn discard_file(repo: &Path, f: FileChange) -> Action {
 }
 
 fn discard_note(f: &FileChange) -> &'static str {
-    if f.submodule { "This can't be undone." } else { "You can undo this afterwards (Ctrl+Z)." }
+    if f.submodule { "This can't be undone." } else { "You can undo this afterwards." }
 }
 
 /// "N files · +a −r" with Collapse all / Expand all. Returns Some(fold everything?) when clicked.
@@ -2922,7 +2928,7 @@ fn line_bar(ui: &mut Ui, doc: &DiffDoc, sel: &mut LineSel, repo: &Path, actions:
                     let (f, p) = (file.clone(), picked.clone());
                     actions.push(Action::confirm(
                         "Discard lines",
-                        format!("Throw away the changes on the {n} picked line{} from your file? You can undo this afterwards (Ctrl+Z).", if n == 1 { "" } else { "s" }),
+                        format!("Throw away the changes on the {n} picked line{} from your file? You can undo this afterwards.", if n == 1 { "" } else { "s" }),
                         "Discard",
                         true,
                         Action::git(repo, "Discard lines", move |r| git::discard_lines(r, &f, &p))
@@ -3395,7 +3401,7 @@ pub fn diff_view(
                                     (DiffMode::Unstaged, 0) => actions.push(quiet(Action::git(repo, "Stage hunk", move |r| git::apply_hunk(r, &patch, false, true)))),
                                     (DiffMode::Unstaged, _) => actions.push(Action::confirm(
                                         "Discard hunk",
-                                        "Throw away this block of changes from your file? You can undo this afterwards (Ctrl+Z).".into(),
+                                        "Throw away this block of changes from your file? You can undo this afterwards.".into(),
                                         "Discard",
                                         true,
                                         Action::git(repo, "Discard hunk", move |r| git::apply_hunk(r, &patch, true, false))

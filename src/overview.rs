@@ -22,6 +22,8 @@ pub struct Tabs<'a> {
     pub tab: OverviewTab,
     pub inbox_count: usize,
     pub inbox: Option<&'a crate::inbox::InboxView>,
+    /// The keyboard may move through the cards (no dialog is open).
+    pub keys: bool,
 }
 
 /// Height of the Open/Fetch/Pull row at the bottom of a card.
@@ -36,7 +38,7 @@ pub fn show(
     tabs: Tabs,
     actions: &mut Vec<Action>,
 ) {
-    let Tabs { tab, inbox_count, inbox } = tabs;
+    let Tabs { tab, inbox_count, inbox, keys } = tabs;
     egui::Frame::new().inner_margin(Margin::symmetric(28, 22)).show(ui, |ui| {
         // Worktrees whose main repository is here are shown inside its card.
         let top = top_level_repos(&ws.repos, summaries);
@@ -81,7 +83,7 @@ pub fn show(
             });
             ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
                 add_menu(ui, "+  Add", actions);
-                if ui.button("⟳  Refresh").on_hover_text("Re-read every repository (Ctrl+R)").clicked() {
+                if ui.button("⟳  Refresh").on_hover_text(crate::keys::with_hint(ui.ctx(), "Re-read every repository", crate::actions::Id::Refresh)).clicked() {
                     actions.push(Action::RefreshOverview);
                 }
                 if ui.button("⬇  Pull all").on_hover_text("Fast-forward every repository that has a remote branch").clicked() {
@@ -117,10 +119,58 @@ pub fn show(
             return;
         }
 
+        // The arrow keys move a ring over the cards; Enter opens the one it's on.
+        let sel_id = egui::Id::unique(("overview_card", &ws.name));
+        let cols_id = sel_id.with("cols");
+        let mut sel: Option<usize> = ui.data(|d| d.get_temp(sel_id)).filter(|i| *i < top.len());
+        let mut scroll_to_card = false;
+        if keys && !top.is_empty() && !ui.ctx().text_edit_focused() && !ui.ctx().any_popup_open() {
+            let cols: usize = ui.data(|d| d.get_temp(cols_id)).unwrap_or(1);
+            let free = crate::panes::enter_free(ui.ctx());
+            let (left, right, up, down, home, end, enter) = ui.input_mut(|i| {
+                let m = egui::Modifiers::NONE;
+                (
+                    i.consume_key(m, egui::Key::ArrowLeft),
+                    i.consume_key(m, egui::Key::ArrowRight),
+                    i.consume_key(m, egui::Key::ArrowUp),
+                    i.consume_key(m, egui::Key::ArrowDown),
+                    i.consume_key(m, egui::Key::Home),
+                    i.consume_key(m, egui::Key::End),
+                    free && i.consume_key(m, egui::Key::Enter),
+                )
+            });
+            let last = top.len() - 1;
+            let moved = match (sel, left, right, up, down, home, end) {
+                (None, true, ..) | (None, _, true, ..) | (None, _, _, true, ..) | (None, _, _, _, true, ..) | (_, _, _, _, _, true, _) => Some(0),
+                (_, _, _, _, _, _, true) => Some(last),
+                (Some(i), true, ..) => Some(i.saturating_sub(1)),
+                (Some(i), _, true, ..) => Some((i + 1).min(last)),
+                (Some(i), _, _, true, ..) => Some(i.saturating_sub(cols)),
+                (Some(i), _, _, _, true, ..) => Some((i + cols).min(last)),
+                _ => None,
+            };
+            if let Some(t) = moved {
+                sel = Some(t);
+                scroll_to_card = true;
+            }
+            if enter && let Some(i) = sel {
+                actions.push(Action::OpenRepo(top[i].clone()));
+            }
+        }
+        ui.data_mut(|d| {
+            match sel {
+                Some(i) => {
+                    d.insert_temp(sel_id, i);
+                }
+                None => d.remove::<usize>(sel_id),
+            }
+        });
+        let ring = sel.filter(|_| crate::keys::keyboard_mode(ui.ctx()));
         egui::ScrollArea::vertical().auto_shrink(false).show(ui, |ui| {
             let gap = 16.0;
             let avail = ui.available_width();
             let cols = ((avail + gap) / (320.0 + gap)).floor().max(1.0) as usize;
+            ui.data_mut(|d| d.insert_temp(cols_id, cols));
             let card_w = (avail - gap * (cols as f32 - 1.0)) / cols as f32;
             for (row_i, chunk) in top.chunks(cols).enumerate() {
                 // Cards in a row share the tallest one's height (measured last frame),
@@ -133,7 +183,8 @@ pub fn show(
                     for (i, path) in chunk.iter().enumerate() {
                         let idx = ws.repos.iter().position(|r| r == *path).unwrap_or(row_i * cols + i);
                         let is_busy = busy.iter().any(|b| &b.1 == *path);
-                        let natural = card(ui, idx, path, summaries.get(*path), forges.get(*path), card_w, row_h, is_busy, actions);
+                        let n = row_i * cols + i;
+                        let natural = card(ui, idx, path, summaries.get(*path), forges.get(*path), card_w, row_h, is_busy, Focus { ring: ring == Some(n), scroll: scroll_to_card && sel == Some(n) }, actions);
                         tallest = tallest.max(natural);
                     }
                 });
@@ -155,16 +206,24 @@ fn empty_state(ui: &mut Ui, actions: &mut Vec<Action>) {
         ui.label(RichText::new("Add the repositories you work on together. You'll see all of them here at once.").color(DIM));
         ui.add_space(16.0);
         if ui.add(egui::Button::new(RichText::new("Add repository…").strong()).fill(ACCENT_DIM)).clicked() {
-            actions.push(Action::PickRepo);
+            actions.push(Action::Run(crate::actions::Id::AddRepo));
         }
         if ui.button("Add every repository in a folder…").clicked() {
             actions.push(Action::PickFolder);
         }
         if ui.button("Clone from a web address…").clicked() {
-            let dest = dirs::home_dir().map(|h| h.display().to_string()).unwrap_or_default();
-            actions.push(Action::Dialog(crate::app::Dialog::Clone { url: String::new(), dest }));
+            actions.push(Action::Run(crate::actions::Id::CloneRepo));
         }
     });
+}
+
+/// How the keyboard sees a card.
+#[derive(Clone, Copy)]
+struct Focus {
+    /// Draw the focus ring.
+    ring: bool,
+    /// Scroll it into view.
+    scroll: bool,
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -177,6 +236,7 @@ fn card(
     width: f32,
     row_h: f32,
     busy: bool,
+    focus: Focus,
     actions: &mut Vec<Action>,
 ) -> f32 {
     let name = git::repo_name(path);
@@ -184,7 +244,7 @@ fn card(
     let color = theme::lane(idx);
     let frame = egui::Frame::new()
         .fill(RAISED)
-        .stroke(Stroke::new(1.0, BORDER))
+        .stroke(if focus.ring { Stroke::new(2.0, ACCENT) } else { Stroke::new(1.0, BORDER) })
         .corner_radius(CornerRadius::same(10))
         .inner_margin(Margin::same(16));
     // The card's own click area is created before its contents, so boxes and buttons
@@ -376,6 +436,9 @@ fn card(
     });
     let card_name = name.clone();
     resp.response.widget_info(|| egui::WidgetInfo::labeled(egui::Role::Group, true, format!("Card {card_name}")));
+    if focus.scroll {
+        ui.scroll_to_rect(resp.response.rect, None);
+    }
     if resp.response.double_clicked() {
         actions.push(Action::OpenRepo(path.clone()));
     }
@@ -576,7 +639,7 @@ mod tests {
             };
             let mut actions = Vec::new();
             let (ws, summaries) = (&self.ws, &self.summaries);
-            let mut output = self.ctx.run_ui(input, |ui| show(ui, ws, summaries, &HashMap::new(), &[], Tabs { tab: OverviewTab::Repos, inbox_count: 0, inbox: None }, &mut actions));
+            let mut output = self.ctx.run_ui(input, |ui| show(ui, ws, summaries, &HashMap::new(), &[], Tabs { tab: OverviewTab::Repos, inbox_count: 0, inbox: None, keys: false }, &mut actions));
             output.textures_delta.clear(); // no screen to upload to
             let mut out = Opened::default();
             for a in actions {
